@@ -3,7 +3,7 @@
  *
  * Entry point shape:
  *
- *   const engine = durableWorkflows({ sandbox, store, resolveDefinition, plugins: [...] })
+ *   const engine = durableWorkflows({ store, resolveDefinition, plugins: [...] })
  *
  * Plugins never augment the engine surface — it is fixed. What a plugin
  * extends is the WORKFLOW's world: its shim defines a virtual module inside
@@ -11,7 +11,7 @@
  * editors. Anything operational a plugin needs host-side (e.g. agents orphan
  * reconciliation) lives on the plugin instance itself, not on the engine.
  */
-import type { ResourceLimits, Sandbox } from '@iso4/sandbox'
+import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory
@@ -21,12 +21,14 @@ export type DurableWorkflows = (options: DurableWorkflowsOptions) => DurableWork
 
 export interface DurableWorkflowsOptions {
   /**
-   * The iso4 sandbox the engine executes workflow replays in. Owned by the
-   * caller (create/dispose is the application's responsibility). The engine
-   * compiles exactly ONE prefix on it — core step shim + all plugin shims —
-   * lazily on first execution, and reuses it for every replay.
+   * Options for the iso4 sandbox — the sandbox itself is ENTIRELY managed
+   * internally: created lazily on first execution together with the one
+   * prefix per engine (core step shim + all plugin shims), reused for every
+   * replay, and disposed by `dispose()`. Note: each engine owns its own
+   * sandbox subprocess — two engines (e.g. two runtime-surface versions)
+   * means two processes.
    */
-  sandbox: Sandbox
+  sandbox?: SandboxOptions
   /**
    * The only mandatory adapter: where instances, steps and pending events
    * live. Values are stored exactly as they cross the iso4 bridge
@@ -112,8 +114,8 @@ export interface DurableWorkflowsEngine {
    */
   restart: (instanceId: string) => Promise<void>
   /**
-   * Await `pendingPromises`, then release the precompiled prefix. Does not
-   * dispose the sandbox — that stays the application's responsibility.
+   * Await `pendingPromises`, then release the precompiled prefix and dispose
+   * the internally managed sandbox.
    */
   dispose: () => Promise<void>
 }
