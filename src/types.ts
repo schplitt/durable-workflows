@@ -304,11 +304,18 @@ interface StepRecordBase {
  * skipped forever) or failed (retry policy decides what happens on the next
  * continuation).
  */
-export interface DoStepRecord extends StepRecordBase {
+export type DoStepRecord = DoStepCompletedRecord | DoStepFailedRecord
+
+export interface DoStepCompletedRecord extends StepRecordBase {
   kind: 'do'
-  status: 'completed' | 'failed'
-  value?: unknown
-  error?: SerializedError
+  status: 'completed'
+  value: unknown
+}
+
+export interface DoStepFailedRecord extends StepRecordBase {
+  kind: 'do'
+  status: 'failed'
+  error: SerializedError
 }
 
 /**
@@ -316,11 +323,18 @@ export interface DoStepRecord extends StepRecordBase {
  * failed permanently) — until then only its sub-steps exist, linked via
  * `parentId`. Evicting a scope evicts its whole subtree.
  */
-export interface ScopeStepRecord extends StepRecordBase {
+export type ScopeStepRecord = ScopeStepCompletedRecord | ScopeStepFailedRecord
+
+export interface ScopeStepCompletedRecord extends StepRecordBase {
   kind: 'scope'
-  status: 'completed' | 'failed'
-  value?: unknown
-  error?: SerializedError
+  status: 'completed'
+  value: unknown
+}
+
+export interface ScopeStepFailedRecord extends StepRecordBase {
+  kind: 'scope'
+  status: 'failed'
+  error: SerializedError
 }
 
 /**
@@ -340,38 +354,70 @@ export interface SleepStepRecord extends StepRecordBase {
  * Durable wait on an external event. `failed` = timeout expired before the
  * event arrived (checked at continuation time, never autonomously).
  */
-export interface WaitForEventStepRecord extends StepRecordBase {
+export type WaitForEventStepRecord
+  = | WaitForEventStepWaitingRecord
+    | WaitForEventStepCompletedRecord
+    | WaitForEventStepFailedRecord
+
+export interface WaitForEventStepWaitingRecord extends StepRecordBase {
   kind: 'waitForEvent'
-  status: 'waiting' | 'completed' | 'failed'
+  status: 'waiting'
   eventType: string
   /**
    * Timeout deadline, if the wait has one.
    */
   wakeAt?: string
+}
+
+export interface WaitForEventStepCompletedRecord extends StepRecordBase {
+  kind: 'waitForEvent'
+  status: 'completed'
+  eventType: string
   /**
-   * The delivered event payload once completed.
+   * The delivered event payload.
    */
-  value?: unknown
-  error?: SerializedError
+  value: unknown
+}
+
+export interface WaitForEventStepFailedRecord extends StepRecordBase {
+  kind: 'waitForEvent'
+  status: 'failed'
+  eventType: string
+  error: SerializedError
 }
 
 /**
  * Long-running host work dispatched by a plugin (e.g. an agent prompt).
+ * `operationToken` is the dispatch idempotency key and how the outer world
+ * addresses the completion back to this step.
  */
-export interface OperationStepRecord extends StepRecordBase {
+export type OperationStepRecord
+  = | OperationStepWaitingRecord
+    | OperationStepCompletedRecord
+    | OperationStepFailedRecord
+
+export interface OperationStepWaitingRecord extends StepRecordBase {
   kind: 'operation'
-  status: 'waiting' | 'completed' | 'failed'
-  /**
-   * Idempotency key for dispatch; also how the outer world addresses the
-   * completion back to this step.
-   */
+  status: 'waiting'
   operationToken: string
   /**
    * Operation timeout deadline, if any.
    */
   wakeAt?: string
-  value?: unknown
-  error?: SerializedError
+}
+
+export interface OperationStepCompletedRecord extends StepRecordBase {
+  kind: 'operation'
+  status: 'completed'
+  operationToken: string
+  value: unknown
+}
+
+export interface OperationStepFailedRecord extends StepRecordBase {
+  kind: 'operation'
+  status: 'failed'
+  operationToken: string
+  error: SerializedError
 }
 
 export interface InstanceRecord {
