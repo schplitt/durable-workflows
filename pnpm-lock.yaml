@@ -6,6 +6,9 @@ settings:
 
 catalogs:
   default:
+    '@iso4/sandbox':
+      specifier: ^0.0.4
+      version: 0.0.4
     '@schplitt/eslint-config':
       specifier: ^1.5.1
       version: 1.5.1
@@ -32,6 +35,9 @@ importers:
 
   .:
     devDependencies:
+      '@iso4/sandbox':
+        specifier: 'catalog:'
+        version: 0.0.4
       '@schplitt/eslint-config':
         specifier: 'catalog:'
         version: 1.5.1(@angular/cli@21.0.4(@types/node@24.10.4))(@vue/compiler-sfc@3.5.26)(jiti@2.6.1)(ts-declaration-location@1.0.7(typescript@6.0.3))(typescript-eslint@8.50.1(eslint@10.5.0(jiti@2.6.1))(typescript@6.0.3))(typescript@6.0.3)
@@ -594,6 +600,38 @@ packages:
   '@isaacs/fs-minipass@4.0.1':
     resolution: {integrity: sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==}
     engines: {node: '>=18.0.0'}
+
+  '@iso4/sandbox@0.0.4':
+    resolution: {integrity: sha512-j5UdvANrz5d/bZgSu7oQ79s3QL0fccNBMvNE9T2myF32q4fowktc5jIth9NYpoJOSZpG0NQ1aYjkjWB+BNps9Q==}
+    engines: {node: '>=24.0.0'}
+
+  '@iso4/v8-darwin-arm64@0.0.4':
+    resolution: {integrity: sha512-6QnXZpsKU4yjykwgklnb4eGRCUJLXNtt4KNMLLom8yN4WdVlGkMruBP/qVWIs5IGk1325ccLpIsxbUJN/aBrQA==}
+    engines: {node: '>=24.0.0'}
+    cpu: [arm64]
+    os: [darwin]
+    hasBin: true
+
+  '@iso4/v8-darwin-x64@0.0.4':
+    resolution: {integrity: sha512-i/N0kbHL2MVCsY2z3HPYABOkMlCPI4x4QHSM5bL45u7Z2mifFjeo2tlH+Wwzv0edcOGplmWGbn9H1jjQL31KXg==}
+    engines: {node: '>=24.0.0'}
+    cpu: [x64]
+    os: [darwin]
+    hasBin: true
+
+  '@iso4/v8-linux-arm64-gnu@0.0.4':
+    resolution: {integrity: sha512-ivFczS0xPnmrXv+6fAN+g9mFih5Odygd14aXb/mPnEHf/Na+2hK2npIK5AhgNaVxFABp68u/vkKEZ6Eq2PE8Pg==}
+    engines: {node: '>=24.0.0'}
+    cpu: [arm64]
+    os: [linux]
+    hasBin: true
+
+  '@iso4/v8-linux-x64-gnu@0.0.4':
+    resolution: {integrity: sha512-BSnjj5HQR6zN+xB1QkbfJcsvij8TJcG/K1LWK8jCEuEbDDm6QXC+7gu9SJE0iD5ouKo0jfCwY45RsrzSCRkN1w==}
+    engines: {node: '>=24.0.0'}
+    cpu: [x64]
+    os: [linux]
+    hasBin: true
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -3955,6 +3993,25 @@ snapshots:
   '@isaacs/fs-minipass@4.0.1':
     dependencies:
       minipass: 7.1.2
+
+  '@iso4/sandbox@0.0.4':
+    optionalDependencies:
+      '@iso4/v8-darwin-arm64': 0.0.4
+      '@iso4/v8-darwin-x64': 0.0.4
+      '@iso4/v8-linux-arm64-gnu': 0.0.4
+      '@iso4/v8-linux-x64-gnu': 0.0.4
+
+  '@iso4/v8-darwin-arm64@0.0.4':
+    optional: true
+
+  '@iso4/v8-darwin-x64@0.0.4':
+    optional: true
+
+  '@iso4/v8-linux-arm64-gnu@0.0.4':
+    optional: true
+
+  '@iso4/v8-linux-x64-gnu@0.0.4':
+    optional: true
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:

@@ -10,6 +10,7 @@ trustPolicyExclude:
   - undici-types@6.21.0
 
 catalog:
+  '@iso4/sandbox': ^0.0.4
   '@schplitt/eslint-config': ^1.5.1
   bumpp: ^11.1.0
   changelogithub: ^14.0.0
@@ -20,3 +21,6 @@ catalog:
 
 onlyBuiltDependencies:
   - esbuild
+
+allowBuilds:
+  esbuild: true

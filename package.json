@@ -48,9 +48,8 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
-  "dependencies": {
-  },
   "devDependencies": {
+    "@iso4/sandbox": "catalog:",
     "@schplitt/eslint-config": "catalog:",
     "bumpp": "catalog:",
     "changelogithub": "catalog:",

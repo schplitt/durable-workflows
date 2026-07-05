@@ -1,0 +1,335 @@
+/**
+ * DRAFT — public type surface for the durable workflows engine.
+ *
+ * Entry point shape:
+ *
+ *   const engine = durableWorkflows({ sandbox, store, plugins: [...] })
+ *
+ * Plugin typing follows the better-auth model, not the vite model: plugins are
+ * not just lifecycle hooks, they carry types that augment the inferred engine
+ * surface (`$engine`). Later the same mechanism can feed the workflow-authoring
+ * types (what a workflow may import).
+ */
+import type { ResourceLimits, Sandbox } from '@iso4/sandbox'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Factory
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type DurableWorkflows = <const TPlugins extends readonly DurableWorkflowsPlugin[] = []>(
+  options: DurableWorkflowsOptions<TPlugins>,
+) => DurableWorkflowsEngine & InferEngineExtensions<TPlugins>
+
+export interface DurableWorkflowsOptions<
+  TPlugins extends readonly DurableWorkflowsPlugin[] = readonly DurableWorkflowsPlugin[],
+> {
+  /**
+   * The iso4 sandbox the engine executes workflow replays in. Owned by the
+   * caller (create/dispose is the application's responsibility).
+   */
+  sandbox: Sandbox
+  /**
+   * The only mandatory adapter: where instances, steps and pending events
+   * live, and what answers "which suspended instances are due".
+   */
+  store: WorkflowStore
+  /**
+   * Capabilities workflow code can import. Each plugin is a pair of an
+   * in-sandbox shim and a host-side implementation, plus optional engine
+   * surface augmentation via `$engine`.
+   */
+  plugins?: TPlugins
+  /**
+   * Decides *when* suspended instances are re-run. Defaults to an in-process
+   * interval loop polling `store.dueWakeups`.
+   */
+  scheduler?: Scheduler
+  /**
+   * (De)serialization for step values and event payloads crossing the bridge
+   * into the store. Defaults to structured-clone-compatible JSON.
+   */
+  codec?: Codec
+  /**
+   * Default retry policy for steps that fail without a per-step override.
+   * Steps failed as `permanent` are never retried regardless of policy.
+   */
+  retry?: RetryPolicy
+  /**
+   * Error names that permanently fail a step — no retries — without needing
+   * a per-step override or a durable-operation verdict.
+   *
+   * NOTE: currently error names do not survive the iso4 bridge
+   * (https://github.com/schplitt/iso4/issues/12); until that lands,
+   * classification falls back to message matching internally.
+   */
+  nonRetryableErrors?: string[]
+  /**
+   * Escape hatch when a name list is not enough (e.g. classify by message
+   * content or step kind). Takes precedence over `nonRetryableErrors`.
+   */
+  classifyError?: (error: SerializedError, ctx: { stepId: string, attempt: number }) => ErrorClass
+  /**
+   * Default iso4 resource limits per replay run. The engine always forces
+   * `maxBridgeCalls` high enough for replay bookkeeping (iso4 defaults to 10,
+   * which replay-heavy workflows exceed immediately).
+   */
+  limits?: Partial<ResourceLimits>
+  /**
+   * Observability hook: structured lifecycle events (instance/step/operation
+   * state changes) and context-tagged workflow logs. The engine emits, the
+   * application persists — the library stores nothing itself.
+   */
+  onEvent?: (event: EngineEvent) => void
+}
+
+// NOTE (not an option): the suspension sentinel is an internal constant shared
+// between the compiled-in shim and the runner. It is deliberately not
+// configurable — and never trusted alone: a suspension only counts if a
+// matching pending wait was registered via a bridge call in the same run.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Engine surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface DurableWorkflowsEngine {
+  /**
+   * Register a workflow definition (bundled ESM source).
+   */
+  register: (definition: WorkflowDefinition) => Promise<void>
+  /**
+   * Start a new instance of a registered workflow.
+   */
+  create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
+  get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
+  /**
+   * Deliver an external event (resolves a matching wait-for-event).
+   */
+  sendEvent: (instanceId: string, event: { type: string, payload?: unknown }) => Promise<void>
+  /**
+   * Manually wake a suspended instance (normally the scheduler's job).
+   */
+  resume: (instanceId: string) => Promise<void>
+  terminate: (instanceId: string) => Promise<void>
+  /**
+   * Prefix invalidation: deletes the step and every step recorded after it,
+   * then replays. Rare manual remediation — not part of normal operation.
+   */
+  evict: (instanceId: string, stepId: string) => Promise<void>
+  /**
+   * Evict everything and replay from scratch.
+   */
+  restart: (instanceId: string) => Promise<void>
+  /**
+   * Stop the scheduler; in-flight runs finish, nothing new is woken.
+   */
+  dispose: () => Promise<void>
+}
+
+export interface WorkflowDefinition {
+  name: string
+  /**
+   * Instances pin the version they started on; replay always uses it.
+   */
+  version?: string
+  /**
+   * Bundled ESM source. Capability specifiers stay external.
+   */
+  code: string
+}
+
+export interface CreateOptions {
+  /**
+   * Caller-provided id for idempotent creation (e.g. derived from an alarm id).
+   */
+  instanceId?: string
+}
+
+export interface WorkflowInstanceHandle {
+  readonly id: string
+  status: () => Promise<InstanceStatus>
+  /**
+   * The workflow's return value; only once status is `completed`.
+   */
+  result: () => Promise<unknown>
+}
+
+export type InstanceStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'terminated'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugins
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface DurableWorkflowsPlugin {
+  /**
+   * Unique id (diagnostics, error scoping).
+   */
+  id: string
+  /**
+   * Virtual module specifier workflow code imports, e.g. `durable-workflows:agents`.
+   */
+  specifier: string
+  /**
+   * In-sandbox ESM source compiled into the iso4 prefix. Defines the module's
+   * exports; may use the core's in-sandbox durable-call helper so plugin
+   * operations become auto-id'd durable steps (how agent sessions work).
+   */
+  shim: string
+  /**
+   * Host-side bridge handlers, constructed **per instance run** — this is the
+   * credentials story: every resume gets freshly built handlers, so secrets
+   * live host-side only and tokens are provisioned at wake-up time.
+   */
+  host: (ctx: InstanceRunContext) => Record<string, HostHandler>
+  /**
+   * Engine surface augmentation (better-auth style): merged into the engine
+   * type returned by `durableWorkflows()`. Implementation lands on the engine
+   * object at construction.
+   */
+  $engine?: Record<string, unknown>
+}
+
+/**
+ * Aligned with iso4's HostExportFunction; args/results cross the bridge serialized.
+ */
+export type HostHandler = (...args: unknown[]) => unknown
+
+export interface InstanceRunContext {
+  instanceId: string
+  workflow: string
+  /**
+   * Monotonic per-instance run counter (1 = first execution).
+   */
+  run: number
+}
+
+/**
+ * Intersection of all `$engine` augmentations carried by the plugin tuple.
+ */
+export type InferEngineExtensions<TPlugins extends readonly DurableWorkflowsPlugin[]>
+  = UnionToIntersection<NonNullable<TPlugins[number]['$engine']>>
+
+type UnionToIntersection<U>
+  = (U extends unknown ? (k: U) => void : never) extends ((k: infer I) => void) ? I : unknown
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Policies & errors
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RetryPolicy {
+  /**
+   * Maximum attempts per step (1 = no retries).
+   */
+  limit: number
+  backoff?: 'constant' | 'linear' | 'exponential'
+  delayMs?: number
+}
+
+export type ErrorClass = 'permanent' | 'transient'
+
+export interface SerializedError {
+  /**
+   * JS error name. See iso4#12 — flattened to 'Error' until fixed upstream.
+   */
+  name: string
+  message: string
+  stack?: string
+  /**
+   * Set by durable-operation verdicts or classification; permanent = never retried.
+   */
+  class?: ErrorClass
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Store contract & records (skeleton — to be designed in detail)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type StepKind = 'do' | 'scope' | 'sleep' | 'waitForEvent' | 'operation'
+
+export type StepStatus = 'completed' | 'failed' | 'waiting'
+
+export interface StepRecord {
+  instanceId: string
+  stepId: string
+  /**
+   * Record order — drives prefix eviction ("this step and everything after").
+   */
+  seq: number
+  kind: StepKind
+  status: StepStatus
+  value?: unknown
+  error?: SerializedError
+  attempts: number
+  /**
+   * Sleep deadline / wait-for-event timeout.
+   */
+  wakeAt?: string
+  eventType?: string
+  /**
+   * Idempotency key for durable-operation dispatch.
+   */
+  operationToken?: string
+  /**
+   * Enclosing scope's stepId for namespaced sub-steps.
+   */
+  parentId?: string
+}
+
+export interface InstanceRecord {
+  instanceId: string
+  workflow: string
+  version?: string
+  status: InstanceStatus
+  input?: unknown
+  result?: unknown
+  error?: SerializedError
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WorkflowStore {
+  createInstance: (record: InstanceRecord) => Promise<void>
+  getInstance: (instanceId: string) => Promise<InstanceRecord | null>
+  updateInstance: (record: InstanceRecord) => Promise<void>
+  deleteInstance: (instanceId: string) => Promise<void>
+
+  getStep: (instanceId: string, stepId: string) => Promise<StepRecord | null>
+  putStep: (record: StepRecord) => Promise<void>
+  listSteps: (instanceId: string) => Promise<StepRecord[]>
+  /**
+   * Prefix delete: the step and every record with a greater `seq`.
+   */
+  evictFromStep: (instanceId: string, stepId: string) => Promise<void>
+
+  putEvent: (instanceId: string, type: string, payload: unknown) => Promise<void>
+  /**
+   * Consume one pending event of the given type, or null.
+   */
+  takeEvent: (instanceId: string, type: string) => Promise<unknown | null>
+
+  /**
+   * Suspended instances whose wake condition is due at `now`.
+   */
+  dueWakeups: (now: Date) => Promise<{ instanceId: string }[]>
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduler, codec, observability
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Scheduler {
+  /**
+   * `wake` is the engine's "replay this instance now" entry point.
+   */
+  start: (wake: (instanceId: string) => Promise<void>) => void
+  stop: () => Promise<void>
+}
+
+export interface Codec {
+  serialize: (value: unknown) => unknown
+  deserialize: (value: unknown) => unknown
+}
+
+export type EngineEvent
+  = | { type: 'instance', instanceId: string, status: InstanceStatus, run: number }
+    | { type: 'step', instanceId: string, stepId: string, status: StepStatus, attempt: number, run: number }
+    | { type: 'log', instanceId: string, stepId?: string, run: number, level: 'log' | 'warn' | 'error', args: unknown[] }
