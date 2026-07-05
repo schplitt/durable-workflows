@@ -48,8 +48,10 @@ export interface DurableWorkflowsOptions {
    */
   plugins?: readonly DurableWorkflowsPlugin[]
   /**
-   * Default retry policy for steps that fail without a per-step override.
-   * Steps failed as `permanent` are never retried regardless of policy.
+   * Retry policy for steps that fail without a per-step override.
+   * OMITTED = NO RETRIES: a failing step fails on first attempt. There is no
+   * built-in default. Steps failed as `permanent` are never retried
+   * regardless of policy.
    */
   retry?: RetryPolicy
   /**
