@@ -5,10 +5,11 @@
  *
  *   const engine = durableWorkflows({ sandbox, store, resolveDefinition, plugins: [...] })
  *
- * Plugin typing follows the better-auth model, not the vite model: plugins are
- * not just lifecycle hooks, they carry types that augment the inferred engine
- * surface (`$engine`). Later the same mechanism can feed the workflow-authoring
- * types (what a workflow may import).
+ * Plugins never augment the engine surface — it is fixed. What a plugin
+ * extends is the WORKFLOW's world: its shim defines a virtual module inside
+ * the sandbox, and its `./workflow` d.ts types that module for authors'
+ * editors. Anything operational a plugin needs host-side (e.g. agents orphan
+ * reconciliation) lives on the plugin instance itself, not on the engine.
  */
 import type { ResourceLimits, Sandbox } from '@iso4/sandbox'
 
@@ -16,13 +17,9 @@ import type { ResourceLimits, Sandbox } from '@iso4/sandbox'
 // Factory
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type DurableWorkflows = <const TPlugins extends readonly DurableWorkflowsPlugin[] = []>(
-  options: DurableWorkflowsOptions<TPlugins>,
-) => DurableWorkflowsEngine & InferEngineExtensions<TPlugins>
+export type DurableWorkflows = (options: DurableWorkflowsOptions) => DurableWorkflowsEngine
 
-export interface DurableWorkflowsOptions<
-  TPlugins extends readonly DurableWorkflowsPlugin[] = readonly DurableWorkflowsPlugin[],
-> {
+export interface DurableWorkflowsOptions {
   /**
    * The iso4 sandbox the engine executes workflow replays in. Owned by the
    * caller (create/dispose is the application's responsibility). The engine
@@ -47,10 +44,9 @@ export interface DurableWorkflowsOptions<
   resolveDefinition: (name: string, version?: string) => Promise<ResolvedDefinition | null>
   /**
    * Capabilities workflow code can import. Each plugin is a pair of an
-   * in-sandbox shim and a host-side implementation, plus optional engine
-   * surface augmentation via `$engine`.
+   * in-sandbox shim and a host-side implementation.
    */
-  plugins?: TPlugins
+  plugins?: readonly DurableWorkflowsPlugin[]
   /**
    * Default retry policy for steps that fail without a per-step override.
    * Steps failed as `permanent` are never retried regardless of policy.
@@ -201,12 +197,6 @@ export interface DurableWorkflowsPlugin {
    * live host-side only and tokens are provisioned at wake-up time.
    */
   host: (ctx: InstanceRunContext) => Record<string, HostHandler>
-  /**
-   * Engine surface augmentation (better-auth style): merged into the engine
-   * type returned by `durableWorkflows()`. Implementation lands on the engine
-   * object at construction.
-   */
-  $engine?: Record<string, unknown>
 }
 
 /**
@@ -224,19 +214,12 @@ export interface InstanceRunContext {
 }
 
 /**
- * Identity helper for plugin authors: preserves the literal type of the
- * plugin object (notably `$engine`) so it flows into engine-type inference.
+ * Identity helper for plugin authors — shape validation with inference kept.
+ * A plugin factory typically wraps this: `agentsPlugin(opts)` builds the
+ * object and may expose its own operational methods alongside (never on the
+ * engine).
  */
-export type DefineWorkflowsPlugin = <const TPlugin extends DurableWorkflowsPlugin>(plugin: TPlugin) => TPlugin
-
-/**
- * Intersection of all `$engine` augmentations carried by the plugin tuple.
- */
-export type InferEngineExtensions<TPlugins extends readonly DurableWorkflowsPlugin[]>
-  = UnionToIntersection<NonNullable<TPlugins[number]['$engine']>>
-
-type UnionToIntersection<U>
-  = (U extends unknown ? (k: U) => void : never) extends ((k: infer I) => void) ? I : unknown
+export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plugin: TPlugin) => TPlugin
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Policies & errors
