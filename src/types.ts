@@ -86,6 +86,14 @@ export interface DurableWorkflowsOptions<
 
 export interface DurableWorkflowsEngine {
   /**
+   * In-flight work: currently executing replay runs and store writes that
+   * have not settled yet. Entries remove themselves on settlement. For a
+   * graceful container shutdown: stop your trigger wiring, then
+   * `await Promise.allSettled([...engine.pendingPromises])`, then `dispose()`
+   * (which also awaits these itself).
+   */
+  readonly pendingPromises: ReadonlySet<Promise<unknown>>
+  /**
    * Start a new instance. Resolves the definition via `resolveDefinition`
    * (without a version unless `opts.version` says otherwise) and pins the
    * returned concrete version to the instance for all future replays.
@@ -114,7 +122,8 @@ export interface DurableWorkflowsEngine {
    */
   restart: (instanceId: string) => Promise<void>
   /**
-   * Release the precompiled prefix; in-flight runs finish first.
+   * Await `pendingPromises`, then release the precompiled prefix. Does not
+   * dispose the sandbox — that stays the application's responsibility.
    */
   dispose: () => Promise<void>
 }
