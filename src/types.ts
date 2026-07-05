@@ -261,36 +261,108 @@ export interface SerializedError {
 // Store contract & records (skeleton — to be designed in detail)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type StepKind = 'do' | 'scope' | 'sleep' | 'waitForEvent' | 'operation'
+export type StepKind = StepRecord['kind']
 
-export type StepStatus = 'completed' | 'failed' | 'waiting'
+export type StepStatus = StepRecord['status']
 
-export interface StepRecord {
+/**
+ * Discriminated on `kind` — each durable primitive persists exactly the
+ * fields its semantics need, no optional grab-bag.
+ */
+export type StepRecord
+  = | DoStepRecord
+    | ScopeStepRecord
+    | SleepStepRecord
+    | WaitForEventStepRecord
+    | OperationStepRecord
+
+interface StepRecordBase {
   instanceId: string
   stepId: string
   /**
    * Record order — drives prefix eviction ("this step and everything after").
    */
   seq: number
-  kind: StepKind
-  status: StepStatus
-  value?: unknown
-  error?: SerializedError
   attempts: number
-  /**
-   * Sleep deadline / wait-for-event timeout. Informational for the
-   * application's own trigger wiring — the engine never acts on time.
-   */
-  wakeAt?: string
-  eventType?: string
-  /**
-   * Idempotency key for durable-operation dispatch.
-   */
-  operationToken?: string
   /**
    * Enclosing scope's stepId for namespaced sub-steps.
    */
   parentId?: string
+}
+
+/**
+ * Atomic unit of work. Never waits: it either completed (value frozen, body
+ * skipped forever) or failed (retry policy decides what happens on the next
+ * continuation).
+ */
+export interface DoStepRecord extends StepRecordBase {
+  kind: 'do'
+  status: 'completed' | 'failed'
+  value?: unknown
+  error?: SerializedError
+}
+
+/**
+ * Composite namespace. Only recorded once its body ran to completion (or
+ * failed permanently) — until then only its sub-steps exist, linked via
+ * `parentId`. Evicting a scope evicts its whole subtree.
+ */
+export interface ScopeStepRecord extends StepRecordBase {
+  kind: 'scope'
+  status: 'completed' | 'failed'
+  value?: unknown
+  error?: SerializedError
+}
+
+/**
+ * Durable timer. Cannot fail — it is either still pending or satisfied.
+ */
+export interface SleepStepRecord extends StepRecordBase {
+  kind: 'sleep'
+  status: 'waiting' | 'completed'
+  /**
+   * Wake deadline. Informational for the application's own trigger wiring —
+   * the engine checks it only when a continuation replays past this step.
+   */
+  wakeAt: string
+}
+
+/**
+ * Durable wait on an external event. `failed` = timeout expired before the
+ * event arrived (checked at continuation time, never autonomously).
+ */
+export interface WaitForEventStepRecord extends StepRecordBase {
+  kind: 'waitForEvent'
+  status: 'waiting' | 'completed' | 'failed'
+  eventType: string
+  /**
+   * Timeout deadline, if the wait has one.
+   */
+  wakeAt?: string
+  /**
+   * The delivered event payload once completed.
+   */
+  value?: unknown
+  error?: SerializedError
+}
+
+/**
+ * Long-running host work dispatched by a plugin (e.g. an agent prompt).
+ */
+export interface OperationStepRecord extends StepRecordBase {
+  kind: 'operation'
+  status: 'waiting' | 'completed' | 'failed'
+  /**
+   * Idempotency key for dispatch; also how the outer world addresses the
+   * completion back to this step.
+   */
+  operationToken: string
+  /**
+   * Operation timeout deadline, if any.
+   */
+  wakeAt?: string
+  value?: unknown
+  error?: SerializedError
 }
 
 export interface InstanceRecord {
