@@ -50,20 +50,12 @@ export interface DurableWorkflowsOptions {
   /**
    * Retry policy for steps that fail without a per-step override.
    * OMITTED = NO RETRIES: a failing step fails on first attempt. There is no
-   * built-in default. Steps failed as `permanent` are never retried
-   * regardless of policy.
+   * built-in default, and no error classification in the engine: workflow
+   * errors are the user's domain (catch them or set per-step policy); the
+   * only thing that stops a configured retry is a host-side `permanent`
+   * verdict on the error (e.g. a plugin failing an operation as unresolvable).
    */
   retry?: RetryPolicy
-  /**
-   * Error names that permanently fail a step — no retries — without needing
-   * a per-step override or a durable-operation verdict.
-   */
-  nonRetryableErrors?: string[]
-  /**
-   * Escape hatch when a name list is not enough (e.g. classify by message
-   * content or step kind). Takes precedence over `nonRetryableErrors`.
-   */
-  classifyError?: (error: SerializedError, ctx: { stepId: string, attempt: number }) => ErrorClass
   /**
    * Default iso4 resource limits per replay run. The engine always forces
    * `maxBridgeCalls` high enough for replay bookkeeping (iso4 defaults to 10,
