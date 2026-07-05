@@ -66,11 +66,12 @@ export interface DurableWorkflowsOptions {
    * (host I/O is free), so generous values cost little.
    *
    * Engine defaults (differing from iso4's own):
-   * - `maxBridgeCalls: 1000` — replay makes ~1 call per completed step plus
-   *   every in-step host call; iso4's default of 10 dies immediately, and a
-   *   low cap silently limits a workflow's LIFETIME step count. 1000 still
-   *   instantly catches the runaway `while (true) await tool()` loop this
-   *   limit exists for.
+   * - `maxBridgeCalls: 300` — replay makes ~1 call per completed step plus
+   *   2 per executing step plus every in-step host call; a typical workflow
+   *   (~32 steps × ~3 host calls) peaks around 160 in a full run, so 300 is
+   *   ~2× headroom while catching the runaway `while (true) await tool()`
+   *   loop fast. Step-per-item loops over large collections should raise
+   *   this via their definition's limits.
    * - `wallTimeMs: 120_000` — wall time DOES include in-run bridge waits
    *   (iso4 defaults to 30s). Anything legitimately longer than this belongs
    *   in a durable operation that suspends.
