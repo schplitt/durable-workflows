@@ -59,15 +59,27 @@ export interface DurableWorkflowsOptions {
    */
   retry?: RetryPolicy
   /**
-   * Default iso4 resource limits per replay run; `ResolvedDefinition.limits`
-   * overrides per definition. Limits are a safety net against runaway code,
-   * not scheduling — CPU time excludes bridge waits (host I/O is free), so
-   * generous values cost little. The engine always forces its own floors:
-   * `maxBridgeCalls` raised for replay bookkeeping (iso4 defaults to 10) and
-   * a `wallTimeMs` well above iso4's 30s default, since wall time DOES
-   * include in-run bridge waits. A limit breach kills the run mid-step with
-   * nothing written: the instance fails with the iso4 error, and raising
-   * limits + `continueWorkflow` re-executes the incomplete step cleanly.
+   * iso4 resource limits per replay run; `ResolvedDefinition.limits`
+   * overrides per definition, and explicit settings ALWAYS win — the engine
+   * never silently overrides what was configured. Limits are a safety net
+   * against runaway code, not scheduling — CPU time excludes bridge waits
+   * (host I/O is free), so generous values cost little.
+   *
+   * Engine defaults (differing from iso4's own):
+   * - `maxBridgeCalls: 1000` — replay makes ~1 call per completed step plus
+   *   every in-step host call; iso4's default of 10 dies immediately, and a
+   *   low cap silently limits a workflow's LIFETIME step count. 1000 still
+   *   instantly catches the runaway `while (true) await tool()` loop this
+   *   limit exists for.
+   * - `wallTimeMs: 120_000` — wall time DOES include in-run bridge waits
+   *   (iso4 defaults to 30s). Anything legitimately longer than this belongs
+   *   in a durable operation that suspends.
+   * - everything else: iso4 defaults (note `cpuTimeMs: 5s` — heavy in-sandbox
+   *   compute like CSV parsing should raise it via its definition's limits).
+   *
+   * A limit breach kills the run mid-step with nothing written: the instance
+   * fails with the iso4 error, and raising limits + `continueWorkflow`
+   * re-executes the incomplete step cleanly.
    */
   limits?: Partial<ResourceLimits>
   /**
@@ -138,11 +150,10 @@ export interface ResolvedDefinition {
   /**
    * Per-definition resource overrides (e.g. from a manifest) for workloads
    * that legitimately need more than the engine default — heavy in-sandbox
-   * compute like parsing large files. Merged over `options.limits`; the
-   * engine still forces its own floors on top (`maxBridgeCalls`, a generous
-   * `wallTimeMs`). Limits bound ONE replay execution, never the workflow's
-   * lifetime — anything longer-running than the wall budget belongs in a
-   * durable operation that suspends.
+   * compute like parsing large files. Merge order: engine defaults ←
+   * `options.limits` ← these; explicit settings always win. Limits bound ONE
+   * replay execution, never the workflow's lifetime — anything longer-running
+   * than the wall budget belongs in a durable operation that suspends.
    */
   limits?: Partial<ResourceLimits>
 }
