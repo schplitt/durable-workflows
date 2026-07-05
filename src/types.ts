@@ -59,9 +59,15 @@ export interface DurableWorkflowsOptions {
    */
   retry?: RetryPolicy
   /**
-   * Default iso4 resource limits per replay run. The engine always forces
-   * `maxBridgeCalls` high enough for replay bookkeeping (iso4 defaults to 10,
-   * which replay-heavy workflows exceed immediately).
+   * Default iso4 resource limits per replay run; `ResolvedDefinition.limits`
+   * overrides per definition. Limits are a safety net against runaway code,
+   * not scheduling — CPU time excludes bridge waits (host I/O is free), so
+   * generous values cost little. The engine always forces its own floors:
+   * `maxBridgeCalls` raised for replay bookkeeping (iso4 defaults to 10) and
+   * a `wallTimeMs` well above iso4's 30s default, since wall time DOES
+   * include in-run bridge waits. A limit breach kills the run mid-step with
+   * nothing written: the instance fails with the iso4 error, and raising
+   * limits + `continueWorkflow` re-executes the incomplete step cleanly.
    */
   limits?: Partial<ResourceLimits>
   /**
@@ -129,6 +135,16 @@ export interface ResolvedDefinition {
    * Bundled ESM source. Capability specifiers stay external.
    */
   code: string
+  /**
+   * Per-definition resource overrides (e.g. from a manifest) for workloads
+   * that legitimately need more than the engine default — heavy in-sandbox
+   * compute like parsing large files. Merged over `options.limits`; the
+   * engine still forces its own floors on top (`maxBridgeCalls`, a generous
+   * `wallTimeMs`). Limits bound ONE replay execution, never the workflow's
+   * lifetime — anything longer-running than the wall budget belongs in a
+   * durable operation that suspends.
+   */
+  limits?: Partial<ResourceLimits>
 }
 
 export interface CreateOptions {
