@@ -25,12 +25,15 @@ export interface DurableWorkflowsOptions<
 > {
   /**
    * The iso4 sandbox the engine executes workflow replays in. Owned by the
-   * caller (create/dispose is the application's responsibility).
+   * caller (create/dispose is the application's responsibility). The engine
+   * compiles exactly ONE prefix on it — core step shim + all plugin shims —
+   * lazily on first execution, and reuses it for every replay.
    */
   sandbox: Sandbox
   /**
    * The only mandatory adapter: where instances, steps and pending events
-   * live, and what answers "which suspended instances are due".
+   * live. Values are stored exactly as they cross the iso4 bridge
+   * (V8-serializable data) — there is no codec layer.
    */
   store: WorkflowStore
   /**
@@ -39,16 +42,6 @@ export interface DurableWorkflowsOptions<
    * surface augmentation via `$engine`.
    */
   plugins?: TPlugins
-  /**
-   * Decides *when* suspended instances are re-run. Defaults to an in-process
-   * interval loop polling `store.dueWakeups`.
-   */
-  scheduler?: Scheduler
-  /**
-   * (De)serialization for step values and event payloads crossing the bridge
-   * into the store. Defaults to structured-clone-compatible JSON.
-   */
-  codec?: Codec
   /**
    * Default retry policy for steps that fail without a per-step override.
    * Steps failed as `permanent` are never retried regardless of policy.
@@ -86,6 +79,13 @@ export interface DurableWorkflowsOptions<
 // between the compiled-in shim and the runner. It is deliberately not
 // configurable — and never trusted alone: a suspension only counts if a
 // matching pending wait was registered via a bridge call in the same run.
+//
+// NOTE (deliberately absent): there is no scheduler and no wake-up machinery.
+// Continuation is entirely event-driven from the OUTSIDE: the application
+// wires its own triggers (cron, queues, webhooks, timer services) per
+// instance id and calls `continueWorkflow` / `sendEvent`. The engine records
+// what an instance is waiting on (`wakeAt`, `eventType` in step records) but
+// never acts on time itself.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Engine surface
@@ -102,13 +102,16 @@ export interface DurableWorkflowsEngine {
   create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
   /**
-   * Deliver an external event (resolves a matching wait-for-event).
+   * Deliver an external event (resolves a matching wait-for-event) and
+   * continue the instance.
    */
   sendEvent: (instanceId: string, event: { type: string, payload?: unknown }) => Promise<void>
   /**
-   * Manually wake a suspended instance (normally the scheduler's job).
+   * Replay a suspended instance now. This is THE continuation entry point —
+   * called by the application's own trigger wiring (its cron, its timer
+   * service, its queue consumer). The engine never wakes anything itself.
    */
-  resume: (instanceId: string) => Promise<void>
+  continueWorkflow: (instanceId: string) => Promise<void>
   terminate: (instanceId: string) => Promise<void>
   /**
    * Prefix invalidation: deletes the step and every step recorded after it,
@@ -120,7 +123,7 @@ export interface DurableWorkflowsEngine {
    */
   restart: (instanceId: string) => Promise<void>
   /**
-   * Stop the scheduler; in-flight runs finish, nothing new is woken.
+   * Release the precompiled prefix; in-flight runs finish first.
    */
   dispose: () => Promise<void>
 }
@@ -260,7 +263,8 @@ export interface StepRecord {
   error?: SerializedError
   attempts: number
   /**
-   * Sleep deadline / wait-for-event timeout.
+   * Sleep deadline / wait-for-event timeout. Informational for the
+   * application's own trigger wiring — the engine never acts on time.
    */
   wakeAt?: string
   eventType?: string
@@ -305,29 +309,11 @@ export interface WorkflowStore {
    * Consume one pending event of the given type, or null.
    */
   takeEvent: (instanceId: string, type: string) => Promise<unknown | null>
-
-  /**
-   * Suspended instances whose wake condition is due at `now`.
-   */
-  dueWakeups: (now: Date) => Promise<{ instanceId: string }[]>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scheduler, codec, observability
+// Observability
 // ─────────────────────────────────────────────────────────────────────────────
-
-export interface Scheduler {
-  /**
-   * `wake` is the engine's "replay this instance now" entry point.
-   */
-  start: (wake: (instanceId: string) => Promise<void>) => void
-  stop: () => Promise<void>
-}
-
-export interface Codec {
-  serialize: (value: unknown) => unknown
-  deserialize: (value: unknown) => unknown
-}
 
 export type EngineEvent
   = | { type: 'instance', instanceId: string, status: InstanceStatus, run: number }
