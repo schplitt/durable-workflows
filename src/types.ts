@@ -3,7 +3,7 @@
  *
  * Entry point shape:
  *
- *   const engine = durableWorkflows({ sandbox, store, plugins: [...] })
+ *   const engine = durableWorkflows({ sandbox, store, resolveDefinition, plugins: [...] })
  *
  * Plugin typing follows the better-auth model, not the vite model: plugins are
  * not just lifecycle hooks, they carry types that augment the inferred engine
@@ -37,6 +37,15 @@ export interface DurableWorkflowsOptions<
    */
   store: WorkflowStore
   /**
+   * Where workflow definitions come from — the engine deliberately has NO
+   * registry of its own. Called with a concrete version when replaying an
+   * instance (instances pin the version they started on), and without one
+   * when creating a new instance — the resolver decides what "latest" means
+   * and returns the concrete version to pin. Definitions live wherever the
+   * application wants: disk, database, git, an upload endpoint.
+   */
+  resolveDefinition: (name: string, version?: string) => Promise<ResolvedDefinition | null>
+  /**
    * Capabilities workflow code can import. Each plugin is a pair of an
    * in-sandbox shim and a host-side implementation, plus optional engine
    * surface augmentation via `$engine`.
@@ -50,10 +59,6 @@ export interface DurableWorkflowsOptions<
   /**
    * Error names that permanently fail a step — no retries — without needing
    * a per-step override or a durable-operation verdict.
-   *
-   * NOTE: currently error names do not survive the iso4 bridge
-   * (https://github.com/schplitt/iso4/issues/12); until that lands,
-   * classification falls back to message matching internally.
    */
   nonRetryableErrors?: string[]
   /**
@@ -75,29 +80,15 @@ export interface DurableWorkflowsOptions<
   onEvent?: (event: EngineEvent) => void
 }
 
-// NOTE (not an option): the suspension sentinel is an internal constant shared
-// between the compiled-in shim and the runner. It is deliberately not
-// configurable — and never trusted alone: a suspension only counts if a
-// matching pending wait was registered via a bridge call in the same run.
-//
-// NOTE (deliberately absent): there is no scheduler and no wake-up machinery.
-// Continuation is entirely event-driven from the OUTSIDE: the application
-// wires its own triggers (cron, queues, webhooks, timer services) per
-// instance id and calls `continueWorkflow` / `sendEvent`. The engine records
-// what an instance is waiting on (`wakeAt`, `eventType` in step records) but
-// never acts on time itself.
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Engine surface
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface DurableWorkflowsEngine {
   /**
-   * Register a workflow definition (bundled ESM source).
-   */
-  register: (definition: WorkflowDefinition) => Promise<void>
-  /**
-   * Start a new instance of a registered workflow.
+   * Start a new instance. Resolves the definition via `resolveDefinition`
+   * (without a version unless `opts.version` says otherwise) and pins the
+   * returned concrete version to the instance for all future replays.
    */
   create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
@@ -128,12 +119,11 @@ export interface DurableWorkflowsEngine {
   dispose: () => Promise<void>
 }
 
-export interface WorkflowDefinition {
-  name: string
+export interface ResolvedDefinition {
   /**
-   * Instances pin the version they started on; replay always uses it.
+   * The concrete version the instance pins; replay always resolves exactly this.
    */
-  version?: string
+  version: string
   /**
    * Bundled ESM source. Capability specifiers stay external.
    */
@@ -145,6 +135,10 @@ export interface CreateOptions {
    * Caller-provided id for idempotent creation (e.g. derived from an alarm id).
    */
   instanceId?: string
+  /**
+   * Pin a specific definition version instead of the resolver's "latest".
+   */
+  version?: string
 }
 
 export interface WorkflowInstanceHandle {
@@ -162,6 +156,21 @@ export type InstanceStatus = 'running' | 'waiting' | 'completed' | 'failed' | 't
 // Plugins
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A plugin ships as ONE npm package with two faces, versioned as a unit so
+ * shim, host implementation and author-facing types can never drift:
+ *
+ *   "."          → the plugin factory (this interface) — consumed by the
+ *                  application composing the engine.
+ *   "./workflow" → ambient types for workflow authors' editors:
+ *                  `declare module 'durable-workflows:agents' { ... }`
+ *                  (the `cloudflare:workers` pattern). Zero runtime coupling —
+ *                  at runtime the specifier resolves to the shim in the prefix.
+ *
+ * Breaking the workflow-facing API is a major bump; in-flight instances keep
+ * running on an engine composed with the old major (npm alias deps), new
+ * instances go to a new engine — routing and drain are application scope.
+ */
 export interface DurableWorkflowsPlugin {
   /**
    * Unique id (diagnostics, error scoping).
@@ -204,6 +213,12 @@ export interface InstanceRunContext {
    */
   run: number
 }
+
+/**
+ * Identity helper for plugin authors: preserves the literal type of the
+ * plugin object (notably `$engine`) so it flows into engine-type inference.
+ */
+export type DefineWorkflowsPlugin = <const TPlugin extends DurableWorkflowsPlugin>(plugin: TPlugin) => TPlugin
 
 /**
  * Intersection of all `$engine` augmentations carried by the plugin tuple.
