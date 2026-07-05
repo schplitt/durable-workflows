@@ -27,6 +27,11 @@ export interface DurableWorkflowsOptions {
    * replay, and disposed by `dispose()`. Note: each engine owns its own
    * sandbox subprocess — two engines (e.g. two runtime-surface versions)
    * means two processes.
+   *
+   * Engine default: `maxIsolates: 30` (iso4 defaults to CPU count) — replay
+   * runs are mostly I/O-idle (bridge waits don't burn CPU), so far more
+   * concurrent runs than cores is fine and many instances may continue at
+   * once.
    */
   sandbox?: SandboxOptions
   /**
@@ -72,11 +77,18 @@ export interface DurableWorkflowsOptions {
    *   ~2× headroom while catching the runaway `while (true) await tool()`
    *   loop fast. Step-per-item loops over large collections should raise
    *   this via their definition's limits.
-   * - `wallTimeMs: 120_000` — wall time DOES include in-run bridge waits
+   * - `wallTimeMs: 180_000` — wall time DOES include in-run bridge waits
    *   (iso4 defaults to 30s). Anything legitimately longer than this belongs
    *   in a durable operation that suspends.
-   * - everything else: iso4 defaults (note `cpuTimeMs: 5s` — heavy in-sandbox
-   *   compute like CSV parsing should raise it via its definition's limits).
+   * - everything else: iso4 defaults, including `memoryMb: 64` and the 16MB
+   *   bridge/export payload caps — DELIBERATELY not raised. The sandbox is
+   *   the orchestrator, not the compute engine: every value crossing a
+   *   durable boundary is persisted and re-crossed on replay, so big data
+   *   (large CSVs, images) is passed BY REFERENCE (storage key, workspace
+   *   path) and processed host-side by plugins or agents, which have real
+   *   toolchains. 64MB covers legitimate in-sandbox work (reshaping a few MB
+   *   of JSON, orchestration math); honest edge cases raise `cpuTimeMs` /
+   *   `memoryMb` via their definition's limits.
    *
    * A limit breach kills the run mid-step with nothing written: the instance
    * fails with the iso4 error, and raising limits + `continueWorkflow`
