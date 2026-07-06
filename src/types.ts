@@ -55,15 +55,6 @@ export interface DurableWorkflowsOptions {
    */
   plugins?: readonly DurableWorkflowsPlugin[]
   /**
-   * Retry policy for steps that fail without a per-step override.
-   * OMITTED = NO RETRIES: a failing step fails on first attempt. There is no
-   * built-in default, and no error classification in the engine: workflow
-   * errors are the user's domain (catch them or set per-step policy); the
-   * only thing that stops a configured retry is a host-side `permanent`
-   * verdict on the error (e.g. a plugin failing an operation as unresolvable).
-   */
-  retry?: RetryPolicy
-  /**
    * iso4 resource limits per replay run; `ResolvedDefinition.limits`
    * overrides per definition, and explicit settings ALWAYS win — the engine
    * never silently overrides what was configured. Limits are a safety net
@@ -261,6 +252,22 @@ export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plu
 // Policies & errors
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Retries are configured PER STEP ONLY (an option on the step call inside the
+ * workflow) — there is no engine-level policy and no built-in default: a step
+ * without its own policy fails on first attempt.
+ *
+ * The policy is PINNED ON FIRST SIGHT: the value supplied by the first call
+ * that reaches the host is persisted with the step, and policies supplied by
+ * later replays of the same step are ignored. Step options should be constant
+ * anyway (determinism rules), but pinning makes retry behavior immune to a
+ * nondeterministically computed policy.
+ *
+ * A host-side `permanent` error verdict always wins: such failures are never
+ * retried regardless of policy. There is no error classification in the
+ * engine beyond that — workflow errors are the author's domain (catch them,
+ * or don't configure retries).
+ */
 export interface RetryPolicy {
   /**
    * Maximum attempts per step (1 = no retries).
@@ -335,6 +342,11 @@ export interface DoStepFailedRecord extends StepRecordBase {
   kind: 'do'
   status: 'failed'
   error: SerializedError
+  /**
+   * Retry policy pinned from the FIRST call that supplied one — policies
+   * passed by later replays are ignored. Absent = never retried.
+   */
+  retry?: RetryPolicy
 }
 
 /**
@@ -437,6 +449,11 @@ export interface OperationStepFailedRecord extends StepRecordBase {
   status: 'failed'
   operationToken: string
   error: SerializedError
+  /**
+   * Retry policy pinned from the FIRST call that supplied one — policies
+   * passed by later replays are ignored. Absent = never retried.
+   */
+  retry?: RetryPolicy
 }
 
 export interface InstanceRecord {
