@@ -28,10 +28,13 @@ export interface DurableWorkflowsOptions {
    * sandbox subprocess — two engines (e.g. two runtime-surface versions)
    * means two processes.
    *
-   * Engine default: `maxIsolates: 30` (iso4 defaults to CPU count) — replay
+   * Engine default: `maxIsolates: 45` (iso4 defaults to CPU count) — replay
    * runs are mostly I/O-idle (bridge waits don't burn CPU), so far more
-   * concurrent runs than cores is fine and many instances may continue at
-   * once.
+   * concurrent runs than cores is fine. This is the capacity budget for
+   * concurrently ACTIVE runs, including long-executing step bodies: one
+   * held slot per run for up to the wall budget; excess continuations queue.
+   * Sized for a 2-core / 4GB service (worst case 45 × 64MB ≈ 2.9GB isolate
+   * memory; realistic orchestration isolates use a fraction of the cap).
    */
   sandbox?: SandboxOptions
   /**
@@ -52,8 +55,21 @@ export interface DurableWorkflowsOptions {
   /**
    * Capabilities workflow code can import. Each plugin is a pair of an
    * in-sandbox shim and a host-side implementation.
+   *
+   * Always a record: keys ARE the mount points — the virtual module
+   * specifiers workflow code imports. Only what is mounted exists in the
+   * sandbox, so a deployment can expose a fully custom namespace over the
+   * first-party plugins (e.g. `{ 'cumulocity:sleep': timePlugin(...) }`).
+   * Core modules (`durable-workflows:workflow`) are remounted via `alias`.
    */
-  plugins?: readonly DurableWorkflowsPlugin[]
+  plugins?: Readonly<Record<string, DurableWorkflowsPlugin>>
+  /**
+   * Additional or replacement specifiers for CORE modules, e.g.
+   * `{ 'cumulocity:workflow': 'durable-workflows:workflow' }` (alias →
+   * canonical). The types-side counterpart is a thin ambient re-export
+   * d.ts shipped by the whitelabeling package.
+   */
+  alias?: Readonly<Record<string, string>>
   /**
    * iso4 resource limits per replay run; `ResolvedDefinition.limits`
    * overrides per definition, and explicit settings ALWAYS win — the engine
@@ -68,13 +84,18 @@ export interface DurableWorkflowsOptions {
    *   ~2× headroom while catching the runaway `while (true) await tool()`
    *   loop fast. Step-per-item loops over large collections should raise
    *   this via their definition's limits.
-   * - `wallTimeMs: 300_000` — wall time DOES include in-run bridge waits and
-   *   in-run retry delays (iso4 defaults to 30s). Note a run executes ALL
-   *   remaining ready steps sequentially, not just one — step-heavy I/O
-   *   pipelines (e.g. migrations) consume wall time in a single run and
-   *   should raise this via their definition's limits. A single wait longer
-   *   than the budget belongs in a durable operation that suspends. CPU time
-   *   needs no such care: bridge waits and retry delays don't burn it.
+   * - `wallTimeMs: 600_000` — wall time DOES include in-run bridge waits
+   *   (iso4 defaults to 30s). Matches Cloudflare's default step duration:
+   *   step bodies doing mixed compute + I/O may legitimately run for
+   *   minutes, each holding one isolate slot while active. A run executes
+   *   ALL remaining ready steps sequentially — step-heavy pipelines (e.g.
+   *   migrations) raise this via their definition's limits; anything longer
+   *   than the budget (or of unknown duration) is lifted to a durable
+   *   operation that suspends, which holds NO slot. Retry backoffs never
+   *   wait in-run (cross-run via `retryAt`).
+   * - `cpuTimeMs: 30_000` — actual in-sandbox compute per run (bridge waits
+   *   excluded; iso4 defaults to 5s). Generous enough for real per-step
+   *   data reshaping; heavy crunchers raise it per definition.
    * - everything else: iso4 defaults, including `memoryMb: 64` and the 16MB
    *   bridge/export payload caps — DELIBERATELY not raised. The sandbox is
    *   the orchestrator, not the compute engine: every value crossing a
@@ -119,20 +140,23 @@ export interface DurableWorkflowsEngine {
   create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
   /**
-   * Deliver the payload a currently WAITING wait-for-event step (matching
-   * `type`) is suspended on, then continue the instance. There is NO event
-   * buffering: if no matching step is waiting, this rejects. The wait step
-   * itself is the hook — its waiting record and the emitted `onEvent` tell
-   * the application that something can now be delivered; what an "event"
-   * is, and when it happens, is entirely application scope.
+   * THE single continuation entry point — called by the application's own
+   * trigger wiring (its cron, its timer service, its webhook handlers). The
+   * engine never wakes anything itself.
+   *
+   * Without `delivery`: plain replay — deadlines (sleep `wakeAt`, wait
+   * timeouts, `retryAt`) are re-checked; if nothing is due the run just
+   * suspends again (harmless no-op).
+   *
+   * With `delivery`: the result for the pending operation addressed by
+   * `token`. The token is minted by the engine when the operation is
+   * created and handed OUTWARD at dispatch time (dispatch payload, waiting
+   * step record, `onEvent`) — the caller echoes it back, never derives it.
+   * `error.class` carries the retry verdict. Unknown or already-settled
+   * token → rejects (which doubles as duplicate/too-late detection). There
+   * is NO buffering: a delivery must hit a waiting operation.
    */
-  sendEvent: (instanceId: string, event: { type: string, payload?: unknown }) => Promise<void>
-  /**
-   * Replay a suspended instance now. This is THE continuation entry point —
-   * called by the application's own trigger wiring (its cron, its timer
-   * service, its queue consumer). The engine never wakes anything itself.
-   */
-  continueWorkflow: (instanceId: string) => Promise<void>
+  continueWorkflow: (instanceId: string, delivery?: OperationDelivery) => Promise<void>
   terminate: (instanceId: string) => Promise<void>
   /**
    * Prefix invalidation: deletes the step and every step recorded after it,
@@ -170,6 +194,16 @@ export interface ResolvedDefinition {
   limits?: Partial<ResourceLimits>
 }
 
+/**
+ * The result the outside world hands a suspended workflow, addressed by the
+ * operation token that was handed out at dispatch time. Success delivers the
+ * value the waiting operation resolves with; failure delivers an error whose
+ * `class` feeds the retry machinery (`permanent` = never retried).
+ */
+export type OperationDelivery
+  = | { token: string, value: unknown }
+    | { token: string, error: SerializedError }
+
 export interface CreateOptions {
   /**
    * Caller-provided id for idempotent creation (e.g. derived from an alarm id).
@@ -185,12 +219,36 @@ export interface WorkflowInstanceHandle {
   readonly id: string
   status: () => Promise<InstanceStatus>
   /**
-   * The workflow's return value; only once status is `completed`.
+   * `null` while the instance is running/waiting; the outcome once it is
+   * terminal.
    */
-  result: () => Promise<unknown>
+  outcome: () => Promise<InstanceOutcome | null>
 }
 
-export type InstanceStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'terminated'
+/**
+ * How a finished instance ended, plus run metadata — everything derivable
+ * from the instance record. NOTE: the workflow function's return value is
+ * DISCARDED — workflows act through their steps, nobody consumes a return
+ * (revisit if child workflows / awaiting another workflow ever lands).
+ */
+export type InstanceOutcome
+  = | (InstanceOutcomeBase & { status: 'completed' })
+    | (InstanceOutcomeBase & { status: 'failed', error: SerializedError })
+    | (InstanceOutcomeBase & { status: 'terminated' })
+
+interface InstanceOutcomeBase {
+  instanceId: string
+  workflow: string
+  version: string
+  /**
+   * How many runs (replays) the instance took.
+   */
+  runs: number
+  createdAt: string
+  finishedAt: string
+}
+
+export type InstanceStatus = InstanceRecord['status']
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plugins
@@ -201,15 +259,27 @@ export type InstanceStatus = 'running' | 'waiting' | 'completed' | 'failed' | 't
  * shim, host implementation and author-facing types can never drift:
  *
  *   "."          → the plugin factory (this interface) — consumed by the
- *                  application composing the engine.
+ *                  application composing the engine. A plugin does NOT name
+ *                  itself: the mount key in `options.plugins` is the
+ *                  specifier; the package README documents its conventional
+ *                  one (e.g. `durable-workflows:agents`).
  *   "./workflow" → ambient types for workflow authors' editors:
  *                  `declare module 'durable-workflows:agents' { ... }`
- *                  (the `cloudflare:workers` pattern). Zero runtime coupling —
- *                  at runtime the specifier resolves to the shim in the prefix.
+ *                  (the `cloudflare:workers` pattern) for the conventional
+ *                  specifier; whitelabeled mounts ship their own thin
+ *                  re-export d.ts. Zero runtime coupling — at runtime the
+ *                  specifier resolves to the shim in the prefix.
  *
  * Breaking the workflow-facing API is a major bump; in-flight instances keep
  * running on an engine composed with the old major (npm alias deps), new
  * instances go to a new engine — routing and drain are application scope.
+ *
+ * Plugins repeat the core's adapter pattern one level down: a plugin defines
+ * its capability, shim and token protocol, but takes its deployment BACKEND
+ * as an interface on its factory — the time plugin takes a timer backend,
+ * an events plugin a notification transport, the agents plugin an agent
+ * service client. The dev wires each to their infra exactly like they wire
+ * the core's store to their database.
  */
 export interface DurableWorkflowsPlugin {
   /**
@@ -217,13 +287,12 @@ export interface DurableWorkflowsPlugin {
    */
   id: string
   /**
-   * Virtual module specifier workflow code imports, e.g. `durable-workflows:agents`.
-   */
-  specifier: string
-  /**
-   * In-sandbox ESM source compiled into the iso4 prefix. Defines the module's
-   * exports; may use the core's in-sandbox durable-call helper so plugin
-   * operations become auto-id'd durable steps (how agent sessions work).
+   * In-sandbox ESM source compiled into the iso4 prefix. Defines the
+   * module's exports, building on `durable-workflows:internal` — the core's
+   * semver'd shim-facing module (durable-operation calls with auto step ids
+   * and tokens, bound to this plugin's host handlers). `internal` is for
+   * shims only: registration-time import scanning rejects workflow bundles
+   * that import it.
    */
   shim: string
   /**
@@ -261,22 +330,28 @@ export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plu
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Retries are configured PER STEP ONLY (an option on the step call inside the
- * workflow) — there is no engine-level policy and no built-in default: a step
- * without its own policy fails on first attempt.
+ * Retries are configured per step (an option on the step call inside the
+ * workflow). A step that supplies no policy gets the ENGINE DEFAULT:
+ * `{ limit: 3, backoff: 'linear', delayMs: 3000 }`, paired with a default
+ * per-step timeout of 5 minutes (which must fit the run's wall budget —
+ * enforced engine-side via run abort, attributable to the step, retryable).
  *
- * Retries execute IN-RUN: the step body is re-run inside the same sandbox
- * execution, with backoff delays implemented as host-backed waits — these
- * consume wall time only (bridge waits are excluded from the CPU budget),
- * never CPU. The whole retry schedule must fit the run's wall budget; the
- * failed record is written only once the policy is exhausted, and from then
- * on it replays as a deterministic throw.
+ * Retries are CROSS-RUN — an isolate is never parked to wait out a backoff
+ * delay. A failing attempt updates the failed record (attempts, pinned
+ * policy, and `retryAt` = failure time + computed backoff) and the run ends
+ * with the instance `waiting`. Re-execution happens on a later continuation
+ * arriving at or after `retryAt` — checked at continuation time like every
+ * other deadline; `retryAt` is informational for the application's trigger
+ * wiring, the engine never acts on time itself. Once attempts exhaust the
+ * policy the failure is final and replays as a deterministic throw.
  *
- * The policy is PINNED ON FIRST SIGHT: the value supplied by the first call
- * that reaches the host is persisted with the step, and policies supplied by
- * later replays of the same step are ignored. Step options should be constant
- * anyway (determinism rules), but pinning makes retry behavior immune to a
- * nondeterministically computed policy.
+ * The EFFECTIVE policy is PINNED AT FIRST FAILURE: the step's own option (or
+ * the engine default in force at that moment) is resolved and persisted on
+ * the failed record; policies supplied by later replays — and later changes
+ * to the engine default — are ignored. Step options should be constant
+ * anyway (determinism rules), but pinning makes retry behavior immune to
+ * nondeterministically computed policies and to default drift across
+ * deploys.
  *
  * A host-side `permanent` error verdict always wins: such failures are never
  * retried regardless of policy (workflow code can trigger this via the
@@ -289,7 +364,13 @@ export interface RetryPolicy {
    * Maximum attempts per step (1 = no retries).
    */
   limit: number
+  /**
+   * How the delay grows per attempt. Default: 'constant'.
+   */
   backoff?: 'constant' | 'linear' | 'exponential'
+  /**
+   * Base delay between attempts in milliseconds. Minimum (and default) 1000.
+   */
   delayMs?: number
 }
 
@@ -297,7 +378,7 @@ export type ErrorClass = 'permanent' | 'transient'
 
 export interface SerializedError {
   /**
-   * JS error name. See iso4#12 — flattened to 'Error' until fixed upstream.
+   * JS error name.
    */
   name: string
   message: string
@@ -323,8 +404,6 @@ export type StepStatus = StepRecord['status']
 export type StepRecord
   = | DoStepRecord
     | ScopeStepRecord
-    | SleepStepRecord
-    | WaitForEventStepRecord
     | OperationStepRecord
 
 interface StepRecordBase {
@@ -359,10 +438,17 @@ export interface DoStepFailedRecord extends StepRecordBase {
   status: 'failed'
   error: SerializedError
   /**
-   * Retry policy pinned from the FIRST call that supplied one — policies
-   * passed by later replays are ignored. Absent = never retried.
+   * The EFFECTIVE policy, pinned at first failure: the step's own option or
+   * the engine default in force at that moment. Policies supplied by later
+   * replays — and later changes to the engine default — are ignored.
    */
-  retry?: RetryPolicy
+  retry: RetryPolicy
+  /**
+   * When the next attempt becomes eligible — present only while retries
+   * remain. Informational for the application's trigger wiring (like
+   * `wakeAt`); enforced at continuation time.
+   */
+  retryAt?: string
 }
 
 /**
@@ -385,58 +471,12 @@ export interface ScopeStepFailedRecord extends StepRecordBase {
 }
 
 /**
- * Durable timer. Cannot fail — it is either still pending or satisfied.
- */
-export interface SleepStepRecord extends StepRecordBase {
-  kind: 'sleep'
-  status: 'waiting' | 'completed'
-  /**
-   * Wake deadline. Informational for the application's own trigger wiring —
-   * the engine checks it only when a continuation replays past this step.
-   */
-  wakeAt: string
-}
-
-/**
- * Durable wait on an external event. `failed` = timeout expired before the
- * event arrived (checked at continuation time, never autonomously).
- */
-export type WaitForEventStepRecord
-  = | WaitForEventStepWaitingRecord
-    | WaitForEventStepCompletedRecord
-    | WaitForEventStepFailedRecord
-
-export interface WaitForEventStepWaitingRecord extends StepRecordBase {
-  kind: 'waitForEvent'
-  status: 'waiting'
-  eventType: string
-  /**
-   * Timeout deadline, if the wait has one.
-   */
-  wakeAt?: string
-}
-
-export interface WaitForEventStepCompletedRecord extends StepRecordBase {
-  kind: 'waitForEvent'
-  status: 'completed'
-  eventType: string
-  /**
-   * The delivered event payload.
-   */
-  value: unknown
-}
-
-export interface WaitForEventStepFailedRecord extends StepRecordBase {
-  kind: 'waitForEvent'
-  status: 'failed'
-  eventType: string
-  error: SerializedError
-}
-
-/**
- * Long-running host work dispatched by a plugin (e.g. an agent prompt).
- * `operationToken` is the dispatch idempotency key and how the outer world
- * addresses the completion back to this step.
+ * THE universal wait primitive — the only thing that suspends. Every waiting
+ * capability (sleep, external events/approvals, agent work) is a plugin
+ * composing this: an outward host-side dispatch paired with an inbound
+ * token-addressed delivery via `continueWorkflow`. `token` is the dispatch
+ * idempotency key AND the delivery address. Multiple operations may be
+ * pending in parallel — which is why deliveries are always token-addressed.
  */
 export type OperationStepRecord
   = | OperationStepWaitingRecord
@@ -446,9 +486,20 @@ export type OperationStepRecord
 export interface OperationStepWaitingRecord extends StepRecordBase {
   kind: 'operation'
   status: 'waiting'
-  operationToken: string
+  token: string
   /**
-   * Operation timeout deadline, if any.
+   * Id of the plugin that dispatched this operation — observability and
+   * orphan reconciliation (a plugin finds "its" waiting operations).
+   */
+  plugin: string
+  /**
+   * Plugin-defined operation name (e.g. 'sleep', 'approval.request',
+   * 'session.prompt') — descriptive for wiring/UI; matching is by token.
+   */
+  operation: string
+  /**
+   * Deadline, if any (sleep wake time, wait/operation timeout) — enforced at
+   * continuation time; informational for the application's trigger wiring.
    */
   wakeAt?: string
 }
@@ -456,35 +507,75 @@ export interface OperationStepWaitingRecord extends StepRecordBase {
 export interface OperationStepCompletedRecord extends StepRecordBase {
   kind: 'operation'
   status: 'completed'
-  operationToken: string
+  token: string
+  plugin: string
+  operation: string
   value: unknown
 }
 
 export interface OperationStepFailedRecord extends StepRecordBase {
   kind: 'operation'
   status: 'failed'
-  operationToken: string
+  token: string
+  plugin: string
+  operation: string
   error: SerializedError
   /**
-   * Retry policy pinned from the FIRST call that supplied one — policies
-   * passed by later replays are ignored. Absent = never retried.
+   * The EFFECTIVE policy, pinned at first failure: the step's own option or
+   * the engine default in force at that moment. Policies supplied by later
+   * replays — and later changes to the engine default — are ignored.
    */
-  retry?: RetryPolicy
+  retry: RetryPolicy
+  /**
+   * When the next attempt becomes eligible — present only while retries
+   * remain. Informational for the application's trigger wiring (like
+   * `wakeAt`); enforced at continuation time.
+   */
+  retryAt?: string
 }
 
-export interface InstanceRecord {
+/**
+ * Discriminated on `status` — error exists iff failed. The workflow's return
+ * value is never persisted (discarded on completion).
+ */
+export type InstanceRecord
+  = | ActiveInstanceRecord
+    | CompletedInstanceRecord
+    | FailedInstanceRecord
+    | TerminatedInstanceRecord
+
+interface InstanceRecordBase {
   instanceId: string
   workflow: string
   /**
    * The pinned definition version — every replay resolves exactly this.
    */
   version: string
-  status: InstanceStatus
   input?: unknown
-  result?: unknown
-  error?: SerializedError
+  /**
+   * Monotonic run counter — incremented per continuation; feeds
+   * `InstanceRunContext.run` and `InstanceOutcome.runs`.
+   */
+  runs: number
   createdAt: string
   updatedAt: string
+}
+
+export interface ActiveInstanceRecord extends InstanceRecordBase {
+  status: 'running' | 'waiting'
+}
+
+export interface CompletedInstanceRecord extends InstanceRecordBase {
+  status: 'completed'
+}
+
+export interface FailedInstanceRecord extends InstanceRecordBase {
+  status: 'failed'
+  error: SerializedError
+}
+
+export interface TerminatedInstanceRecord extends InstanceRecordBase {
+  status: 'terminated'
 }
 
 export interface WorkflowStore {
@@ -508,5 +599,19 @@ export interface WorkflowStore {
 
 export type EngineEvent
   = | { type: 'instance', instanceId: string, status: InstanceStatus, run: number }
-    | { type: 'step', instanceId: string, stepId: string, status: StepStatus, attempt: number, run: number }
+    | {
+      type: 'step'
+      instanceId: string
+      stepId: string
+      kind: StepKind
+      status: StepStatus
+      attempt: number
+      run: number
+      /**
+       * The wait token for waiting wait-for-event / operation steps — this is
+       * how the application's wiring learns the delivery address (e.g. hands
+       * it to the agent service or embeds it in an approval ticket).
+       */
+      token?: string
+    }
     | { type: 'log', instanceId: string, stepId?: string, run: number, level: 'log' | 'warn' | 'error', args: unknown[] }
