@@ -35,9 +35,9 @@ export interface DurableWorkflowsOptions {
    */
   sandbox?: SandboxOptions
   /**
-   * The only mandatory adapter: where instances, steps and pending events
-   * live. Values are stored exactly as they cross the iso4 bridge
-   * (V8-serializable data) — there is no codec layer.
+   * The only mandatory adapter: where instances and steps live. Values are
+   * stored exactly as they cross the iso4 bridge (V8-serializable data) —
+   * there is no codec layer.
    */
   store: WorkflowStore
   /**
@@ -68,9 +68,13 @@ export interface DurableWorkflowsOptions {
    *   ~2× headroom while catching the runaway `while (true) await tool()`
    *   loop fast. Step-per-item loops over large collections should raise
    *   this via their definition's limits.
-   * - `wallTimeMs: 180_000` — wall time DOES include in-run bridge waits
-   *   (iso4 defaults to 30s). Anything legitimately longer than this belongs
-   *   in a durable operation that suspends.
+   * - `wallTimeMs: 300_000` — wall time DOES include in-run bridge waits and
+   *   in-run retry delays (iso4 defaults to 30s). Note a run executes ALL
+   *   remaining ready steps sequentially, not just one — step-heavy I/O
+   *   pipelines (e.g. migrations) consume wall time in a single run and
+   *   should raise this via their definition's limits. A single wait longer
+   *   than the budget belongs in a durable operation that suspends. CPU time
+   *   needs no such care: bridge waits and retry delays don't burn it.
    * - everything else: iso4 defaults, including `memoryMb: 64` and the 16MB
    *   bridge/export payload caps — DELIBERATELY not raised. The sandbox is
    *   the orchestrator, not the compute engine: every value crossing a
@@ -115,8 +119,12 @@ export interface DurableWorkflowsEngine {
   create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
   /**
-   * Deliver an external event (resolves a matching wait-for-event) and
-   * continue the instance.
+   * Deliver the payload a currently WAITING wait-for-event step (matching
+   * `type`) is suspended on, then continue the instance. There is NO event
+   * buffering: if no matching step is waiting, this rejects. The wait step
+   * itself is the hook — its waiting record and the emitted `onEvent` tell
+   * the application that something can now be delivered; what an "event"
+   * is, and when it happens, is entirely application scope.
    */
   sendEvent: (instanceId: string, event: { type: string, payload?: unknown }) => Promise<void>
   /**
@@ -257,6 +265,13 @@ export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plu
  * workflow) — there is no engine-level policy and no built-in default: a step
  * without its own policy fails on first attempt.
  *
+ * Retries execute IN-RUN: the step body is re-run inside the same sandbox
+ * execution, with backoff delays implemented as host-backed waits — these
+ * consume wall time only (bridge waits are excluded from the CPU budget),
+ * never CPU. The whole retry schedule must fit the run's wall budget; the
+ * failed record is written only once the policy is exhausted, and from then
+ * on it replays as a deterministic throw.
+ *
  * The policy is PINNED ON FIRST SIGHT: the value supplied by the first call
  * that reaches the host is persisted with the step, and policies supplied by
  * later replays of the same step are ignored. Step options should be constant
@@ -264,9 +279,10 @@ export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plu
  * nondeterministically computed policy.
  *
  * A host-side `permanent` error verdict always wins: such failures are never
- * retried regardless of policy. There is no error classification in the
- * engine beyond that — workflow errors are the author's domain (catch them,
- * or don't configure retries).
+ * retried regardless of policy (workflow code can trigger this via the
+ * well-known NonRetryableError, Cloudflare-style). There is no error
+ * classification in the engine beyond that — workflow errors are the
+ * author's domain (catch them, or don't configure retries).
  */
 export interface RetryPolicy {
   /**
@@ -484,12 +500,6 @@ export interface WorkflowStore {
    * Prefix delete: the step and every record with a greater `seq`.
    */
   evictFromStep: (instanceId: string, stepId: string) => Promise<void>
-
-  putEvent: (instanceId: string, type: string, payload: unknown) => Promise<void>
-  /**
-   * Consume one pending event of the given type, or null.
-   */
-  takeEvent: (instanceId: string, type: string) => Promise<unknown | null>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
