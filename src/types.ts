@@ -459,7 +459,10 @@ export interface OperationStepFailedRecord extends StepRecordBase {
 export interface InstanceRecord {
   instanceId: string
   workflow: string
-  version?: string
+  /**
+   * The pinned definition version — every replay resolves exactly this.
+   */
+  version: string
   status: InstanceStatus
   input?: unknown
   result?: unknown
