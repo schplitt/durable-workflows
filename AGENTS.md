@@ -127,6 +127,7 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 
 ### Common Mistakes to Avoid
 
+- Do not commit changes before the user has reviewed them — make the edits, report, and wait for the user's go-ahead to commit.
 - Do not use `pnpm test` in automation.
 - Do not create tiny helper/utility functions or `parse*`/`normalize*` wrappers for trivial one-off logic.
 - Do not guess when the requested behavior or scope is unclear.
