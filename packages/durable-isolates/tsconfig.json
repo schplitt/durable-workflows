@@ -27,7 +27,7 @@
     "moduleDetection": "force",
     "target": "esnext",
     "skipDefaultLibCheck": true,
-    "skipLibCheck": true,
+    "skipLibCheck": true
   },
-  "include": ["./src/**/*"]
+  "include": ["./src/**/*", "./tests/**/*"]
 }

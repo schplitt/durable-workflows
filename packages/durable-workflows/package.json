@@ -1,0 +1,60 @@
+{
+  "name": "durable-workflows",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A composable durable workflow library inspired by Cloudflare Workflows, built on top of iso4",
+  "keywords": [
+    "workflow",
+    "durable",
+    "durable-execution",
+    "step",
+    "sandbox",
+    "iso4",
+    "typescript",
+    "esm"
+  ],
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/durable-workflows/tree/main/packages/durable-workflows#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/durable-workflows.git",
+    "directory": "packages/durable-workflows"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/durable-workflows/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "durable-isolates": "workspace:*"
+  },
+  "devDependencies": {
+    "@schplitt/eslint-config": "catalog:",
+    "eslint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=26.0.0"
+  }
+}
