@@ -11,7 +11,7 @@
  * editors. Anything operational a plugin needs host-side (e.g. agents orphan
  * reconciliation) lives on the plugin instance itself, not on the engine.
  */
-import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
+import type { ResourceLimits, SandboxOptions } from 'durable-isolates/types/iso4'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory

@@ -1,17 +1,23 @@
 name: Release
 
-permissions:
-  contents: write
-  id-token: write
-
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
+  # Runs on every push to main.
+  # When there are pending changesets → creates/updates the "Version Packages" PR.
+  # When the Version Packages PR is merged (no pending changesets) → the action
+  # runs `changeset publish`, pushing both packages to npm.
   release:
+    name: Version & Publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write # required for npm OIDC trusted publishing
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,30 +31,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 26
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build
-        run: pnpm build
+        run: pnpm -r --filter="./packages/*" build
 
-      - name: Test
-        run: pnpm test
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Update npm
-        run: npm install -g npm@latest
-
-      - run: pnpm changelogithub
+      - name: Create Version PR or publish
+        uses: changesets/action@v1
+        with:
+          version: pnpm exec changeset version
+          publish: pnpm exec changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish to NPM
-        # publish placeholder package first, for example via npmx.dev
-        run: pnpm publish --access public --no-git-checks --provenance 

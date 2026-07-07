@@ -1,19 +1,10 @@
 {
-  "name": "@schplitt/durable-workflows",
+  "name": "durable-workflows-monorepo",
   "version": "0.0.0",
+  "private": true,
   "type": "module",
   "packageManager": "pnpm@11.7.0",
-  "description": "A composable durable workflow library inspired by Cloudflare Workflows, built on top of iso4",
-  "keywords": [
-    "workflow",
-    "durable",
-    "durable-execution",
-    "step",
-    "sandbox",
-    "iso4",
-    "typescript",
-    "esm"
-  ],
+  "description": "Monorepo for durable-workflows — a composable durable workflow library inspired by Cloudflare Workflows, built on top of iso4",
   "license": "MIT",
   "author": "schplitt",
   "homepage": "https://github.com/schplitt/durable-workflows#readme",
@@ -24,35 +15,20 @@
   "bugs": {
     "url": "https://github.com/schplitt/durable-workflows/issues"
   },
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs"
-    }
-  },
-  "main": "./dist/index.mjs",
-  "module": "./dist/index.mjs",
-  "types": "./dist/index.d.mts",
-  "files": [
-    "LICENSE",
-    "README.md",
-    "dist"
-  ],
   "scripts": {
-    "build": "tsdown",
+    "build": "pnpm -r --filter=\"./packages/*\" build",
+    "test": "pnpm -r --filter=\"./packages/*\" test",
+    "test:run": "pnpm -r --filter=\"./packages/*\" test:run",
     "lint": "eslint",
     "lint:fix": "eslint --fix",
-    "typecheck": "tsc --noEmit",
-    "prerelease": "eslint && tsc --noEmit && tsdown && vitest run",
-    "release": "bumpp",
-    "test": "vitest",
-    "test:run": "vitest run"
+    "typecheck": "pnpm -r --filter=\"./packages/*\" typecheck",
+    "changeset": "changeset",
+    "c": "changeset",
+    "release": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run && changeset"
   },
   "devDependencies": {
-    "@iso4/sandbox": "catalog:",
+    "@changesets/cli": "catalog:",
     "@schplitt/eslint-config": "catalog:",
-    "bumpp": "catalog:",
-    "changelogithub": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",

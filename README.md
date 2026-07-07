@@ -6,12 +6,21 @@ Workflows run inside a sandbox and use a step-based API whose results are persis
 
 > 🚧 Work in progress — nothing to see here yet.
 
+## Packages
+
+This is a pnpm monorepo. Published packages live in [`packages/`](./packages):
+
+| Package                                             | Description                             |
+| --------------------------------------------------- | --------------------------------------- |
+| [`durable-workflows`](./packages/durable-workflows) | The durable workflow engine.            |
+| [`durable-isolates`](./packages/durable-isolates)   | The replay kernel the engine builds on. |
+
 ## Development
 
 ```sh
 pnpm install    # Install dependencies
-pnpm test:run   # Run tests
-pnpm build      # Build
+pnpm test:run   # Run all package tests
+pnpm build      # Build all packages
 pnpm lint       # Lint
 pnpm typecheck  # Type check
 ```
