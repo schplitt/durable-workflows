@@ -5,7 +5,7 @@
 This repo is a **pnpm monorepo** (modeled on the [iso4](https://github.com/schplitt/iso4) repo, releases via [changesets](https://github.com/changesets/changesets)) containing two published packages:
 
 - **`durable-workflows`** — a composable durable workflow library, actively inspired by [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) and built on top of [`iso4`](https://github.com/schplitt/iso4). Workflows run inside a sandbox with a step-based API whose results are persisted, enabling suspend/resume, retries, and event-driven continuation. The persistence layer is pluggable, and the sandbox is extensible with user-provided globals and module imports. It has a `workspace:*` dependency on `durable-isolates` (declared now, consumed later).
-- **`durable-isolates`** — the replay kernel `durable-workflows` builds on: durably execute one isolate program over a log. Currently a skeleton; the kernel is implemented in a later session.
+- **`durable-isolates`** — the replay kernel `durable-workflows` builds on: durably execute one isolate program over a **keyed cache** of boundaries. Implemented as a **memoize-by-key router** — in-sandbox shims form a `key` and call the primitives from `durable-isolates:internal`: `durableCall(key, name, …args)` (host-handler work), `durableLookup`/`durableCommit` (sandbox-side checkpoints) and the nestable `boundary(key, fn)`/`nextKey(name)` sugar over them. The host answers a boundary from the cache by `key` or dispatches the `name` handler. A handler throwing `SuspendIsolate` suspends the run (waiting record + abort); resume is always **re-execution** (the waiting boundary re-dispatches and the handler consults host state — there is no delivery API and no tokens); `handle.suspend()` suspends externally (drains in-flight handler IO into the cache, for server teardown). Determinism is a documented contract, not an enforced check (no divergence detection). The caller owns storage, retry/eviction (cache surgery), and reacting to pending operations.
 
 The project uses ESM modules, Vitest for testing, ESLint for code quality, and tsdown for builds. Node `>=26`.
 
@@ -25,8 +25,16 @@ packages/
     vitest.config.ts
   durable-isolates/       # The replay kernel (published as `durable-isolates`)
     src/
-      index.ts            # Skeleton — kernel lands in a later session
+      index.ts            # Public entry — re-exports types + durableIsolates + SuspendIsolate
+      durable-isolates.ts # Factory: binds one lazy iso4 sandbox; hydrate() → runner
+      execute.ts          # One replay turn — the multiplexed bridge (call/lookup/commit), drain, suspend()
+      mount.ts            # Build precompile imports/globals + flatten default handlers
+      shim.ts             # In-sandbox `durable-isolates:internal` module source + bridge-global name
+      internal.ts         # Shim-facing types (the `./internal` export: durableCall/lookup/commit/boundary/nextKey)
+      suspend-isolate.ts  # `SuspendIsolate` — thrown by a handler to suspend the run
+      types/index.ts      # Kernel public type surface
       types/iso4.ts       # Re-exports the @iso4/sandbox type surface
+    tests/kernel.test.ts  # Kernel test suite
     package.json          # @iso4/sandbox dependency lives here
     tsconfig.json         # standalone (no root base)
     tsdown.config.ts
@@ -69,7 +77,7 @@ Root scripts use `pnpm -r --filter="./packages/*"`; `lint`/`lint:fix` run ESLint
 - Each package has its own `vitest.config.ts`; put tests inside that package's `tests/` directory (or alongside source under `src/`) — both are covered by the package `tsconfig.json` `include`, so tests are type-checked against the same config as source
 - Use the `*.test.ts` file naming convention
 - Run `pnpm test:run` from the root for all packages (no watch), or run it inside a single package
-- Both packages currently set `passWithNoTests: true` — they have no tests yet; drop that once a real suite lands
+- `durable-isolates` has a real suite (`tests/kernel.test.ts`) and no longer sets `passWithNoTests`. `durable-workflows` still sets `passWithNoTests: true` — drop it once that package has a real suite
 
 Example test structure:
 
