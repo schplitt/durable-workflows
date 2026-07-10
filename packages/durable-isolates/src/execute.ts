@@ -1,4 +1,4 @@
-import type { HostGlobals, Prefix, RebindGlobals, ResourceLimits, RunError } from '@iso4/sandbox'
+import type { HostGlobals, Prefix, RebindGlobals, ResourceLimits } from '@iso4/sandbox'
 import type {
   BoundaryCache,
   BoundaryRecord,
@@ -7,7 +7,6 @@ import type {
   HostHandler,
   PendingOperation,
   PerExecuteHandlers,
-  SerializedError,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
 import { DURABLE_CALL_GLOBAL } from './shim'
@@ -38,30 +37,7 @@ const SUSPENDED = Symbol('durable-isolates.suspended')
  */
 type CallEnvelope
   = | { ok: true, value: unknown }
-    | { ok: false, error: SerializedError }
-
-function serializeError(e: unknown): SerializedError {
-  if (e instanceof Error) {
-    const out: SerializedError = { name: e.name, message: e.message }
-    if (e.stack !== undefined)
-      out.stack = e.stack
-    const data = (e as { data?: unknown }).data
-    if (data !== undefined)
-      out.data = data
-    return out
-  }
-  return { name: 'Error', message: String(e) }
-}
-
-function runErrorToSerialized(error: RunError): SerializedError {
-  const out: SerializedError = {
-    name: error.name && error.name !== 'Error' ? error.name : error.code,
-    message: error.message,
-  }
-  if (error.stack !== undefined)
-    out.stack = error.stack
-  return out
-}
+    | { ok: false, error: unknown }
 
 export interface ExecuteRunParams {
   prefix: Prefix<HostGlobals, Record<string, never>>
@@ -117,7 +93,9 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   const dispatch = async (key: string, name: string, args: unknown[], seq: number): Promise<CallEnvelope | typeof SUSPENDED> => {
     const handler = registry.get(name)
     if (handler === undefined) {
-      const error: SerializedError = { name: 'Error', message: `durable-isolates: no handler for "${name}"` }
+      // Plain, persistable record (see the catch below); iso4 rebuilds it as an
+      // Error in the sandbox when the bridge re-throws it.
+      const error = { name: 'Error', message: `durable-isolates: no handler for "${name}"` }
       cache[key] = { seq, status: 'failed', error }
       return { ok: false, error }
     }
@@ -131,15 +109,23 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
         pending.push({ id: key, name, payload: e.payload })
         return SUSPENDED
       }
-      const error = serializeError(e)
+      // Record the failure as plain, persistable data (the cache is JSON-shaped).
+      // An Error's name/message are non-enumerable, so lift them explicitly; the
+      // spread carries any own enumerable fields (e.g. `status`). `stack` is
+      // dropped — a host stack is noise replayed in the sandbox, where iso4
+      // synthesizes a fresh one. The bridge re-throws this, and iso4 (>=0.2.2)
+      // rebuilds a real Error from it in the sandbox — no reconstruction shim.
+      const error = e instanceof Error ? { ...e, name: e.name, message: e.message } : e
       cache[key] = { seq, status: 'failed', error }
       return { ok: false, error }
     }
   }
 
-  // The one bridge global, multiplexed on its first argument. It always
-  // RESOLVES (never rejects — a rejecting host bridge poisons the run); the
-  // shim throws on `{ ok: false }` envelopes.
+  // The one bridge global, multiplexed on its first argument. A `call` resolves
+  // with the boundary's value on success and REJECTS with the recorded error on
+  // failure: iso4 (>=0.2.2) delivers a rejecting bridge to the sandbox `catch`
+  // faithfully (rebuilt as a real Error with name/message/fields), so no
+  // envelope unwrapping or error reconstruction is needed sandbox-side.
   const durableBridge = async (...bridgeArgs: unknown[]): Promise<unknown> => {
     const op = String(bridgeArgs[0])
 
@@ -162,9 +148,9 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     const existing = cache[key]
     if (existing !== undefined) {
       if (existing.status === 'completed')
-        return { ok: true, value: existing.value }
+        return existing.value
       if (existing.status === 'failed')
-        return { ok: false, error: existing.error }
+        throw existing.error
       // waiting → fall through and re-dispatch (existing seq reused)
     }
 
@@ -175,7 +161,9 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       controller.abort()
       return never()
     }
-    return settled
+    if (settled.ok)
+      return settled.value
+    throw settled.error
   }
 
   const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...hydrateLimits, ...executeLimits }
@@ -198,7 +186,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       return { outcome: 'suspended', pending, cache }
     if (result.status === 'completed')
       return { outcome: 'completed', result: result.exports.default, cache }
-    return { outcome: 'failed', error: runErrorToSerialized(result.error), cache }
+    return { outcome: 'failed', error: result.error, cache }
   })()
 
   const suspend = (): Promise<ExecuteResult> => {

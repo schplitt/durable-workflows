@@ -32,12 +32,9 @@ export const DURABLE_CALL_GLOBAL = '__di_call'
  *
  * `durableCall(key, name, ...args)` — the host-backed durable primitive. The
  * host answers the boundary keyed by `key` from the cache, or forwards ALL
- * `args` to the mounted handler `name`. The bridge always RESOLVES with an
- * `{ ok, value } | { ok: false, error }` envelope (never rejects — a rejecting
- * host bridge poisons the whole run), which the shim unwraps: returns the
- * value, or throws a reconstructed error (catchable, non-poisoning, with name /
- * stack / data preserved since it crossed the bridge as data). On suspension
- * the host aborts the run, so the returned promise never resolves.
+ * `args` to the mounted handler `name`. The bridge resolves with the boundary's
+ * value on success and REJECTS with the recorded error on failure.
+ * On suspension the host aborts the run, so the returned promise never settles.
  *
  * `durableLookup(key)` — non-memoized read of the live cache: `{hit, value?}`.
  * `durableCommit(key, value)` — record a completed boundary from the sandbox.
@@ -49,21 +46,11 @@ export const DURABLE_CALL_GLOBAL = '__di_call'
  * a per-scope-per-name counter (plain module state, reset every replay).
  */
 export const internalShim: string = /* js */ `
-function __di_reconstruct(e) {
-  const err = new Error(e && e.message != null ? e.message : String(e));
-  if (e && e.name) err.name = e.name;
-  if (e && e.stack) err.stack = e.stack;
-  if (e && 'data' in e && e.data !== undefined) err.data = e.data;
-  return err;
-}
-
 const __di_prefix = [];
 const __di_counters = Object.create(null);
 
 export async function durableCall(key, name, ...args) {
-  const r = await globalThis.${DURABLE_CALL_GLOBAL}('call', String(key), String(name), args);
-  if (r && r.ok) return r.value;
-  throw __di_reconstruct(r ? r.error : { message: 'durable-isolates: malformed durableCall result' });
+  return await globalThis.${DURABLE_CALL_GLOBAL}('call', String(key), String(name), args);
 }
 
 export async function durableLookup(key) {

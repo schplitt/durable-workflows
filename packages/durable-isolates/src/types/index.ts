@@ -234,9 +234,11 @@ export interface SuspendedResult extends ExecuteResultBase {
 export interface FailedResult extends ExecuteResultBase {
   outcome: 'failed'
   /**
-   * The failure: a user error or a resource-limit breach.
+   * The failure — a user error (iso4 `RunError`: `code`/`name`/`message`/
+   * `stack`/`fields`) or a resource-limit breach. Typed `unknown`: the kernel
+   * does not model a shape; the caller inspects it at its own risk.
    */
-  error: SerializedError
+  error: unknown
 }
 
 /**
@@ -287,7 +289,12 @@ export interface CompletedBoundary extends BoundaryRecordBase {
 
 export interface FailedBoundary extends BoundaryRecordBase {
   status: 'failed'
-  error: SerializedError
+  /**
+   * The value the handler threw, recorded verbatim. Re-thrown into the sandbox
+   * on replay via the durable envelope; iso4's bridge serialization carries it
+   * faithfully (name/message/stack + own fields).
+   */
+  error: unknown
 }
 
 /**
@@ -302,21 +309,4 @@ export interface WaitingBoundary extends BoundaryRecordBase {
    * The operation that suspended.
    */
   name: string
-}
-
-/**
- * The failure recorded for a boundary, with full fidelity for the CALLER (which
- * may inspect `name`/`data`, e.g. a retry classifier). The kernel re-throws it
- * into the sandbox on replay via the durable envelope, so `name`/`stack`/`data`
- * are preserved there too.
- */
-export interface SerializedError {
-  name: string
-  message: string
-  stack?: string
-  /**
-   * Structured detail carried alongside the error (iso4's structured error
-   * `data`, or a consumer's own payload). Opaque to the kernel.
-   */
-  data?: unknown
 }
