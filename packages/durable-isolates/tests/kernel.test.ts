@@ -527,7 +527,7 @@ describe('error plane', () => {
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
-    expect(r1.error.message).toContain('kaboom')
+    expect((r1.error as { message?: string }).message).toContain('kaboom')
     expect(booms).toBe(1)
 
     const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
@@ -580,7 +580,71 @@ describe('error plane', () => {
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
-    expect(r.result).toBe('NonRetryableError') // carried via the envelope, not flattened
+    expect(r.result).toBe('NonRetryableError') // carried via the bridge, not flattened
+  }, 15_000)
+
+  test('a host throw reaches the sandbox catch as a real Error with ALL own fields', async () => {
+    const handlers: PerExecuteHandlers = {
+      boom: () => {
+        throw Object.assign(new Error('payment declined'), { name: 'PaymentError', status: 402 })
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) {
+        out = { name: e.name, message: e.message, status: e.status, isError: e instanceof Error }
+      }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, handlers }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    // name/message + the custom `status` survive; rebuilt as a real Error in-sandbox.
+    expect(r.result).toEqual({ name: 'PaymentError', message: 'payment declined', status: 402, isError: true })
+    // Recorded as plain, persistable data with the host stack stripped.
+    const failed = Object.values(r.cache).find((rec) => rec.status === 'failed')
+    expect(failed?.status).toBe('failed')
+    if (failed?.status !== 'failed')
+      return
+    expect(failed.error).toEqual({ name: 'PaymentError', message: 'payment declined', status: 402 })
+  }, 15_000)
+
+  test('a non-Error host throw crosses without an assumed shape', async () => {
+    const handlers: PerExecuteHandlers = {
+      boom: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
+        throw { code: 'DENY', reason: 'nope' }
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = { code: e.code, reason: e.reason } }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, handlers }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual({ code: 'DENY', reason: 'nope' })
+  }, 15_000)
+
+  test('an uncaught host throw surfaces as a structured run-level failure', async () => {
+    const handlers: PerExecuteHandlers = {
+      boom: () => {
+        throw Object.assign(new Error('boom'), { name: 'PaymentError', status: 402 })
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('boom', {})`
+
+    const r = await runner.execute({ code, cache: {}, handlers }).result
+    expect(r.outcome).toBe('failed')
+    if (r.outcome !== 'failed')
+      return
+    const err = r.error as { name?: string, message?: string, fields?: Record<string, unknown> }
+    expect(err.name).toBe('PaymentError')
+    expect(err.message).toBe('boom')
+    expect(err.fields?.status).toBe(402) // iso4 nests non-reserved props under `fields`
   }, 15_000)
 
   test('a changed program just misses and runs — determinism is a contract, not a check', async () => {

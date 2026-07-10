@@ -33,11 +33,11 @@ export interface ExecuteOptions {
 }
 export interface FailedBoundary extends BoundaryRecordBase {
   status: "failed";
-  error: SerializedError;
+  error: unknown;
 }
 export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
-  error: SerializedError;
+  error: unknown;
 }
 export interface HydrateOptions {
   modules: Readonly<Record<string, ModuleDefinition>>;
@@ -51,12 +51,6 @@ export interface PendingOperation {
   id: string;
   name: string;
   payload: unknown;
-}
-export interface SerializedError {
-  name: string;
-  message: string;
-  stack?: string;
-  data?: unknown;
 }
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";
