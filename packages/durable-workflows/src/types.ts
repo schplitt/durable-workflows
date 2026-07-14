@@ -11,6 +11,7 @@
  * editors. Anything operational a plugin needs host-side (e.g. agents orphan
  * reconciliation) lives on the plugin instance itself, not on the engine.
  */
+import type { HostHandler } from 'durable-isolates'
 import type { ResourceLimits, SandboxOptions } from 'durable-isolates/types/iso4'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,12 +79,16 @@ export interface DurableWorkflowsOptions {
    * (host I/O is free), so generous values cost little.
    *
    * Engine defaults (differing from iso4's own):
-   * - `maxBridgeCalls: 300` — replay makes ~1 call per completed step plus
-   *   2 per executing step plus every in-step host call; a typical workflow
-   *   (~32 steps × ~3 host calls) peaks around 160 in a full run, so 300 is
-   *   ~2× headroom while catching the runaway `while (true) await tool()`
-   *   loop fast. Step-per-item loops over large collections should raise
-   *   this via their definition's limits.
+   * - `maxBridgeCalls: 300` — each durable boundary costs a small, known
+   *   number of bridge calls: a completed do/scope replays as 1 (a
+   *   `durableLookup` hit, its body skipped), a do/scope executing this run is
+   *   2 (`durableLookup` miss + `durableCommit`), and every durable operation
+   *   is 1 (`durableCall`, whether answered from cache or dispatched). A
+   *   typical workflow (~32 boundaries, most cached on a late replay, a handful
+   *   of operations) peaks around 100–160 calls in a full run, so 300 is ~2×
+   *   headroom while catching the runaway `while (true) await op()` loop fast.
+   *   Step-per-item loops over large collections should raise this via their
+   *   definition's limits.
    * - `wallTimeMs: 600_000` — wall time DOES include in-run bridge waits
    *   (iso4 defaults to 30s). Matches Cloudflare's default step duration:
    *   step bodies doing mixed compute + I/O may legitimately run for
@@ -152,7 +157,16 @@ export interface DurableWorkflowsEngine {
    * `token`. The token is minted by the engine when the operation is
    * created and handed OUTWARD at dispatch time (dispatch payload, waiting
    * step record, `onEvent`) — the caller echoes it back, never derives it.
-   * `error.class` carries the retry verdict. Unknown or already-settled
+   *
+   * Delivery is entirely a STORE operation followed by a plain re-execution —
+   * nothing is injected into the kernel cache. The engine settles the token
+   * against the store (flips the waiting operation record and stashes the
+   * delivered value / error+verdict), then re-executes. On re-dispatch the
+   * operation's host handler consults that stashed result and RETURNS it (→ the
+   * kernel records a completed boundary through this live dispatch) or THROWS
+   * it (→ a failed boundary, `error.class` deciding retry). This is why the
+   * kernel needs no delivery API: the value only ever enters the cache the one
+   * legal way, through the handler's re-dispatch. Unknown or already-settled
    * token → rejects (which doubles as duplicate/too-late detection). There
    * is NO buffering: a delivery must hit a waiting operation.
    */
@@ -289,10 +303,14 @@ export interface DurableWorkflowsPlugin {
   /**
    * In-sandbox ESM source compiled into the iso4 prefix. Defines the
    * module's exports, building on `durable-workflows:internal` — the core's
-   * semver'd shim-facing module (durable-operation calls with auto step ids
-   * and tokens, bound to this plugin's host handlers). `internal` is for
-   * shims only: registration-time import scanning rejects workflow bundles
-   * that import it.
+   * semver'd shim-facing module, itself a thin wrapper over the kernel's
+   * `durable-isolates:internal` that enforces the leaf rule and namespaces
+   * step ids into boundary keys. A durable-operation call forms an auto step
+   * id (the boundary key) and routes to this plugin's host handlers by name.
+   * No token ever crosses the bridge: tokens are host-side identity minted and
+   * settled by the engine against the store, never visible to sandbox code.
+   * `internal` is for shims only: registration-time import scanning rejects
+   * workflow bundles that import it.
    */
   shim: string
   /**
@@ -302,11 +320,6 @@ export interface DurableWorkflowsPlugin {
    */
   host: (ctx: InstanceRunContext) => Record<string, HostHandler>
 }
-
-/**
- * Aligned with iso4's HostExportFunction; args/results cross the bridge serialized.
- */
-export type HostHandler = (...args: unknown[]) => unknown
 
 export interface InstanceRunContext {
   instanceId: string
@@ -376,6 +389,21 @@ export interface RetryPolicy {
 
 export type ErrorClass = 'permanent' | 'transient'
 
+/**
+ * How a failure is persisted in a step/instance record. This layer's error
+ * shape is the kernel's recorded error (`FailedBoundary.error` — the plain
+ * `{ name, message, ...ownFields }` a thrown handler error becomes crossing the
+ * iso4 bridge) plus this layer's derived retry `class`.
+ *
+ * Single mapping between the two layers: the operation verdict rides in `data`.
+ * A plugin host handler signals a permanent failure by throwing an error
+ * carrying its verdict as an own-enumerable field (the kernel preserves own
+ * fields across the bridge and records them verbatim); the engine reads that
+ * `data` when it turns a kernel `FailedBoundary` into a `StepRecord` and
+ * PROJECTS it onto `class`. So `data` is the raw payload the plugin attached
+ * (and what replays into the sandbox `catch`), `class` is the engine's
+ * interpretation the retry machinery reads — `permanent` is never retried.
+ */
 export interface SerializedError {
   /**
    * JS error name.
@@ -384,7 +412,14 @@ export interface SerializedError {
   message: string
   stack?: string
   /**
-   * Set by durable-operation verdicts or classification; permanent = never retried.
+   * Structured payload carried verbatim across the kernel bridge (the thrown
+   * error's own fields). Where a durable-operation verdict rides; re-thrown
+   * into the sandbox on replay so catch-branches see it identically.
+   */
+  data?: unknown
+  /**
+   * The retry verdict the engine DERIVES from `data` (or a well-known
+   * NonRetryableError name) at record time; permanent = never retried.
    */
   class?: ErrorClass
 }
