@@ -4,8 +4,8 @@
 
 This repo is a **pnpm monorepo** (modeled on the [iso4](https://github.com/schplitt/iso4) repo, releases via [changesets](https://github.com/changesets/changesets)) containing two published packages:
 
-- **`durable-workflows`** — a composable durable workflow library, actively inspired by [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) and built on top of [`iso4`](https://github.com/schplitt/iso4). Workflows run inside a sandbox with a step-based API whose results are persisted, enabling suspend/resume, retries, and event-driven continuation. The persistence layer is pluggable, and the sandbox is extensible with user-provided globals and module imports. It has a `workspace:*` dependency on `durable-isolates` (declared now, consumed later).
-- **`durable-isolates`** — the replay kernel `durable-workflows` builds on: durably execute one isolate program over a **keyed cache** of boundaries. Implemented as a **memoize-by-key router** — in-sandbox shims form a `key` and call the primitives from `durable-isolates:internal`: `durableCall(key, name, …args)` (host-handler work), `durableLookup`/`durableCommit` (sandbox-side checkpoints) and the nestable `boundary(key, fn)`/`nextKey(name)` sugar over them. The host answers a boundary from the cache by `key` or dispatches the `name` handler. A handler throwing `SuspendIsolate` suspends the run (waiting record + abort); resume is always **re-execution** (the waiting boundary re-dispatches and the handler consults host state — there is no delivery API and no tokens); `handle.suspend()` suspends externally (drains in-flight handler IO into the cache, for server teardown). Determinism is a documented contract, not an enforced check (no divergence detection). The caller owns storage, retry/eviction (cache surgery), and reacting to pending operations.
+- **`durable-workflows`** — a composable durable workflow library, actively inspired by [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) and built on top of [`iso4`](https://github.com/schplitt/iso4). Workflows run inside a sandbox with a step-based API whose results are persisted, enabling suspend/resume, retries, and event-driven continuation. It consumes `durable-isolates` (`workspace:*`). The **authoring surface** is shipped so far: two preloaded virtual modules — `durable-workflows:workflow` (author-facing `defineWorkflow({ run })` + `step.do(id, fn)`) and `durable-workflows:internal` (the shim-facing wrapper over the kernel, for plugin authors) — plus `durableWorkflowHost`, the execution host that wraps a `durable-isolates` host: `hydrate({ workflow, plugins })` mounts a definition with the core auto-injected, and `runner.execute({ input, cache })` runs one replay turn (input baked into a generated entry as JSON). The higher-level engine runtime (store adapters, the `durableWorkflows()` lifecycle factory in `types.ts`) is not built yet.
+- **`durable-isolates`** — the replay kernel `durable-workflows` builds on: durably execute one isolate program over a **keyed cache** of boundaries. Implemented as a **memoize-by-key router** — in-sandbox shims form a `key` and call the primitives from `durable-isolates:internal`: `durableCall(key, name, …args)` (host-handler work), `durableLookup`/`durableCommit` (sandbox-side checkpoints) and the nestable `boundary(key, fn)`/`nextKey(name)` sugar over them. The ambient boundary prefix is carried through iso4's `AsyncLocalStorage` (`@iso4/sandbox` ≥ 0.3.0), so nested boundaries key deterministically whether they run sequentially or in parallel (`Promise.all`). The host answers a boundary from the cache by `key` or dispatches the `name` handler. A handler throwing `SuspendIsolate` suspends the run (waiting record + abort); resume is always **re-execution** (the waiting boundary re-dispatches and the handler consults host state — there is no delivery API and no tokens); `handle.suspend()` suspends externally (drains in-flight handler IO into the cache, for server teardown). Determinism is a documented contract, not an enforced check (no divergence detection). The caller owns storage, retry/eviction (cache surgery), and reacting to pending operations.
 
 The project uses ESM modules, Vitest for testing, ESLint for code quality, and tsdown for builds. Node `>=26`.
 
@@ -15,21 +15,27 @@ The project uses ESM modules, Vitest for testing, ESLint for code quality, and t
 
 ```
 packages/
-  durable-workflows/      # The engine (published as `durable-workflows`)
+  durable-workflows/      # Published as `durable-workflows`
     src/
-      index.ts            # Public entry — re-exports the type surface
-      types.ts            # Engine/host public type surface
+      index.ts            # Public entry — types + durableWorkflowHost + specifier constants
+      types.ts            # Engine/host public type surface (the not-yet-built engine runtime)
+      host.ts             # durableWorkflowHost: hydrate({ workflow, plugins }) → runner.execute({ input, cache })
+      shim.ts             # Source of the two virtual modules + coreModules bundle (internal)
+      internal.ts         # `./internal` export — shim-facing types (operation/boundary) for plugin authors
+      workflow.d.ts        # `./workflow` export — ambient `declare module 'durable-workflows:workflow'` (copied to dist)
+    tests/authoring-surface.test.ts  # Authoring surface + host, against the real kernel
+    __snapshots__/tsnapi/ # tsnapi public-API snapshots (index, internal)
     package.json          # workspace:* dep on durable-isolates
     tsconfig.json         # standalone (no root base)
-    tsdown.config.ts
+    tsdown.config.ts      # entries: index, internal; copies workflow.d.ts; tsnapi plugin
     vitest.config.ts
   durable-isolates/       # The replay kernel (published as `durable-isolates`)
     src/
       index.ts            # Public entry — re-exports types + durableIsolates + SuspendIsolate
       durable-isolates.ts # Factory: binds one lazy iso4 sandbox; hydrate() → runner
-      execute.ts          # One replay turn — the multiplexed bridge (call/lookup/commit), drain, suspend()
-      mount.ts            # Build precompile imports/globals + flatten default handlers
-      shim.ts             # In-sandbox `durable-isolates:internal` module source + bridge-global name
+      execute.ts          # One replay turn — three bridge globals (__di_call/__di_lookup/__di_commit), drain, suspend()
+      mount.ts            # Build precompile imports/globals + flatten default handlers; reserved-specifier guard
+      shim.ts             # In-sandbox `durable-isolates:internal` source (ALS-backed prefix) + bridge-global names
       internal.ts         # Shim-facing types (the `./internal` export: durableCall/lookup/commit/boundary/nextKey)
       suspend-isolate.ts  # `SuspendIsolate` — thrown by a handler to suspend the run
       types/index.ts      # Kernel public type surface
@@ -43,6 +49,8 @@ eslint.config.js          # Shared flat ESLint config (lints the whole repo)
 pnpm-workspace.yaml       # `packages/*` + dependency catalog
 .changeset/               # changesets config + release docs
 ```
+
+`durable-workflows` public exports: `.` (types + `durableWorkflowHost` + `INTERNAL_SPECIFIER`/`WORKFLOW_SPECIFIER`), `./internal` (shim-facing types), and `./workflow` (author-facing ambient `.d.ts`). The core shim sources and `coreModules` are internal — the host mounts them; callers never do.
 
 Each package owns its own `src/` (public API exported from `src/index.ts`), a standalone `tsconfig.json` (no shared root base), `tsdown.config.ts`, and `vitest.config.ts`. Shared root config is just ESLint and the pnpm catalog.
 
@@ -77,7 +85,7 @@ Root scripts use `pnpm -r --filter="./packages/*"`; `lint`/`lint:fix` run ESLint
 - Each package has its own `vitest.config.ts`; put tests inside that package's `tests/` directory (or alongside source under `src/`) — both are covered by the package `tsconfig.json` `include`, so tests are type-checked against the same config as source
 - Use the `*.test.ts` file naming convention
 - Run `pnpm test:run` from the root for all packages (no watch), or run it inside a single package
-- `durable-isolates` has a real suite (`tests/kernel.test.ts`) and no longer sets `passWithNoTests`. `durable-workflows` still sets `passWithNoTests: true` — drop it once that package has a real suite
+- Both packages have real suites (`durable-isolates/tests/kernel.test.ts`, `durable-workflows/tests/authoring-surface.test.ts`) and neither sets `passWithNoTests`. The `durable-workflows` suite mounts the real shims on a `durable-isolates` runner via `durableWorkflowHost`, so it exercises the whole chain (workflow → `:workflow` → `:internal` → `durable-isolates:internal` → host)
 
 Example test structure:
 

@@ -9,7 +9,7 @@ import type {
   PerExecuteHandlers,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
-import { DURABLE_CALL_GLOBAL } from './shim'
+import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL } from './shim'
 
 /**
  * Kernel default limits merged UNDER the caller's. Only `maxBridgeCalls` is
@@ -50,16 +50,16 @@ export interface ExecuteRunParams {
 }
 
 /**
- * One replay turn. The single bridge global `__di_call(op, ...)`, closed over
- * this run's context, multiplexes the three primitives:
+ * One replay turn. Three bridge globals, each closed over this run's context,
+ * back the three primitives:
  *
- * - `call(key, name, args)` — answers the boundary at `key` from the cache or
- *   dispatches the `name` handler, recording the result. A handler throwing
+ * - `__di_call(key, name, args)` — answers the boundary at `key` from the cache
+ *   or dispatches the `name` handler, recording the result. A handler throwing
  *   `SuspendIsolate` writes a waiting record and aborts. A `waiting` record is
  *   NOT terminal on replay — it re-dispatches (that is the one resume path), so
  *   the handler (consulting host state) can proceed, suspend again, or throw.
- * - `lookup(key)` — non-memoized read of the live cache (the checkpoint check).
- * - `commit(key, value)` — record a completed boundary from the sandbox.
+ * - `__di_lookup(key)` — non-memoized read of the live cache (checkpoint check).
+ * - `__di_commit(key, value)` — record a completed boundary from the sandbox.
  *
  * Every in-flight handler dispatch is tracked and DRAINED before the result is
  * built (on every outcome): a dispatch racing an abort or the run's completion
@@ -121,29 +121,29 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     }
   }
 
-  // The one bridge global, multiplexed on its first argument. A `call` resolves
-  // with the boundary's value on success and REJECTS with the recorded error on
-  // failure: iso4 (>=0.2.2) delivers a rejecting bridge to the sandbox `catch`
-  // faithfully (rebuilt as a real Error with name/message/fields), so no
-  // envelope unwrapping or error reconstruction is needed sandbox-side.
-  const durableBridge = async (...bridgeArgs: unknown[]): Promise<unknown> => {
-    const op = String(bridgeArgs[0])
+  // `__di_lookup` — non-memoized read of the live cache (the checkpoint check).
+  const lookupBridge = (...bridgeArgs: unknown[]): unknown => {
+    const record: BoundaryRecord | undefined = cache[String(bridgeArgs[0])]
+    if (record !== undefined && record.status === 'completed')
+      return { hit: true, value: record.value }
+    return { hit: false }
+  }
 
-    if (op === 'lookup') {
-      const record: BoundaryRecord | undefined = cache[String(bridgeArgs[1])]
-      if (record !== undefined && record.status === 'completed')
-        return { hit: true, value: record.value }
-      return { hit: false }
-    }
+  // `__di_commit` — record a completed boundary from the sandbox.
+  const commitBridge = (...bridgeArgs: unknown[]): unknown => {
+    cache[String(bridgeArgs[0])] = { seq: seqNext++, status: 'completed', value: bridgeArgs[1] }
+    return { ok: true }
+  }
 
-    if (op === 'commit') {
-      cache[String(bridgeArgs[1])] = { seq: seqNext++, status: 'completed', value: bridgeArgs[2] }
-      return { ok: true }
-    }
-
-    const key = String(bridgeArgs[1])
-    const name = String(bridgeArgs[2])
-    const args: unknown[] = Array.isArray(bridgeArgs[3]) ? bridgeArgs[3] : []
+  // `__di_call` — answer the boundary at `key` from the cache or dispatch its
+  // handler. Resolves with the boundary's value on success and REJECTS with the
+  // recorded error on failure: iso4 (>=0.2.2) delivers a rejecting bridge to the
+  // sandbox `catch` faithfully (rebuilt as a real Error with name/message/fields),
+  // so no envelope unwrapping or error reconstruction is needed sandbox-side.
+  const callBridge = async (...bridgeArgs: unknown[]): Promise<unknown> => {
+    const key = String(bridgeArgs[0])
+    const name = String(bridgeArgs[1])
+    const args: unknown[] = Array.isArray(bridgeArgs[2]) ? bridgeArgs[2] : []
 
     const existing = cache[key]
     if (existing !== undefined) {
@@ -171,7 +171,11 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   const result = (async (): Promise<ExecuteResult> => {
     const result = await prefix.run({
       code,
-      globals: { [DURABLE_CALL_GLOBAL]: durableBridge } as RebindGlobals<HostGlobals>,
+      globals: {
+        [DURABLE_CALL_GLOBAL]: callBridge,
+        [DURABLE_LOOKUP_GLOBAL]: lookupBridge,
+        [DURABLE_COMMIT_GLOBAL]: commitBridge,
+      } as RebindGlobals<HostGlobals>,
       limits,
       signal: controller.signal,
     })
