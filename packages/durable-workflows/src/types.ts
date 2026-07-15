@@ -11,7 +11,7 @@
  * editors. Anything operational a plugin needs host-side (e.g. agents orphan
  * reconciliation) lives on the plugin instance itself, not on the engine.
  */
-import type { HostHandler } from 'durable-isolates'
+import type { BoundaryCache } from 'durable-isolates'
 import type { ResourceLimits, SandboxOptions } from 'durable-isolates/types/iso4'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -39,9 +39,9 @@ export interface DurableWorkflowsOptions {
    */
   sandbox?: SandboxOptions
   /**
-   * The only mandatory adapter: where instances and steps live. Values are
-   * stored exactly as they cross the iso4 bridge (V8-serializable data) —
-   * there is no codec layer.
+   * The only mandatory adapter: where instances and their boundary cache live.
+   * Values are stored exactly as they cross the iso4 bridge (V8-serializable
+   * data) — there is no codec layer.
    */
   store: WorkflowStore
   /**
@@ -96,8 +96,8 @@ export interface DurableWorkflowsOptions {
    *   ALL remaining ready steps sequentially — step-heavy pipelines (e.g.
    *   migrations) raise this via their definition's limits; anything longer
    *   than the budget (or of unknown duration) is lifted to a durable
-   *   operation that suspends, which holds NO slot. Retry backoffs never
-   *   wait in-run (cross-run via `retryAt`).
+   *   operation that suspends, which holds NO slot. Retries, if any, are the
+   *   caller's cross-run concern (cache surgery), never an in-run wait.
    * - `cpuTimeMs: 30_000` — actual in-sandbox compute per run (bridge waits
    *   excluded; iso4 defaults to 5s). Generous enough for real per-step
    *   data reshaping; heavy crunchers raise it per definition.
@@ -138,49 +138,38 @@ export interface DurableWorkflowsEngine {
    */
   readonly pendingPromises: ReadonlySet<Promise<unknown>>
   /**
-   * Start a new instance. Resolves the definition via `resolveDefinition`
-   * (without a version unless `opts.version` says otherwise) and pins the
-   * returned concrete version to the instance for all future replays.
+   * Start a new instance and run its first turn. Resolves the definition via
+   * `resolveDefinition` (without a version unless `opts.version` says
+   * otherwise), pins the returned concrete version to the instance for all
+   * future replays, and returns the run's outcome.
    */
-  create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<WorkflowInstanceHandle>
+  create: (workflow: string, input?: unknown, opts?: CreateOptions) => Promise<RunOutcome>
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
   /**
    * THE single continuation entry point — called by the application's own
    * trigger wiring (its cron, its timer service, its webhook handlers). The
    * engine never wakes anything itself.
    *
-   * Without `delivery`: plain replay — deadlines (sleep `wakeAt`, wait
-   * timeouts, `retryAt`) are re-checked; if nothing is due the run just
-   * suspends again (harmless no-op).
-   *
-   * With `delivery`: the result for the pending operation addressed by
-   * `token`. The token is minted by the engine when the operation is
-   * created and handed OUTWARD at dispatch time (dispatch payload, waiting
-   * step record, `onEvent`) — the caller echoes it back, never derives it.
-   *
-   * Delivery is entirely a STORE operation followed by a plain re-execution —
-   * nothing is injected into the kernel cache. The engine settles the token
-   * against the store (flips the waiting operation record and stashes the
-   * delivered value / error+verdict), then re-executes. On re-dispatch the
-   * operation's host handler consults that stashed result and RETURNS it (→ the
-   * kernel records a completed boundary through this live dispatch) or THROWS
-   * it (→ a failed boundary, `error.class` deciding retry). This is why the
-   * kernel needs no delivery API: the value only ever enters the cache the one
-   * legal way, through the handler's re-dispatch. Unknown or already-settled
-   * token → rejects (which doubles as duplicate/too-late detection). There
-   * is NO buffering: a delivery must hit a waiting operation.
+   * Plain re-execution: a fresh replay passes through the cache and
+   * re-dispatches every still-waiting operation's handler, which consults host
+   * state (the plugin's own backend, the clock, an approval row) and proceeds,
+   * throws, or suspends again. There is no delivery argument and no token — a
+   * resolved value reaches the workflow because the handler now RETURNS it on
+   * re-dispatch, not because anything is injected into the cache. If nothing is
+   * due the run just suspends again (a harmless no-op). Returns the outcome.
    */
-  continueWorkflow: (instanceId: string, delivery?: OperationDelivery) => Promise<void>
+  continueWorkflow: (instanceId: string) => Promise<RunOutcome>
   terminate: (instanceId: string) => Promise<void>
   /**
-   * Prefix invalidation: deletes the step and every step recorded after it,
-   * then replays. Rare manual remediation — not part of normal operation.
+   * Prefix invalidation: deletes the boundary and every boundary recorded after
+   * it (by `seq`), then replays. Rare manual remediation — not part of normal
+   * operation.
    */
-  evict: (instanceId: string, stepId: string) => Promise<void>
+  evict: (instanceId: string, stepId: string) => Promise<RunOutcome>
   /**
    * Evict everything and replay from scratch.
    */
-  restart: (instanceId: string) => Promise<void>
+  restart: (instanceId: string) => Promise<RunOutcome>
   /**
    * Await `pendingPromises`, then release the precompiled prefix and dispose
    * the internally managed sandbox.
@@ -209,14 +198,38 @@ export interface ResolvedDefinition {
 }
 
 /**
- * The result the outside world hands a suspended workflow, addressed by the
- * operation token that was handed out at dispatch time. Success delivers the
- * value the waiting operation resolves with; failure delivers an error whose
- * `class` feeds the retry machinery (`permanent` = never retried).
+ * The outcome of one replay run (`create` / `continueWorkflow` / `evict` /
+ * `restart`). A run never ends 'running': it either completed, is now waiting
+ * on one or more operations, or failed.
  */
-export type OperationDelivery
-  = | { token: string, value: unknown }
-    | { token: string, error: SerializedError }
+export type RunOutcome
+  = | (RunOutcomeBase & { status: 'completed' })
+    | (RunOutcomeBase & { status: 'waiting', pending: PendingOperation[] })
+    | (RunOutcomeBase & { status: 'failed', error: SerializedError })
+
+interface RunOutcomeBase {
+  instanceId: string
+  /**
+   * Which run this was (1 = first execution) — matches the instance's run
+   * counter after this turn.
+   */
+  run: number
+}
+
+/**
+ * A durable operation that suspended this run, surfaced so the caller's own
+ * wiring can react (register a timer, POST a job, create an approval ticket)
+ * and later resume with a plain `continueWorkflow`. `stepId` is the boundary
+ * key, `operation` the plugin operation name, `payload` whatever the handler
+ * passed to `SuspendIsolate`. Usually the handler already did the outward work
+ * before suspending, so this is mostly informational; the bare escape-hatch
+ * plugins (raw events) are where the caller genuinely acts on it.
+ */
+export interface PendingOperation {
+  stepId: string
+  operation: string
+  payload: unknown
+}
 
 export interface CreateOptions {
   /**
@@ -288,12 +301,19 @@ export type InstanceStatus = InstanceRecord['status']
  * running on an engine composed with the old major (npm alias deps), new
  * instances go to a new engine — routing and drain are application scope.
  *
- * Plugins repeat the core's adapter pattern one level down: a plugin defines
- * its capability, shim and token protocol, but takes its deployment BACKEND
- * as an interface on its factory — the time plugin takes a timer backend,
- * an events plugin a notification transport, the agents plugin an agent
- * service client. The dev wires each to their infra exactly like they wire
- * the core's store to their database.
+ * Plugins repeat the core's adapter pattern one level down, in one of two
+ * packaging shapes (both this same `{ id, shim, handlers }` object):
+ *   - the plugin ships the SHIM and the handler LOGIC and takes its deployment
+ *     backend as a factory parameter (a well-defined external service: the
+ *     agents plugin takes an agent-service client, a fetch plugin the iso4
+ *     fetch handler);
+ *   - the plugin ships only the SHIM and the dev supplies the handler, because
+ *     the mechanism is irreducibly their infra (the `time`/sleep plugin: where
+ *     and how a wake-up is registered — cron row, Postgres NOTIFY, setTimeout
+ *     — and what fires it are the dev's, so the handler is theirs, guided by
+ *     jsdoc).
+ * Either way the dev wires the backend (or the handler) to their infra exactly
+ * like they wire the core's store to their database.
  */
 export interface DurableWorkflowsPlugin {
   /**
@@ -306,28 +326,50 @@ export interface DurableWorkflowsPlugin {
    * semver'd shim-facing module, itself a thin wrapper over the kernel's
    * `durable-isolates:internal` that enforces the leaf rule and namespaces
    * step ids into boundary keys. A durable-operation call forms an auto step
-   * id (the boundary key) and routes to this plugin's host handlers by name.
-   * No token ever crosses the bridge: tokens are host-side identity minted and
-   * settled by the engine against the store, never visible to sandbox code.
-   * `internal` is for shims only: registration-time import scanning rejects
-   * workflow bundles that import it.
+   * id (the boundary key) and routes to this plugin's handlers by name. No
+   * token machinery exists: an operation that must wait suspends by its handler
+   * throwing `SuspendIsolate`, and resume is plain re-execution — the handler
+   * consults host state to proceed. `internal` is for shims only:
+   * registration-time import scanning rejects workflow bundles that import it.
    */
   shim: string
   /**
-   * Host-side bridge handlers, constructed **per instance run** — this is the
-   * credentials story: every resume gets freshly built handlers, so secrets
-   * live host-side only and tokens are provisioned at wake-up time.
+   * Host-side handlers keyed by operation `name`. The plugin's factory closes
+   * over its backend (and any auth provider); a handler provisions credentials
+   * itself per call via that provider (`auth(instanceId)`), so every resume
+   * runs against freshly provisioned secrets that never enter the sandbox.
    */
-  host: (ctx: InstanceRunContext) => Record<string, HostHandler>
+  handlers: Readonly<Record<string, DurableHandler>>
 }
 
-export interface InstanceRunContext {
+/**
+ * A host-side handler for one durable operation `name`. Invoked when its
+ * boundary is not already settled in the cache — a cache hit never re-dispatches
+ * it. A `waiting` boundary IS re-dispatched (the resume path): the handler
+ * consults host state and either returns a value (→ completed boundary), throws
+ * `SuspendIsolate` (→ still waiting), or throws anything else (→ failed
+ * boundary, re-thrown deterministically on replay). It receives ONE structured
+ * input: the sandbox `payload` kept strictly separate from engine metadata.
+ */
+export type DurableHandler = (input: DurableHandlerInput) => unknown
+
+export interface DurableHandlerInput {
   instanceId: string
   workflow: string
   /**
    * Monotonic per-instance run counter (1 = first execution).
    */
   run: number
+  /**
+   * The boundary key — unique per operation call, stable across replays. Key
+   * your own backend on this (timer row, dispatch idempotency).
+   */
+  stepId: string
+  /**
+   * Exactly what the workflow passed the operation, forwarded from the sandbox
+   * — never blended with the metadata above.
+   */
+  payload: unknown
 }
 
 /**
@@ -339,70 +381,26 @@ export interface InstanceRunContext {
 export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(plugin: TPlugin) => TPlugin
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Policies & errors
+// Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Retries are configured per step (an option on the step call inside the
- * workflow). A step that supplies no policy gets the ENGINE DEFAULT:
- * `{ limit: 3, backoff: 'linear', delayMs: 3000 }`, paired with a default
- * per-step timeout of 5 minutes (which must fit the run's wall budget —
- * enforced engine-side via run abort, attributable to the step, retryable).
- *
- * Retries are CROSS-RUN — an isolate is never parked to wait out a backoff
- * delay. A failing attempt updates the failed record (attempts, pinned
- * policy, and `retryAt` = failure time + computed backoff) and the run ends
- * with the instance `waiting`. Re-execution happens on a later continuation
- * arriving at or after `retryAt` — checked at continuation time like every
- * other deadline; `retryAt` is informational for the application's trigger
- * wiring, the engine never acts on time itself. Once attempts exhaust the
- * policy the failure is final and replays as a deterministic throw.
- *
- * The EFFECTIVE policy is PINNED AT FIRST FAILURE: the step's own option (or
- * the engine default in force at that moment) is resolved and persisted on
- * the failed record; policies supplied by later replays — and later changes
- * to the engine default — are ignored. Step options should be constant
- * anyway (determinism rules), but pinning makes retry behavior immune to
- * nondeterministically computed policies and to default drift across
- * deploys.
- *
- * A host-side `permanent` error verdict always wins: such failures are never
- * retried regardless of policy (workflow code can trigger this via the
- * well-known NonRetryableError, Cloudflare-style). There is no error
- * classification in the engine beyond that — workflow errors are the
- * author's domain (catch them, or don't configure retries).
+ * An optional verdict a plugin may attach to a failure. The minimal engine does
+ * NOT act on it — retry is the caller's cache surgery (delete the failed
+ * boundary and re-run), not engine state — so `class` is purely informational
+ * for the application's own retry decision. `permanent` conventionally means
+ * "re-running can never help" (bad config, disallowed request).
  */
-export interface RetryPolicy {
-  /**
-   * Maximum attempts per step (1 = no retries).
-   */
-  limit: number
-  /**
-   * How the delay grows per attempt. Default: 'constant'.
-   */
-  backoff?: 'constant' | 'linear' | 'exponential'
-  /**
-   * Base delay between attempts in milliseconds. Minimum (and default) 1000.
-   */
-  delayMs?: number
-}
-
 export type ErrorClass = 'permanent' | 'transient'
 
 /**
- * How a failure is persisted in a step/instance record. This layer's error
- * shape is the kernel's recorded error (`FailedBoundary.error` — the plain
+ * How a failure is surfaced (`RunOutcome` failed, `FailedInstanceRecord`). This
+ * layer's shape is the kernel's recorded error — the plain
  * `{ name, message, ...ownFields }` a thrown handler error becomes crossing the
- * iso4 bridge) plus this layer's derived retry `class`.
- *
- * Single mapping between the two layers: the operation verdict rides in `data`.
- * A plugin host handler signals a permanent failure by throwing an error
- * carrying its verdict as an own-enumerable field (the kernel preserves own
- * fields across the bridge and records them verbatim); the engine reads that
- * `data` when it turns a kernel `FailedBoundary` into a `StepRecord` and
- * PROJECTS it onto `class`. So `data` is the raw payload the plugin attached
- * (and what replays into the sandbox `catch`), `class` is the engine's
- * interpretation the retry machinery reads — `permanent` is never retried.
+ * iso4 bridge — lifted into a named shape. `data` carries the thrown error's
+ * own fields verbatim; it is re-thrown into the sandbox on replay, so
+ * catch-branches see it identically. `class` is an optional verdict a plugin
+ * attached, read by the app, not by the engine.
  */
 export interface SerializedError {
   /**
@@ -412,162 +410,19 @@ export interface SerializedError {
   message: string
   stack?: string
   /**
-   * Structured payload carried verbatim across the kernel bridge (the thrown
-   * error's own fields). Where a durable-operation verdict rides; re-thrown
-   * into the sandbox on replay so catch-branches see it identically.
+   * The thrown error's own fields, carried verbatim across the kernel bridge
+   * and re-thrown into the sandbox on replay.
    */
   data?: unknown
   /**
-   * The retry verdict the engine DERIVES from `data` (or a well-known
-   * NonRetryableError name) at record time; permanent = never retried.
+   * Optional plugin-attached verdict; informational only (see `ErrorClass`).
    */
   class?: ErrorClass
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Store contract & records (skeleton — to be designed in detail)
+// Store contract & records
 // ─────────────────────────────────────────────────────────────────────────────
-
-export type StepKind = StepRecord['kind']
-
-export type StepStatus = StepRecord['status']
-
-/**
- * Discriminated on `kind` — each durable primitive persists exactly the
- * fields its semantics need, no optional grab-bag.
- */
-export type StepRecord
-  = | DoStepRecord
-    | ScopeStepRecord
-    | OperationStepRecord
-
-interface StepRecordBase {
-  instanceId: string
-  stepId: string
-  /**
-   * Record order — drives prefix eviction ("this step and everything after").
-   */
-  seq: number
-  attempts: number
-  /**
-   * Enclosing scope's stepId for namespaced sub-steps.
-   */
-  parentId?: string
-}
-
-/**
- * Atomic unit of work. Never waits: it either completed (value frozen, body
- * skipped forever) or failed (retry policy decides what happens on the next
- * continuation).
- */
-export type DoStepRecord = DoStepCompletedRecord | DoStepFailedRecord
-
-export interface DoStepCompletedRecord extends StepRecordBase {
-  kind: 'do'
-  status: 'completed'
-  value: unknown
-}
-
-export interface DoStepFailedRecord extends StepRecordBase {
-  kind: 'do'
-  status: 'failed'
-  error: SerializedError
-  /**
-   * The EFFECTIVE policy, pinned at first failure: the step's own option or
-   * the engine default in force at that moment. Policies supplied by later
-   * replays — and later changes to the engine default — are ignored.
-   */
-  retry: RetryPolicy
-  /**
-   * When the next attempt becomes eligible — present only while retries
-   * remain. Informational for the application's trigger wiring (like
-   * `wakeAt`); enforced at continuation time.
-   */
-  retryAt?: string
-}
-
-/**
- * Composite namespace. Only recorded once its body ran to completion (or
- * failed permanently) — until then only its sub-steps exist, linked via
- * `parentId`. Evicting a scope evicts its whole subtree.
- */
-export type ScopeStepRecord = ScopeStepCompletedRecord | ScopeStepFailedRecord
-
-export interface ScopeStepCompletedRecord extends StepRecordBase {
-  kind: 'scope'
-  status: 'completed'
-  value: unknown
-}
-
-export interface ScopeStepFailedRecord extends StepRecordBase {
-  kind: 'scope'
-  status: 'failed'
-  error: SerializedError
-}
-
-/**
- * THE universal wait primitive — the only thing that suspends. Every waiting
- * capability (sleep, external events/approvals, agent work) is a plugin
- * composing this: an outward host-side dispatch paired with an inbound
- * token-addressed delivery via `continueWorkflow`. `token` is the dispatch
- * idempotency key AND the delivery address. Multiple operations may be
- * pending in parallel — which is why deliveries are always token-addressed.
- */
-export type OperationStepRecord
-  = | OperationStepWaitingRecord
-    | OperationStepCompletedRecord
-    | OperationStepFailedRecord
-
-export interface OperationStepWaitingRecord extends StepRecordBase {
-  kind: 'operation'
-  status: 'waiting'
-  token: string
-  /**
-   * Id of the plugin that dispatched this operation — observability and
-   * orphan reconciliation (a plugin finds "its" waiting operations).
-   */
-  plugin: string
-  /**
-   * Plugin-defined operation name (e.g. 'sleep', 'approval.request',
-   * 'session.prompt') — descriptive for wiring/UI; matching is by token.
-   */
-  operation: string
-  /**
-   * Deadline, if any (sleep wake time, wait/operation timeout) — enforced at
-   * continuation time; informational for the application's trigger wiring.
-   */
-  wakeAt?: string
-}
-
-export interface OperationStepCompletedRecord extends StepRecordBase {
-  kind: 'operation'
-  status: 'completed'
-  token: string
-  plugin: string
-  operation: string
-  value: unknown
-}
-
-export interface OperationStepFailedRecord extends StepRecordBase {
-  kind: 'operation'
-  status: 'failed'
-  token: string
-  plugin: string
-  operation: string
-  error: SerializedError
-  /**
-   * The EFFECTIVE policy, pinned at first failure: the step's own option or
-   * the engine default in force at that moment. Policies supplied by later
-   * replays — and later changes to the engine default — are ignored.
-   */
-  retry: RetryPolicy
-  /**
-   * When the next attempt becomes eligible — present only while retries
-   * remain. Informational for the application's trigger wiring (like
-   * `wakeAt`); enforced at continuation time.
-   */
-  retryAt?: string
-}
 
 /**
  * Discriminated on `status` — error exists iff failed. The workflow's return
@@ -589,7 +444,7 @@ interface InstanceRecordBase {
   input?: unknown
   /**
    * Monotonic run counter — incremented per continuation; feeds
-   * `InstanceRunContext.run` and `InstanceOutcome.runs`.
+   * `DurableHandlerInput.run`, `RunOutcome.run` and `InstanceOutcome.runs`.
    */
   runs: number
   createdAt: string
@@ -613,19 +468,26 @@ export interface TerminatedInstanceRecord extends InstanceRecordBase {
   status: 'terminated'
 }
 
+/**
+ * Deliberately tiny: the engine persists only instances and, per instance, the
+ * kernel's boundary cache as an opaque blob. There is no per-step table — the
+ * durable history IS the cache. Eviction (prefix / subtree surgery) is done
+ * in-memory by the engine on the loaded cache before it re-executes, so the
+ * store only ever reads and writes the whole blob. A new backend should be an
+ * afternoon.
+ */
 export interface WorkflowStore {
   createInstance: (record: InstanceRecord) => Promise<void>
   getInstance: (instanceId: string) => Promise<InstanceRecord | null>
   updateInstance: (record: InstanceRecord) => Promise<void>
   deleteInstance: (instanceId: string) => Promise<void>
 
-  getStep: (instanceId: string, stepId: string) => Promise<StepRecord | null>
-  putStep: (record: StepRecord) => Promise<void>
-  listSteps: (instanceId: string) => Promise<StepRecord[]>
   /**
-   * Prefix delete: the step and every record with a greater `seq`.
+   * The instance's boundary cache — the kernel's durable history, persisted
+   * verbatim. `null` (or `{}`) before the first run.
    */
-  evictFromStep: (instanceId: string, stepId: string) => Promise<void>
+  getCache: (instanceId: string) => Promise<BoundaryCache | null>
+  putCache: (instanceId: string, cache: BoundaryCache) => Promise<void>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -638,15 +500,10 @@ export type EngineEvent
       type: 'step'
       instanceId: string
       stepId: string
-      kind: StepKind
-      status: StepStatus
-      attempt: number
-      run: number
       /**
-       * The wait token for waiting wait-for-event / operation steps — this is
-       * how the application's wiring learns the delivery address (e.g. hands
-       * it to the agent service or embeds it in an approval ticket).
+       * The boundary's status this run — mirrors the kernel's `BoundaryRecord`.
        */
-      token?: string
+      status: 'completed' | 'failed' | 'waiting'
+      run: number
     }
     | { type: 'log', instanceId: string, stepId?: string, run: number, level: 'log' | 'warn' | 'error', args: unknown[] }
