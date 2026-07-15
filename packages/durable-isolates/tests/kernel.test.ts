@@ -445,6 +445,54 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     expect(r2.result).toBe(42)
     expect(probes).toBe(1) // neither body ever re-ran
   }, 15_000)
+
+  test('parallel nested boundaries: async context keeps each branch prefix isolated', async () => {
+    let probes = 0
+    const handlers: PerExecuteHandlers = {
+      probe: () => {
+        probes += 1
+        return 'ok'
+      },
+    }
+    // Two nested branches run concurrently under Promise.all, interleaving at
+    // several await points. A shared module-level prefix would cross-contaminate
+    // (both keys would become `charge/refund/validate/...`); the ambient prefix
+    // is carried through iso4 AsyncLocalStorage, so each branch keys under itself.
+    const code = `import { boundary, durableCall, nextKey } from 'durable-isolates:internal'
+      const branch = (name) => boundary(name, async () => {
+        await Promise.resolve(); await Promise.resolve()
+        return await boundary('validate', async () => {
+          await Promise.resolve()
+          return await durableCall(nextKey('probe'), 'probe', {})
+        })
+      })
+      const [a, b] = await Promise.all([branch('charge'), branch('refund')])
+      export default [a, b]`
+
+    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toEqual(['ok', 'ok'])
+    expect(Object.keys(r1.cache).sort()).toEqual([
+      'charge',
+      'charge/validate',
+      'charge/validate/probe#0',
+      'refund',
+      'refund/validate',
+      'refund/validate/probe#0',
+    ])
+    expect(probes).toBe(2)
+
+    // The outer commits alone answer the replay — both bodies skip wholesale.
+    const pruned: BoundaryCache = { charge: r1.cache.charge!, refund: r1.cache.refund! }
+    const r2 = await runner.execute({ code, cache: pruned, handlers }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual(['ok', 'ok'])
+    expect(probes).toBe(2) // neither body re-ran
+  }, 15_000)
 })
 
 describe('external suspension (handle.suspend())', () => {
@@ -724,4 +772,12 @@ describe('e2e: @iso4/fetch mounted durably', () => {
     expect(gets).toBe(1) // GET cached — NOT re-fetched on resume
     expect(deletes).toBe(2) // DELETE re-dispatched and ran once
   }, 20_000)
+})
+
+describe('mount guards', () => {
+  test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
+    await expect(
+      host.hydrate({ modules: { 'durable-isolates:internal': { shim: 'export const x = 1' } } }),
+    ).rejects.toThrow(/reserved module specifier/)
+  })
 })

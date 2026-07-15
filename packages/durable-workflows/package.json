@@ -28,6 +28,13 @@
     ".": {
       "types": "./dist/index.d.mts",
       "import": "./dist/index.mjs"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.mts",
+      "import": "./dist/internal.mjs"
+    },
+    "./workflow": {
+      "types": "./dist/workflow.d.ts"
     }
   },
   "main": "./dist/index.mjs",
@@ -51,6 +58,7 @@
     "@schplitt/eslint-config": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
+    "tsnapi": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

@@ -35,9 +35,11 @@ export type DurableCommit = (key: string, value: unknown) => Promise<void>
  * Checkpoint sugar over lookup/commit: on a hit return the cached value WITHOUT
  * running `fn`; on a miss run `fn` in-sandbox, commit its result, return it.
  * Nestable — `key` joins the ambient prefix while `fn` runs, so inner keys
- * concatenate (`scope/inner#0`). A body containing further durable work re-runs
- * on every replay until committed (inner boundaries fast-path from the cache);
- * scopes must run sequentially (the ambient prefix is not async-context-safe).
+ * concatenate (`scope/inner#0`). The prefix is carried through async context
+ * (iso4 `AsyncLocalStorage`), so it survives `await` and stays isolated per
+ * branch: nested scopes may run sequentially OR in parallel (`Promise.all`) and
+ * still key deterministically. A body containing further durable work re-runs on
+ * every replay until committed (inner boundaries fast-path from the cache).
  */
 export type Boundary = <T>(key: string, fn: () => T | Promise<T>) => Promise<T>
 
