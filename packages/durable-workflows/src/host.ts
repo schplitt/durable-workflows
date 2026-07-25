@@ -24,6 +24,7 @@ import type {
   ModuleDefinition,
   PerExecuteHandlers,
 } from 'durable-isolates'
+import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import { durableIsolates } from 'durable-isolates'
 import { coreModules } from './shim'
 
@@ -46,6 +47,12 @@ export interface WorkflowHydrateOptions {
    * automatically; a plugin may not use a reserved specifier.
    */
   plugins?: Readonly<Record<string, ModuleDefinition>>
+  /**
+   * Default iso4 resource limits for every `execute` on this runner;
+   * `WorkflowExecuteOptions.limits` overrides per run. Forwarded to the kernel's
+   * `hydrate`.
+   */
+  limits?: Partial<ResourceLimits>
 }
 
 export interface WorkflowExecuteOptions {
@@ -62,6 +69,10 @@ export interface WorkflowExecuteOptions {
    * Per-run host handlers for the mounted plugins, keyed by operation name.
    */
   handlers?: PerExecuteHandlers
+  /**
+   * iso4 resource limits for this run, overriding the runner's `hydrate` default.
+   */
+  limits?: Partial<ResourceLimits>
 }
 
 export interface WorkflowRunner {
@@ -97,7 +108,7 @@ export interface DurableWorkflowHost {
 export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWorkflowHost {
   const host = durableIsolates(options)
   return {
-    hydrate: async ({ workflow, plugins = {} }): Promise<WorkflowRunner> => {
+    hydrate: async ({ workflow, plugins = {}, limits }): Promise<WorkflowRunner> => {
       for (const specifier of Object.keys(plugins)) {
         if (Object.hasOwn(coreModules, specifier) || specifier === DEFINITION_SPECIFIER) {
           throw new Error(
@@ -108,11 +119,17 @@ export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWo
       }
       const runner = await host.hydrate({
         modules: { ...coreModules, [DEFINITION_SPECIFIER]: { shim: workflow }, ...plugins },
+        ...(limits === undefined ? {} : { limits }),
       })
       return {
-        execute: ({ input, cache, handlers }) => {
+        execute: ({ input, cache, handlers, limits: runLimits }) => {
           const code = `import workflow from '${DEFINITION_SPECIFIER}'\nexport default await workflow(${JSON.stringify(input) ?? 'undefined'})`
-          return runner.execute(handlers === undefined ? { code, cache } : { code, cache, handlers })
+          return runner.execute({
+            code,
+            cache,
+            ...(handlers === undefined ? {} : { handlers }),
+            ...(runLimits === undefined ? {} : { limits: runLimits }),
+          })
         },
         dispose: () => runner.dispose(),
       }

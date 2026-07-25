@@ -56,6 +56,7 @@
   },
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
+    "@types/node": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
     "tsnapi": "catalog:",

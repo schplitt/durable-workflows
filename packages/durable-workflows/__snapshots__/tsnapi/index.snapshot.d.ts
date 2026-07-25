@@ -36,7 +36,6 @@ export interface DurableWorkflowsEngine {
 export interface DurableWorkflowsOptions {
   sandbox?: SandboxOptions;
   store: WorkflowStore;
-  resolveDefinition: (_: string, _?: string) => Promise<ResolvedDefinition | null>;
   plugins?: Readonly<Record<string, DurableWorkflowsPlugin>>;
   alias?: Readonly<Record<string, string>>;
   limits?: Partial<ResourceLimits>;
@@ -50,6 +49,9 @@ export interface DurableWorkflowsPlugin {
 export interface FailedInstanceRecord extends InstanceRecordBase {
   status: "failed";
   error: SerializedError;
+}
+export interface MemoryWorkflowStore extends WorkflowStore {
+  deploy: (_: string, _: string, _: string, _?: Partial<ResourceLimits>) => void;
 }
 export interface PendingOperation {
   stepId: string;
@@ -75,10 +77,12 @@ export interface WorkflowExecuteOptions {
   input?: unknown;
   cache: BoundaryCache;
   handlers?: PerExecuteHandlers;
+  limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowHydrateOptions {
   workflow: string;
   plugins?: Readonly<Record<string, ModuleDefinition>>;
+  limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowInstanceHandle {
   readonly id: string;
@@ -96,6 +100,7 @@ export interface WorkflowStore {
   deleteInstance: (_: string) => Promise<void>;
   getCache: (_: string) => Promise<BoundaryCache | null>;
   putCache: (_: string, _: BoundaryCache) => Promise<void>;
+  getDefinition: (_: string, _?: string) => Promise<ResolvedDefinition | null>;
 }
 // #endregion
 
@@ -146,6 +151,8 @@ export type RunOutcome = (RunOutcomeBase & {
 
 // #region Functions
 export declare function durableWorkflowHost(_?: DurableIsolatesOptions): DurableWorkflowHost;
+export declare function durableWorkflows(_: DurableWorkflowsOptions): DurableWorkflowsEngine;
+export declare function memoryStore(): MemoryWorkflowStore;
 // #endregion
 
 // #region Variables

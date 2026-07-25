@@ -21,7 +21,10 @@
  * A durable OPERATION call — the primitive every waiting/host-backed capability
  * is built on. Forms an auto step id (the boundary key) from `name` via the
  * kernel's ambient `nextKey` (`name#0`, `name#1`, … per scope) and routes to the
- * host handler registered under `name`, forwarding `args`. Resolves with the
+ * host handler registered under `name`. Over the wire it forwards the step id
+ * first, then `args` (the kernel never passes a handler its boundary key, so the
+ * engine recovers `stepId` from this leading id and treats the rest as
+ * `payload`). Resolves with the
  * boundary's value, rejects with a recorded/handler error, and never settles
  * when the handler suspends (the run is aborted). Answered from the cache on
  * replay — the handler runs at most once per boundary until re-dispatch.
