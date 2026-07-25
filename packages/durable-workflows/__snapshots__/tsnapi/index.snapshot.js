@@ -3,6 +3,8 @@
  */
 // #region Functions
 export function durableWorkflowHost(_) {}
+export function durableWorkflows(_) {}
+export function memoryStore() {}
 // #endregion
 
 // #region Variables

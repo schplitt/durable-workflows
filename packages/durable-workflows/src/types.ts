@@ -3,7 +3,7 @@
  *
  * Entry point shape:
  *
- *   const engine = durableWorkflows({ store, resolveDefinition, plugins: [...] })
+ *   const engine = durableWorkflows({ store, plugins: { ... } })
  *
  * Plugins never augment the engine surface — it is fixed. What a plugin
  * extends is the WORKFLOW's world: its shim defines a virtual module inside
@@ -39,20 +39,12 @@ export interface DurableWorkflowsOptions {
    */
   sandbox?: SandboxOptions
   /**
-   * The only mandatory adapter: where instances and their boundary cache live.
-   * Values are stored exactly as they cross the iso4 bridge (V8-serializable
-   * data) — there is no codec layer.
+   * The only mandatory adapter: ONE persistent world — instances, their
+   * boundary caches, and read access to workflow definitions. Values are
+   * stored exactly as they cross the iso4 bridge (V8-serializable data) —
+   * there is no codec layer.
    */
   store: WorkflowStore
-  /**
-   * Where workflow definitions come from — the engine deliberately has NO
-   * registry of its own. Called with a concrete version when replaying an
-   * instance (instances pin the version they started on), and without one
-   * when creating a new instance — the resolver decides what "latest" means
-   * and returns the concrete version to pin. Definitions live wherever the
-   * application wants: disk, database, git, an upload endpoint.
-   */
-  resolveDefinition: (name: string, version?: string) => Promise<ResolvedDefinition | null>
   /**
    * Capabilities workflow code can import. Each plugin is a pair of an
    * in-sandbox shim and a host-side implementation.
@@ -139,7 +131,7 @@ export interface DurableWorkflowsEngine {
   readonly pendingPromises: ReadonlySet<Promise<unknown>>
   /**
    * Start a new instance and run its first turn. Resolves the definition via
-   * `resolveDefinition` (without a version unless `opts.version` says
+   * the store's `getDefinition` (without a version unless `opts.version` says
    * otherwise), pins the returned concrete version to the instance for all
    * future replays, and returns the run's outcome.
    */
@@ -161,9 +153,10 @@ export interface DurableWorkflowsEngine {
   continueWorkflow: (instanceId: string) => Promise<RunOutcome>
   terminate: (instanceId: string) => Promise<void>
   /**
-   * Prefix invalidation: deletes the boundary and every boundary recorded after
-   * it (by `seq`), then replays. Rare manual remediation — not part of normal
-   * operation.
+   * Prefix invalidation: deletes the boundary, every boundary recorded after it
+   * (by `seq`), and its whole subtree (by key-prefix — a scope's children commit
+   * before the scope itself, so a seq-only prune would leave them cached), then
+   * replays. Rare manual remediation — not part of normal operation.
    */
   evict: (instanceId: string, stepId: string) => Promise<RunOutcome>
   /**
@@ -237,7 +230,7 @@ export interface CreateOptions {
    */
   instanceId?: string
   /**
-   * Pin a specific definition version instead of the resolver's "latest".
+   * Pin a specific definition version instead of the store's "latest"/active.
    */
   version?: string
 }
@@ -475,6 +468,11 @@ export interface TerminatedInstanceRecord extends InstanceRecordBase {
  * in-memory by the engine on the loaded cache before it re-executes, so the
  * store only ever reads and writes the whole blob. A new backend should be an
  * afternoon.
+ *
+ * Definitions are the store's READ-ONLY third concern: the engine never
+ * writes them. Writing (upload, versioning, rollback, deletion) is the
+ * application's own deploy layer operating on the same backend — deliberately
+ * out of engine scope.
  */
 export interface WorkflowStore {
   createInstance: (record: InstanceRecord) => Promise<void>
@@ -488,6 +486,23 @@ export interface WorkflowStore {
    */
   getCache: (instanceId: string) => Promise<BoundaryCache | null>
   putCache: (instanceId: string, cache: BoundaryCache) => Promise<void>
+
+  /**
+   * Where workflow definitions come from — the engine only ever READS them.
+   * Called without a `version` when creating a new instance (the adapter
+   * decides what "latest"/active means and returns the concrete version to
+   * pin), and with the pinned version on every replay of an existing
+   * instance.
+   *
+   * CONTRACT (the price of storing a reference instead of the bytes): a
+   * `(name, version)` pair is immutable and must stay fetchable —
+   * byte-identical, forever — while any instance pins it. Think docker image
+   * digest: the deploy layer never mutates a handed-out version and refuses
+   * to delete one that instances still reference; otherwise those instances
+   * strand or (worse) replay divergent code. The engine cannot enforce this —
+   * it lives in the adapter/deploy layer.
+   */
+  getDefinition: (name: string, version?: string) => Promise<ResolvedDefinition | null>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

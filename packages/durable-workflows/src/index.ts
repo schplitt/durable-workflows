@@ -10,6 +10,7 @@
  * the shim-facing contract for plugin authors at `durable-workflows/internal`.
  */
 export type * from './types'
+export { durableWorkflows } from './engine'
 export type {
   DurableWorkflowHost,
   WorkflowExecuteOptions,
@@ -17,6 +18,8 @@ export type {
   WorkflowRunner,
 } from './host'
 export { durableWorkflowHost } from './host'
+export type { MemoryWorkflowStore } from './memory-store'
+export { memoryStore } from './memory-store'
 // The canonical specifiers are exported: plugin shims import from them, and
 // `alias` remounts reference them. The core shim SOURCES are not public — the
 // host mounts them for you.

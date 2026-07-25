@@ -37,9 +37,13 @@ export const WORKFLOW_SPECIFIER = 'durable-workflows:workflow'
  *
  * `operation(name, ...args)` — a durable OPERATION call: forms an auto step id
  * with the kernel's `nextKey` (`name#0`, `name#1`, … within the current scope)
- * and routes to the host handler `name`, forwarding `args`. This is what plugin
- * shims build their capability on (e.g. `export const sleep = ms =>
- * operation('sleep', ms)`).
+ * and routes to the host handler `name`. It forwards the step id FIRST, then the
+ * caller's `args` — the kernel hands a handler only what the shim forwards and
+ * never the boundary key, so carrying it in the args is how the engine recovers
+ * `stepId` when it builds the handler's `{ instanceId, workflow, run, stepId,
+ * payload }` input (it strips this leading id and passes the rest as `payload`).
+ * This is what plugin shims build their capability on (e.g. `export const sleep =
+ * ms => operation('sleep', ms)`).
  *
  * `boundary(id, fn)` — the nestable BOUNDARY: `fn` runs in-sandbox, its return
  * value is committed, and `id` is prepended as the ambient prefix so inner
@@ -51,7 +55,8 @@ export const internalShim: string = /* js */ `
 import { durableCall, boundary as kernelBoundary, nextKey } from 'durable-isolates:internal'
 
 export function operation(name, ...args) {
-  return durableCall(nextKey(String(name)), String(name), ...args)
+  const key = nextKey(String(name))
+  return durableCall(key, String(name), key, ...args)
 }
 
 export function boundary(id, fn) {
