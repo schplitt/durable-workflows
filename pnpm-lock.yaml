@@ -13,8 +13,8 @@ catalogs:
       specifier: ^0.0.1
       version: 0.0.1
     '@iso4/sandbox':
-      specifier: ^0.3.0
-      version: 0.3.0
+      specifier: ^0.4.0
+      version: 0.4.0
     '@schplitt/eslint-config':
       specifier: ^1.5.1
       version: 1.5.1
@@ -64,7 +64,7 @@ importers:
     dependencies:
       '@iso4/sandbox':
         specifier: 'catalog:'
-        version: 0.3.0
+        version: 0.4.0
     devDependencies:
       '@iso4/fetch':
         specifier: 'catalog:'
@@ -732,33 +732,33 @@ packages:
     resolution: {integrity: sha512-9moEW0miSoMzyX4OEEFtAZGsLKGSCFqDh+VZap5/qhvCD1OPV/jzPrQ1Bu2RdzHttjqhQ9kAnZQN9/9+yejfKQ==}
     engines: {node: '>=24.0.0'}
 
-  '@iso4/sandbox@0.3.0':
-    resolution: {integrity: sha512-2SNs7MbiU9xkSTDsFPp66/ShvxEWQi+90lP35WTAAWsZvtuK9KR3IhN9aZbbohC9E29tie00jCpNGRG199cIXQ==}
+  '@iso4/sandbox@0.4.0':
+    resolution: {integrity: sha512-niLZEbswu64XlkrdP92Yh+VfQJpNrBg+M6r/v0JKnCCE1OIaUmW1RlgT4L/u6F/mDvx9kdzZxUnYGtQUUzxWcg==}
     engines: {node: '>=24.0.0'}
 
-  '@iso4/v8-darwin-arm64@0.3.0':
-    resolution: {integrity: sha512-0rze8Uy3LQaSquqJOrydOV2jle9Xu30kuLGvXMNlW0x47OhIZG9/t5oX2NaCQpVtz4DlCceSnQ6pikwUGWdoLQ==}
+  '@iso4/v8-darwin-arm64@0.4.0':
+    resolution: {integrity: sha512-Yy3BHUnRizblqLqCq7ho/8TnTYPeQkERRoSr/09wSHNsAea5T24t6q0wyFZFGsHT6AW+6gq5rDJ7094tPdOQcw==}
     engines: {node: '>=24.0.0'}
     cpu: [arm64]
     os: [darwin]
     hasBin: true
 
-  '@iso4/v8-darwin-x64@0.3.0':
-    resolution: {integrity: sha512-0dfxrWFkUObmmocz1remA0okvdML9U+RGkjndACfzK//8Xqm0ArsnDKURldYwPu/+iaAHLLuFPwwRSSOlSegGQ==}
+  '@iso4/v8-darwin-x64@0.4.0':
+    resolution: {integrity: sha512-P99V/1iPmHedYFWo4P2VDG7uAKlSMZ9+an0v+ANtqzpcXGkAy5mbBK99f4ffi5StKJ2YxR7i0NZgL9/dKLHaqA==}
     engines: {node: '>=24.0.0'}
     cpu: [x64]
     os: [darwin]
     hasBin: true
 
-  '@iso4/v8-linux-arm64-gnu@0.3.0':
-    resolution: {integrity: sha512-OO0uzET+qkhF927hTJgmxCMI6EgaWxwKAkRqvOWpA1hUCt/wAdHUDwxGH8CArD5Cj/iZ48V/VV7CUo3lsu6KPg==}
+  '@iso4/v8-linux-arm64-gnu@0.4.0':
+    resolution: {integrity: sha512-Y6W6r5fchjyieh7tkBUf8ui/19kWRaeVCs9KEnNfkJ1KlIQGSf3O5PFsEPXzt1clN7A6Nhf+v28Wu1LjEicalw==}
     engines: {node: '>=24.0.0'}
     cpu: [arm64]
     os: [linux]
     hasBin: true
 
-  '@iso4/v8-linux-x64-gnu@0.3.0':
-    resolution: {integrity: sha512-Q4SLY+bmC9DnWrYkepAC8OtxtnQh3OfzdwsJJ/S4UiYPqmWI6INA6fopPxRdjBHQIUPtcsVsANCq0ZFGEoKALw==}
+  '@iso4/v8-linux-x64-gnu@0.4.0':
+    resolution: {integrity: sha512-L+yAWVMjQpB1dgk21gG2zrJau2as5+C31I69IGj+BY5i8Qf5FCFqkKhaS5nznCvTkbAtsqL5KW0nh5DIjDiexw==}
     engines: {node: '>=24.0.0'}
     cpu: [x64]
     os: [linux]
@@ -4359,23 +4359,23 @@ snapshots:
       rou3: 0.8.1
       undici: 6.27.0
 
-  '@iso4/sandbox@0.3.0':
+  '@iso4/sandbox@0.4.0':
     optionalDependencies:
-      '@iso4/v8-darwin-arm64': 0.3.0
-      '@iso4/v8-darwin-x64': 0.3.0
-      '@iso4/v8-linux-arm64-gnu': 0.3.0
-      '@iso4/v8-linux-x64-gnu': 0.3.0
+      '@iso4/v8-darwin-arm64': 0.4.0
+      '@iso4/v8-darwin-x64': 0.4.0
+      '@iso4/v8-linux-arm64-gnu': 0.4.0
+      '@iso4/v8-linux-x64-gnu': 0.4.0
 
-  '@iso4/v8-darwin-arm64@0.3.0':
+  '@iso4/v8-darwin-arm64@0.4.0':
     optional: true
 
-  '@iso4/v8-darwin-x64@0.3.0':
+  '@iso4/v8-darwin-x64@0.4.0':
     optional: true
 
-  '@iso4/v8-linux-arm64-gnu@0.3.0':
+  '@iso4/v8-linux-arm64-gnu@0.4.0':
     optional: true
 
-  '@iso4/v8-linux-x64-gnu@0.3.0':
+  '@iso4/v8-linux-x64-gnu@0.4.0':
     optional: true
 
   '@jridgewell/gen-mapping@0.3.13':
