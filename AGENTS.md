@@ -155,6 +155,7 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 - Use `pnpm test:run` in automated/agent workflows. Do not use `pnpm test` there because it starts watch mode.
 - Prefer `pnpm lint:fix` before spending time on manual lint/style cleanup.
 - Releases are changesets-based: a PR changing a published package should include a changeset (`pnpm changeset`). On merge to `main`, `changesets/action` opens a "Version Packages" PR; merging that publishes to npm. Do not add bumpp/changelogithub — those were the old single-package flow.
+- To hold a package back from a release, add it to `ignore` in `.changeset/config.json` — but its pending changesets must then be parked in `.changeset-held/` (see its README), NOT left in `.changeset/`: `changesets/action` doesn't account for the ignore list when deciding version-PR vs publish, so leftover ignored-package changesets produce an empty Version PR that errors and blocks publishing. They can't go in a `.changeset/` subdirectory either (changesets treats directories there as its legacy v1 format and crashes). To release the held package later, move its changesets back and remove it from `ignore` in the same PR.
 - Run root scripts from the repo root; they fan out over `packages/*`. Per-package work can be done with `cd packages/<pkg>`.
 
 ### Patterns & Conventions
