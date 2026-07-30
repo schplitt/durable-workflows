@@ -8,5 +8,5 @@
   "baseBranch": "main",
   "bumpVersionsWithWorkspaceProtocolOnly": true,
   "updateInternalDependencies": "patch",
-  "ignore": []
+  "ignore": ["durable-workflows"]
 }
