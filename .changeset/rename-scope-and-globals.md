@@ -1,5 +1,5 @@
 ---
-"durable-isolates": minor
+"durable-isolates": patch
 ---
 
 Align vocabulary with iso4: rename the prepare/execute/globals/scope surface.
