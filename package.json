@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@11.7.0",
+  "packageManager": "pnpm@11.18.0",
   "description": "Monorepo for durable-workflows — a composable durable workflow library inspired by Cloudflare Workflows, built on top of iso4",
   "license": "MIT",
   "author": "schplitt",
