@@ -22,7 +22,7 @@ import type {
   DurableIsolatesOptions,
   ExecuteHandle,
   ModuleDefinition,
-  PerExecuteHandlers,
+  PerExecuteGlobals,
 } from 'durable-isolates'
 import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import { durableIsolates } from 'durable-isolates'
@@ -66,9 +66,9 @@ export interface WorkflowExecuteOptions {
    */
   cache: BoundaryCache
   /**
-   * Per-run host handlers for the mounted plugins, keyed by operation name.
+   * Per-run host globals for the mounted plugins, keyed by operation name.
    */
-  handlers?: PerExecuteHandlers
+  globals?: PerExecuteGlobals
   /**
    * iso4 resource limits for this run, overriding the runner's `hydrate` default.
    */
@@ -122,12 +122,12 @@ export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWo
         ...(limits === undefined ? {} : { limits }),
       })
       return {
-        execute: ({ input, cache, handlers, limits: runLimits }) => {
+        execute: ({ input, cache, globals, limits: runLimits }) => {
           const code = `import workflow from '${DEFINITION_SPECIFIER}'\nexport default await workflow(${JSON.stringify(input) ?? 'undefined'})`
           return runner.execute({
             code,
             cache,
-            ...(handlers === undefined ? {} : { handlers }),
+            ...(globals === undefined ? {} : { globals }),
             ...(runLimits === undefined ? {} : { limits: runLimits }),
           })
         },

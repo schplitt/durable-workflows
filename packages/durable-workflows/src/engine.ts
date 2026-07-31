@@ -11,20 +11,20 @@
  *   load the instance record + its boundary cache from the store
  *     → resolve the pinned definition version via the store's `getDefinition`
  *     → hydrate (or reuse) a runner for that version, mounted with the plugins
- *     → execute one turn with per-run handlers carrying the instance metadata
+ *     → execute one turn with per-run globals carrying the instance metadata
  *     → persist the grown cache and the new instance status
  *     → return a RunOutcome.
  *
  * The engine stores nothing but instances and one opaque cache blob per instance
  * (see {@link WorkflowStore}); retry, scheduling and wake-ups are the caller's
  * job. Resume is plain re-execution: a waiting operation re-dispatches and its
- * handler consults host state.
+ * global consults host state.
  */
-import type { HostHandler, ModuleDefinition } from 'durable-isolates'
+import type { HostGlobal, ModuleDefinition } from 'durable-isolates'
 import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import type { WorkflowRunner } from './host'
 import type {
-  DurableHandler,
+  DurableGlobal,
   DurableWorkflowsEngine,
   DurableWorkflowsOptions,
   InstanceOutcome,
@@ -124,16 +124,16 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
     mountedModules[aliasSpecifier] = { shim: `export * from '${canonical}'` }
   }
 
-  // Flat operation-name → handler map across every plugin. Routing is by name,
-  // so two DISTINCT handlers under one name are ambiguous — reject that; the
-  // same handler mounted under two alias specifiers is fine.
-  const handlerByName = new Map<string, DurableHandler>()
+  // Flat operation-name → global map across every plugin. Routing is by name,
+  // so two DISTINCT globals under one name are ambiguous — reject that; the
+  // same global mounted under two alias specifiers is fine.
+  const globalByName = new Map<string, DurableGlobal>()
   for (const plugin of Object.values(plugins)) {
-    for (const [name, handler] of Object.entries(plugin.handlers)) {
-      const existing = handlerByName.get(name)
-      if (existing !== undefined && existing !== handler)
-        throw new Error(`durable-workflows: two plugins register a handler named "${name}"`)
-      handlerByName.set(name, handler)
+    for (const [name, global] of Object.entries(plugin.globals)) {
+      const existing = globalByName.get(name)
+      if (existing !== undefined && existing !== global)
+        throw new Error(`durable-workflows: two plugins register a global named "${name}"`)
+      globalByName.set(name, global)
     }
   }
 
@@ -173,7 +173,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
   }
 
   // One replay turn against the current record. Resolves the runner, executes
-  // with per-run handlers, persists the grown cache and the new status, emits
+  // with per-run globals, persists the grown cache and the new status, emits
   // events, and returns the outcome. An infrastructure failure (resolve/hydrate/
   // execute/store) rejects WITHOUT transitioning — nothing is persisted past the
   // point it threw.
@@ -184,15 +184,15 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
     const runner = await ensureRunner(workflow, version, def)
     const cache = (await store.getCache(instanceId)) ?? {}
 
-    const handlers: Record<string, HostHandler> = {}
-    for (const [name, handler] of handlerByName) {
-      handlers[name] = (...forwarded: unknown[]) => {
+    const globals: Record<string, HostGlobal> = {}
+    for (const [name, global] of globalByName) {
+      globals[name] = (...forwarded: unknown[]) => {
         const [stepId, ...payload] = forwarded
-        return handler({ instanceId, workflow, run, stepId: String(stepId), payload })
+        return global({ instanceId, workflow, run, stepId: String(stepId), payload })
       }
     }
 
-    const result = await runner.execute({ input: record.input, cache, handlers }).result
+    const result = await runner.execute({ input: record.input, cache, globals }).result
     await store.putCache(instanceId, result.cache)
 
     // Emit a step event for every boundary that settled or changed this run.

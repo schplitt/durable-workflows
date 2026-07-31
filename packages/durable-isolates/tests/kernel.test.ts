@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
-import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, PerExecuteHandlers } from '../src'
+import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, PerExecuteGlobals } from '../src'
 import { durableIsolates, SuspendIsolate } from '../src'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
@@ -29,9 +29,9 @@ afterAll(async () => {
 })
 
 describe('durable calls (key from the sandbox)', () => {
-  test('auto-keyed call: completes, caches; handler runs once across replays', async () => {
+  test('auto-keyed call: completes, caches; global runs once across replays', async () => {
     let pings = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       ping: () => {
         pings += 1
         return 'pong'
@@ -39,7 +39,7 @@ describe('durable calls (key from the sandbox)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('ping', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -47,17 +47,17 @@ describe('durable calls (key from the sandbox)', () => {
     expect(Object.keys(r1.cache)).toEqual(['ping#0'])
     expect(pings).toBe(1)
 
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
     expect(r2.result).toBe('pong')
-    expect(pings).toBe(1) // cached — handler NOT re-invoked
+    expect(pings).toBe(1) // cached — global NOT re-invoked
   }, 15_000)
 
   test('explicit key via step(): the sandbox-supplied key is the boundary id', async () => {
     let runs = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       compute: () => {
         runs += 1
         return 42
@@ -65,21 +65,21 @@ describe('durable calls (key from the sandbox)', () => {
     }
     const code = `import { step } from 'tools'; export default await step('load-report', 'compute', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
     expect(r1.result).toBe(42)
     expect(Object.keys(r1.cache)).toEqual(['load-report'])
 
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     expect(runs).toBe(1) // cached by the explicit key
   }, 15_000)
 
   test('forwards all args; repeated names get distinct keys', async () => {
     const seen: unknown[] = []
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       echo: (a, b) => {
         seen.push([a, b])
         return { a, b }
@@ -90,7 +90,7 @@ describe('durable calls (key from the sandbox)', () => {
       const y = await call('echo', 'q', 2)
       export default [x, y]`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -100,7 +100,7 @@ describe('durable calls (key from the sandbox)', () => {
   }, 15_000)
 
   test('parallel leaf calls: keys form in source order, both settle', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       echo: async (v) => {
         await new Promise((resolve) => {
           setTimeout(resolve, 20)
@@ -112,7 +112,7 @@ describe('durable calls (key from the sandbox)', () => {
       const [a, b] = await Promise.all([call('echo', 'first'), call('echo', 'second')])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -122,26 +122,26 @@ describe('durable calls (key from the sandbox)', () => {
     expect(r1.cache['echo#1']).toMatchObject({ status: 'completed', value: 'second' })
   }, 15_000)
 
-  test('a per-execute handler overrides the module default (per-run auth)', async () => {
+  test('a per-execute global overrides the module default (per-run auth)', async () => {
     const withDefault = await host.hydrate({
-      modules: { tools: { shim: SHIM, handlers: { who: () => 'default' } } },
+      modules: { tools: { shim: SHIM, globals: { who: () => 'default' } } },
     })
     const code = `import { call } from 'tools'; export default await call('who', {})`
 
     const def = await withDefault.execute({ code, cache: {} }).result
     expect(def.outcome === 'completed' && def.result).toBe('default')
 
-    const overridden = await withDefault.execute({ code, cache: {}, handlers: { who: () => 'per-run' } }).result
+    const overridden = await withDefault.execute({ code, cache: {}, globals: { who: () => 'per-run' } }).result
     expect(overridden.outcome === 'completed' && overridden.result).toBe('per-run')
   }, 15_000)
 })
 
 describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
-  test('explicit gate: the handler returns the stored answer on re-dispatch', async () => {
+  test('explicit gate: the global returns the stored answer on re-dispatch', async () => {
     let loads = 0
     let approves = 0
     let answer: { approved: boolean } | undefined
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       load: () => {
         loads += 1
         return { title: 't' }
@@ -158,7 +158,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       const b = await call('approve', { subject: a.title })
       export default { a, b }`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -171,8 +171,8 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(loads).toBe(1)
     expect(approves).toBe(1)
 
-    answer = { approved: true } // host state — the handler returns it on re-dispatch
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    answer = { approved: true } // host state — the global returns it on re-dispatch
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -180,7 +180,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(loads).toBe(1) // read cached — NOT re-invoked
     expect(approves).toBe(2) // the answer entered the cache through the live re-dispatch
 
-    const r3 = await runner.execute({ code, cache: r2.cache, handlers }).result
+    const r3 = await runner.execute({ code, cache: r2.cache, globals }).result
     expect(r3.outcome).toBe('completed')
     expect(approves).toBe(2) // now settled in the cache — no further dispatch
   }, 15_000)
@@ -188,7 +188,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
   test('implicit gate: gated call suspends, then does the real work on resume', async () => {
     let approved = false
     let dispatches = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       del: () => {
         dispatches += 1
         if (!approved)
@@ -198,7 +198,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('del', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -207,7 +207,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(r1.pending[0]?.payload).toEqual({ op: 'DELETE' })
 
     approved = true // app state — same cache, just re-run
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -215,9 +215,9 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(dispatches).toBe(2) // waiting → re-dispatched; the DELETE ran exactly once
   }, 15_000)
 
-  test('denial: the handler throws on re-dispatch, catchable in the sandbox', async () => {
+  test('denial: the global throws on re-dispatch, catchable in the sandbox', async () => {
     let denied = false
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       del: () => {
         if (denied) {
           const e = new Error('user declined')
@@ -232,13 +232,13 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       try { await call('del', {}) } catch (e) { msg = e.name + ': ' + e.message }
       export default msg`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
 
     denied = true
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -247,7 +247,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('a parallel branch in flight at suspension is drained and kept', async () => {
     let slowRuns = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       slow: async () => {
         slowRuns += 1
         await new Promise((resolve) => {
@@ -263,7 +263,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       const [a, b] = await Promise.all([call('slow', {}), call('gate', {})])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -275,7 +275,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     const r2 = await runner.execute({
       code,
       cache: r1.cache,
-      handlers: { ...handlers, gate: () => 'approved' },
+      globals: { ...globals, gate: () => 'approved' },
     }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
@@ -286,7 +286,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('a sandbox try/catch around the suspending call cannot swallow it', async () => {
     let approves = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       approve: () => {
         approves += 1
         throw new SuspendIsolate({})
@@ -297,7 +297,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       try { await call('approve', {}) } catch { swallowed = true }
       export default { swallowed }`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -307,7 +307,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('bare re-execution re-dispatches and re-suspends with the same id', async () => {
     let dispatches = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       gate: () => {
         dispatches += 1
         throw new SuspendIsolate({})
@@ -315,12 +315,12 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('gate', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
 
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('suspended')
     if (r2.outcome !== 'suspended')
       return
@@ -332,7 +332,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 describe('checkpoints (lookup / commit / boundary)', () => {
   test('lookup+commit: the committed value survives eviction of the work that produced it', async () => {
     let produces = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       produce: () => {
         produces += 1
         return `v${produces}`
@@ -346,7 +346,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
       else { v = await call('produce', {}); await durableCommit('memo', v) }
       export default v`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -356,7 +356,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     // Evict the inner work; the checkpoint alone answers the replay.
     const surgically: BoundaryCache = { ...r1.cache }
     delete surgically['produce#0']
-    const r2 = await runner.execute({ code, cache: surgically, handlers }).result
+    const r2 = await runner.execute({ code, cache: surgically, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -368,7 +368,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     let approved = false
     let probes = 0
     let gates = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       probe: () => {
         probes += 1
         return 41
@@ -387,7 +387,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
         return a + 1
       })`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -395,7 +395,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     expect(probes).toBe(1)
 
     approved = true
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -405,7 +405,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
     // Evict the inner records: the committed scope must skip its body wholesale.
     const pruned: BoundaryCache = { scope: r2.cache.scope! }
-    const r3 = await runner.execute({ code, cache: pruned, handlers }).result
+    const r3 = await runner.execute({ code, cache: pruned, globals }).result
     expect(r3.outcome).toBe('completed')
     if (r3.outcome !== 'completed')
       return
@@ -416,7 +416,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
   test('nested boundary: keys concatenate; the outer commit alone answers replays', async () => {
     let probes = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       probe: () => {
         probes += 1
         return 41
@@ -430,7 +430,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
         return a + 1
       })`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -438,7 +438,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     expect(Object.keys(r1.cache).sort()).toEqual(['outer', 'outer/inner', 'outer/inner/probe#0'])
 
     const pruned: BoundaryCache = { outer: r1.cache.outer! }
-    const r2 = await runner.execute({ code, cache: pruned, handlers }).result
+    const r2 = await runner.execute({ code, cache: pruned, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -448,7 +448,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
   test('parallel nested boundaries: async context keeps each branch prefix isolated', async () => {
     let probes = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       probe: () => {
         probes += 1
         return 'ok'
@@ -469,7 +469,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
       const [a, b] = await Promise.all([branch('charge'), branch('refund')])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -486,7 +486,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
     // The outer commits alone answer the replay — both bodies skip wholesale.
     const pruned: BoundaryCache = { charge: r1.cache.charge!, refund: r1.cache.refund! }
-    const r2 = await runner.execute({ code, cache: pruned, handlers }).result
+    const r2 = await runner.execute({ code, cache: pruned, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -502,7 +502,7 @@ describe('external suspension (handle.suspend())', () => {
     const startedOnce = new Promise<void>((resolve) => {
       started = resolve
     })
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       slow: async () => {
         slowRuns += 1
         started()
@@ -514,7 +514,7 @@ describe('external suspension (handle.suspend())', () => {
     }
     const code = `import { call } from 'tools'; export default await call('slow', {})`
 
-    const handle = runner.execute({ code, cache: {}, handlers })
+    const handle = runner.execute({ code, cache: {}, globals })
     await startedOnce
     const r1 = await handle.suspend() // server teardown mid-dispatch
     expect(r1.outcome).toBe('suspended')
@@ -523,7 +523,7 @@ describe('external suspension (handle.suspend())', () => {
     expect(r1.pending).toEqual([]) // nothing waits on the outside — we stopped it
     expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', value: 'expensive-io' }) // drained write kept
 
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -532,10 +532,10 @@ describe('external suspension (handle.suspend())', () => {
   }, 15_000)
 
   test('suspend() after completion is a no-op resolving the completed result', async () => {
-    const handlers: PerExecuteHandlers = { ping: () => 'pong' }
+    const globals: PerExecuteGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'; export default await call('ping', {})`
 
-    const handle = runner.execute({ code, cache: {}, handlers })
+    const handle = runner.execute({ code, cache: {}, globals })
     const r1 = await handle.result
     expect(r1.outcome).toBe('completed')
 
@@ -544,14 +544,14 @@ describe('external suspension (handle.suspend())', () => {
   }, 15_000)
 
   test('a run suspended on approval is inert — suspend() has nothing to drain', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       gate: () => {
         throw new SuspendIsolate({})
       },
     }
     const code = `import { call } from 'tools'; export default await call('gate', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -561,9 +561,9 @@ describe('external suspension (handle.suspend())', () => {
 })
 
 describe('error plane', () => {
-  test('a failed call is recorded and re-throws deterministically (handler once)', async () => {
+  test('a failed call is recorded and re-throws deterministically (global once)', async () => {
     let booms = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       boom: () => {
         booms += 1
         throw new Error('kaboom')
@@ -571,21 +571,21 @@ describe('error plane', () => {
     }
     const code = `import { call } from 'tools'; export default await call('boom', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
     expect((r1.error as { message?: string }).message).toContain('kaboom')
     expect(booms).toBe(1)
 
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('failed')
     expect(booms).toBe(1) // re-thrown from the cache
   }, 15_000)
 
   test('retry is cache surgery: delete the failed entry to re-execute that boundary', async () => {
     let attempts = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       flaky: () => {
         attempts += 1
         if (attempts === 1)
@@ -595,7 +595,7 @@ describe('error plane', () => {
     }
     const code = `import { call } from 'tools'; export default await call('flaky', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
@@ -603,7 +603,7 @@ describe('error plane', () => {
 
     const retried: BoundaryCache = { ...r1.cache }
     delete retried['flaky#0'] // the caller's retry policy decided to re-execute
-    const r2 = await runner.execute({ code, cache: retried, handlers }).result
+    const r2 = await runner.execute({ code, cache: retried, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -612,7 +612,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a durable failure preserves the error name in the in-sandbox catch', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       boom: () => {
         const e = new Error('nope')
         e.name = 'NonRetryableError'
@@ -624,7 +624,7 @@ describe('error plane', () => {
       try { await call('boom', {}) } catch (e) { name = e.name }
       export default name`
 
-    const r = await runner.execute({ code, cache: {}, handlers }).result
+    const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -632,7 +632,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a host throw reaches the sandbox catch as a real Error with ALL own fields', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       boom: () => {
         throw Object.assign(new Error('payment declined'), { name: 'PaymentError', status: 402 })
       },
@@ -644,7 +644,7 @@ describe('error plane', () => {
       }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, handlers }).result
+    const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -659,7 +659,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a non-Error host throw crosses without an assumed shape', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       boom: () => {
         // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
         throw { code: 'DENY', reason: 'nope' }
@@ -670,7 +670,7 @@ describe('error plane', () => {
       try { await call('boom', {}) } catch (e) { out = { code: e.code, reason: e.reason } }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, handlers }).result
+    const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -678,14 +678,14 @@ describe('error plane', () => {
   }, 15_000)
 
   test('an uncaught host throw surfaces as a structured run-level failure', async () => {
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       boom: () => {
         throw Object.assign(new Error('boom'), { name: 'PaymentError', status: 402 })
       },
     }
     const code = `import { call } from 'tools'; export default await call('boom', {})`
 
-    const r = await runner.execute({ code, cache: {}, handlers }).result
+    const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('failed')
     if (r.outcome !== 'failed')
       return
@@ -697,17 +697,17 @@ describe('error plane', () => {
 
   test('a changed program just misses and runs — determinism is a contract, not a check', async () => {
     let bs = 0
-    const handlers: PerExecuteHandlers = { a: () => 1, b: () => {
+    const globals: PerExecuteGlobals = { a: () => 1, b: () => {
       bs += 1
       return 2
     } }
 
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
 
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('b', {})`, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('b', {})`, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -717,14 +717,14 @@ describe('error plane', () => {
   }, 15_000)
 })
 
-// real @iso4/fetch as a mounted handler; the shim keys it, the middleware gates
+// real @iso4/fetch as a mounted global; the shim keys it, the middleware gates
 describe('e2e: @iso4/fetch mounted durably', () => {
   test('cached read + consent-gated DELETE that suspends then runs on approval', async () => {
     let approved = false
     let gets = 0
     let deletes = 0
 
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       fetch: createSafeFetch({
         pinDns: false,
         rules: {
@@ -752,7 +752,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
       const del = await call('fetch', 'https://example.test/inventory/42', { method: 'DELETE' }).then((r) => r.body)
       export default { read, del }`
 
-    const r1 = await runner.execute({ code, cache: {}, handlers }).result
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -761,7 +761,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
     expect(deletes).toBe(1)
 
     approved = true
-    const r2 = await runner.execute({ code, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return

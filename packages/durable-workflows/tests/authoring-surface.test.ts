@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { SuspendIsolate } from 'durable-isolates'
-import type { PerExecuteHandlers } from 'durable-isolates'
+import type { PerExecuteGlobals } from 'durable-isolates'
 import type { DurableWorkflowHost, WorkflowRunner } from '../src'
 import { durableWorkflowHost, INTERNAL_SPECIFIER, WORKFLOW_SPECIFIER } from '../src'
 
@@ -58,7 +58,7 @@ describe('input', () => {
 describe('step.do', () => {
   test('body runs once, then replays from the committed value', async () => {
     let probes = 0
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       probe: () => {
         probes += 1
         return 5
@@ -72,7 +72,7 @@ describe('step.do', () => {
         }
       })`)
 
-    const r1 = await runner.execute({ input: { base: 10 }, cache: {}, handlers }).result
+    const r1 = await runner.execute({ input: { base: 10 }, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -82,7 +82,7 @@ describe('step.do', () => {
     expect(r1.cache.load).toMatchObject({ status: 'completed', value: 15 })
     expect(r1.cache['load/probe#0']).toMatchObject({ status: 'completed', value: 5 })
 
-    const r2 = await runner.execute({ input: { base: 10 }, cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ input: { base: 10 }, cache: r1.cache, globals }).result
     expect(r2.outcome === 'completed' && r2.result).toBe(15)
     expect(probes).toBe(1) // body skipped wholesale — the operation never re-dispatched
   }, 15_000)
@@ -138,7 +138,7 @@ describe('step.do', () => {
 
   test('an operation inside a step suspends the run, then resumes on re-dispatch', async () => {
     let answer: string | undefined
-    const handlers: PerExecuteHandlers = {
+    const globals: PerExecuteGlobals = {
       approve: () => {
         if (answer === undefined)
           throw new SuspendIsolate({ need: 'approval' })
@@ -153,7 +153,7 @@ describe('step.do', () => {
         }
       })`)
 
-    const r1 = await runner.execute({ cache: {}, handlers }).result
+    const r1 = await runner.execute({ cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -161,7 +161,7 @@ describe('step.do', () => {
     expect(r1.pending[0]?.payload).toEqual({ need: 'approval' })
 
     answer = 'approved'
-    const r2 = await runner.execute({ cache: r1.cache, handlers }).result
+    const r2 = await runner.execute({ cache: r1.cache, globals }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('approved')
   }, 15_000)
 })

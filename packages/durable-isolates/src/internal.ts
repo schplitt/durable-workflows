@@ -10,9 +10,9 @@
 /**
  * The host-backed durable primitive. The shim forms `key` in the sandbox
  * (via {@link NextKey}, an input-derived string, or an author-supplied id) and
- * passes it over the wire; `name` routes to the mounted host handler; `args`
+ * passes it over the wire; `name` routes to the mounted host global; `args`
  * are forwarded to it. The host answers a cache hit by `key`, or dispatches the
- * handler; recorded/handler failures re-throw deterministically, and on
+ * global; recorded/global failures re-throw deterministically, and on
  * suspension the returned promise never resolves (the run is aborted).
  */
 export type DurableCall = (key: string, name: string, ...args: unknown[]) => Promise<unknown>
@@ -34,8 +34,8 @@ export type DurableCommit = (key: string, value: unknown) => Promise<void>
 /**
  * Checkpoint sugar over lookup/commit: on a hit return the cached value WITHOUT
  * running `fn`; on a miss run `fn` in-sandbox, commit its result, return it.
- * Nestable — `key` joins the ambient prefix while `fn` runs, so inner keys
- * concatenate (`scope/inner#0`). The prefix is carried through async context
+ * Nestable — `key` joins the ambient scope while `fn` runs, so inner keys
+ * concatenate (`scope/inner#0`). The scope is carried through async context
  * (iso4 `AsyncLocalStorage`), so it survives `await` and stays isolated per
  * branch: nested scopes may run sequentially OR in parallel (`Promise.all`) and
  * still key deterministically. A body containing further durable work re-runs on
@@ -44,7 +44,7 @@ export type DurableCommit = (key: string, value: unknown) => Promise<void>
 export type Boundary = <T>(key: string, fn: () => T | Promise<T>) => Promise<T>
 
 /**
- * Ambient auto-key former for shims: current scope prefix + `name` + a
+ * Ambient auto-key former for shims: current scope + `name` + a
  * per-scope-per-name counter. Counters are plain sandbox module state — they
  * reset every replay, which is exactly what deterministic re-derivation wants.
  */

@@ -1,11 +1,11 @@
 /**
  * durable-isolates — the replay kernel's public type surface.
  *
- * The model: mount in-sandbox SHIMS plus host HANDLERS. A shim forms a `key` in
+ * The model: mount in-sandbox SHIMS plus host GLOBALS. A shim forms a `key` in
  * the sandbox and calls `durableCall(key, name, ...args)` (from
  * `durable-isolates:internal`); the kernel answers that boundary from the cache
- * when `key` is recorded (never re-executed), dispatches the `name` handler on a
- * miss, and lets a handler suspend the whole run by throwing `SuspendIsolate`.
+ * when `key` is recorded (never re-executed), dispatches the `name` global on a
+ * miss, and lets a global suspend the whole run by throwing `SuspendIsolate`.
  * Sandbox-side checkpoints (`boundary(key, fn)` over `durableLookup`/
  * `durableCommit`) memoize in-sandbox work the same way. Everything the caller
  * must remember comes back as the grown cache, and resume is always the same
@@ -70,7 +70,7 @@ export interface HydrateOptions {
 }
 
 /**
- * One mounted module: an in-sandbox shim plus its default host handlers.
+ * One mounted module: an in-sandbox shim plus its default host globals.
  */
 export interface ModuleDefinition {
   /**
@@ -82,24 +82,24 @@ export interface ModuleDefinition {
    */
   shim: string
   /**
-   * Default host handlers, keyed by the `name` the shim routes to. OPTIONAL:
-   * handlers whose per-instance state (e.g. auth) is captured per run can be
-   * supplied via `ExecuteOptions.handlers` instead. Effective handler = the
+   * Default host globals, keyed by the `name` the shim routes to. OPTIONAL:
+   * globals whose per-instance state (e.g. auth) is captured per run can be
+   * supplied via `ExecuteOptions.globals` instead. Effective global = the
    * per-execute override falling back to this default; a `name` with neither
    * fails that call.
    */
-  handlers?: HandlerMap
+  globals?: GlobalMap
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handlers
+// Globals
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * A host-side handler for one operation `name`. The kernel invokes it only when
- * the call's `key` is not already completed/failed in the cache, so handlers
+ * A host-side global for one operation `name`. The kernel invokes it only when
+ * the call's `key` is not already completed/failed in the cache, so globals
  * never see replay of a settled boundary. A `waiting` boundary IS re-dispatched
- * (that is the resume path): the handler consults host/app state and either
+ * (that is the resume path): the global consults host/app state and either
  * proceeds this time, suspends again, or throws. It receives ALL the args the
  * shim's `durableCall` forwarded (V8-serialized across the bridge).
  *
@@ -108,20 +108,20 @@ export interface ModuleDefinition {
  * - throws `SuspendIsolate` → the run suspends (waiting boundary + abort);
  * - throws anything else → failed boundary, re-thrown deterministically on replay.
  */
-export type HostHandler = (...args: unknown[]) => unknown
+export type HostGlobal = (...args: unknown[]) => unknown
 
 /**
- * Host handlers keyed by the operation `name` the shim routes to.
+ * Host globals keyed by the operation `name` the shim routes to.
  */
-export type HandlerMap = Readonly<Record<string, HostHandler>>
+export type GlobalMap = Readonly<Record<string, HostGlobal>>
 
 /**
- * Per-`execute` handler overrides, keyed by operation `name`. Rebinds the host
- * handler for THIS run (the credentials story: fresh handlers per run, auth in
- * their closure — including any approval/consent answers the handler consults
- * on re-dispatch). Omitted names reuse the module's default handler.
+ * Per-`execute` global overrides, keyed by operation `name`. Rebinds the host
+ * global for THIS run (the credentials story: fresh globals per run, auth in
+ * their closure — including any approval/consent answers the global consults
+ * on re-dispatch). Omitted names reuse the module's default global.
  */
-export type PerExecuteHandlers = Readonly<Record<string, HostHandler>>
+export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Runner — a hydrated prefix; one replay turn per execute
@@ -131,7 +131,7 @@ export interface DurableIsolatesRunner {
   /**
    * One replay turn — a (nearly) pure function over the cache. Re-runs `code`
    * from the top in a fresh isolate: a boundary answers from `cache` when its
-   * key is recorded, else runs for real; a handler throwing `SuspendIsolate`
+   * key is recorded, else runs for real; a global throwing `SuspendIsolate`
    * aborts the run (suspension is host-decided and uncatchable in-sandbox).
    * Returns the outcome plus the grown cache — the caller persists `cache` and
    * hands it back next turn. The returned handle carries the `result` promise
@@ -159,10 +159,10 @@ export interface ExecuteOptions {
    */
   cache: BoundaryCache
   /**
-   * Rebind host handlers for this run (auth and approval answers captured in
+   * Rebind host globals for this run (auth and approval answers captured in
    * closure), keyed by operation `name`. Omitted names reuse the module default.
    */
-  handlers?: PerExecuteHandlers
+  globals?: PerExecuteGlobals
   /**
    * iso4 resource limits for this run, overriding the prefix's `hydrate`
    * default.
@@ -181,9 +181,9 @@ export interface ExecuteHandle {
   /**
    * Suspend the run from OUTSIDE (server teardown): aborts the isolate (CPU
    * work since the last boundary is disposable — replay redoes it), lets every
-   * in-flight handler dispatch FINISH and be recorded (the IO is not wasted;
+   * in-flight global dispatch FINISH and be recorded (the IO is not wasted;
    * replay fast-paths it), then resolves with `{outcome: 'suspended', ... }` —
-   * the same shape as a handler suspension, with possibly-empty `pending`.
+   * the same shape as a global suspension, with possibly-empty `pending`.
    * Await it in the shutdown path, persist `cache`, and re-execute later. A
    * no-op resolving the settled result when the run already finished.
    */
@@ -225,7 +225,7 @@ export interface SuspendedResult extends ExecuteResultBase {
    * Boundaries awaiting the outside world — one per waiting record written this
    * run (empty when the run was suspended externally via `handle.suspend()`).
    * The caller reacts (elicit, notify, wait) and resumes by re-executing with
-   * the grown cache: the waiting boundary re-dispatches and its handler,
+   * the grown cache: the waiting boundary re-dispatches and its global,
    * consulting host state, proceeds, suspends again, or throws.
    */
   pending: PendingOperation[]
@@ -244,7 +244,7 @@ export interface FailedResult extends ExecuteResultBase {
 /**
  * A dispatched-but-unanswered operation, handed outward on suspension. `id` is
  * the boundary's cache key, `name` the operation that suspended, `payload` what
- * the handler passed to `SuspendIsolate`.
+ * the global passed to `SuspendIsolate`.
  */
 export interface PendingOperation {
   id: string
@@ -290,7 +290,7 @@ export interface CompletedBoundary extends BoundaryRecordBase {
 export interface FailedBoundary extends BoundaryRecordBase {
   status: 'failed'
   /**
-   * The value the handler threw, recorded verbatim. Re-thrown into the sandbox
+   * The value the global threw, recorded verbatim. Re-thrown into the sandbox
    * on replay via the durable envelope; iso4's bridge serialization carries it
    * faithfully (name/message/stack + own fields).
    */
@@ -298,7 +298,7 @@ export interface FailedBoundary extends BoundaryRecordBase {
 }
 
 /**
- * A boundary whose handler suspended. NOT terminal: re-executing the same cache
+ * A boundary whose global suspended. NOT terminal: re-executing the same cache
  * re-dispatches it — that is the one resume path. Values only ever enter the
  * cache through a live dispatch or an explicit in-sandbox commit; there is no
  * way to inject a result from outside.

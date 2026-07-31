@@ -5,7 +5,7 @@ import type {
   DurableIsolates,
   DurableIsolatesRunner,
 } from './types'
-import { precompileGlobals, resolveDefaultHandlers, toPrecompileImports } from './mount'
+import { precompileGlobals, resolveDefaultGlobals, toPrecompileImports } from './mount'
 import { executeRun } from './execute'
 
 /**
@@ -25,7 +25,7 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
   const host: DurableIsolates = {
     hydrate: async (hydrateOptions): Promise<DurableIsolatesRunner> => {
       const { modules, limits: hydrateLimits } = hydrateOptions
-      const defaults = resolveDefaultHandlers(modules)
+      const defaults = resolveDefaultGlobals(modules)
 
       const sandbox = await getSandbox()
       const prefix: Prefix<HostGlobals, Record<string, never>> = await sandbox.precompile({
@@ -41,7 +41,7 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
           hydrateLimits,
           code: executeOptions.code,
           cache: executeOptions.cache,
-          handlers: executeOptions.handlers,
+          globals: executeOptions.globals,
           executeLimits: executeOptions.limits,
         }),
         dispose: () => prefix.dispose(),

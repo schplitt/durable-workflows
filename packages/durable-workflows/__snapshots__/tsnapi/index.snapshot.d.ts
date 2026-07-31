@@ -12,7 +12,7 @@ export interface CreateOptions {
   instanceId?: string;
   version?: string;
 }
-export interface DurableHandlerInput {
+export interface DurableGlobalInput {
   instanceId: string;
   workflow: string;
   run: number;
@@ -44,7 +44,7 @@ export interface DurableWorkflowsOptions {
 export interface DurableWorkflowsPlugin {
   id: string;
   shim: string;
-  handlers: Readonly<Record<string, DurableHandler>>;
+  globals: Readonly<Record<string, DurableGlobal>>;
 }
 export interface FailedInstanceRecord extends InstanceRecordBase {
   status: "failed";
@@ -76,7 +76,7 @@ export interface TerminatedInstanceRecord extends InstanceRecordBase {
 export interface WorkflowExecuteOptions {
   input?: unknown;
   cache: BoundaryCache;
-  handlers?: PerExecuteHandlers;
+  globals?: PerExecuteGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowHydrateOptions {
@@ -106,7 +106,7 @@ export interface WorkflowStore {
 
 // #region Types
 export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(_: TPlugin) => TPlugin;
-export type DurableHandler = (_: DurableHandlerInput) => unknown;
+export type DurableGlobal = (_: DurableGlobalInput) => unknown;
 export type DurableWorkflows = (_: DurableWorkflowsOptions) => DurableWorkflowsEngine;
 export type EngineEvent = {
   type: "instance";
