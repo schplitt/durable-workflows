@@ -3,7 +3,7 @@
  * `durable-isolates` replay kernel. See `./types` for the engine/host public
  * type surface.
  *
- * `durableWorkflowHost` is the execution surface: `hydrate({ workflow, plugins })`
+ * `durableWorkflowHost` is the execution surface: `prepare({ workflow, plugins })`
  * mounts a workflow definition with the core modules auto-injected, and the
  * returned runner's `execute({ input })` runs it. Author-facing types live at
  * `durable-workflows/workflow` (the ambient `durable-workflows:workflow` module);
@@ -14,7 +14,7 @@ export { durableWorkflows } from './engine'
 export type {
   DurableWorkflowHost,
   WorkflowExecuteOptions,
-  WorkflowHydrateOptions,
+  WorkflowPrepareOptions,
   WorkflowRunner,
 } from './host'
 export { durableWorkflowHost } from './host'

@@ -11,7 +11,7 @@ export interface CompletedResult extends ExecuteResultBase {
   result: unknown;
 }
 export interface DurableIsolates {
-  hydrate: (_: HydrateOptions) => Promise<DurableIsolatesRunner>;
+  prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
   dispose: () => Promise<void>;
 }
 export interface DurableIsolatesOptions {
@@ -39,10 +39,6 @@ export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
   error: unknown;
 }
-export interface HydrateOptions {
-  modules: Readonly<Record<string, ModuleDefinition>>;
-  limits?: Partial<ResourceLimits>;
-}
 export interface ModuleDefinition {
   shim: string;
   globals?: GlobalMap;
@@ -51,6 +47,10 @@ export interface PendingOperation {
   id: string;
   name: string;
   payload: unknown;
+}
+export interface PrepareOptions {
+  modules: Readonly<Record<string, ModuleDefinition>>;
+  limits?: Partial<ResourceLimits>;
 }
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";

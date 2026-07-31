@@ -10,7 +10,7 @@ import { executeRun } from './execute'
 
 /**
  * Bind one iso4 sandbox (the Rust core + isolate pool). The sandbox is created
- * lazily on the first `hydrate` and reused for every prefix; `dispose()` tears
+ * lazily on the first `prepare` and reused for every prefix; `dispose()` tears
  * it — and all its prefixes — down. See {@link CreateDurableIsolates}.
  * @param options the sandbox options for the one iso4 bind
  */
@@ -23,12 +23,12 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
   }
 
   const host: DurableIsolates = {
-    hydrate: async (hydrateOptions): Promise<DurableIsolatesRunner> => {
-      const { modules, limits: hydrateLimits } = hydrateOptions
+    prepare: async (prepareOptions): Promise<DurableIsolatesRunner> => {
+      const { modules, limits: prepareLimits } = prepareOptions
       const defaults = resolveDefaultGlobals(modules)
 
       const sandbox = await getSandbox()
-      const prefix: Prefix<HostGlobals, Record<string, never>> = await sandbox.precompile({
+      const prefix: Prefix<HostGlobals, Record<string, never>> = await sandbox.prepare({
         code: '',
         globals: precompileGlobals(),
         imports: toPrecompileImports(modules),
@@ -38,7 +38,7 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
         execute: (executeOptions) => executeRun({
           prefix,
           defaults,
-          hydrateLimits,
+          prepareLimits,
           code: executeOptions.code,
           cache: executeOptions.cache,
           globals: executeOptions.globals,

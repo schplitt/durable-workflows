@@ -21,7 +21,7 @@ let runner: DurableIsolatesRunner
 
 beforeAll(async () => {
   host = durableIsolates({ sandbox: { maxIsolates: 4 } })
-  runner = await host.hydrate({ modules: { tools: { shim: SHIM } } })
+  runner = await host.prepare({ modules: { tools: { shim: SHIM } } })
 }, 30_000)
 
 afterAll(async () => {
@@ -123,7 +123,7 @@ describe('durable calls (key from the sandbox)', () => {
   }, 15_000)
 
   test('a per-execute global overrides the module default (per-run auth)', async () => {
-    const withDefault = await host.hydrate({
+    const withDefault = await host.prepare({
       modules: { tools: { shim: SHIM, globals: { who: () => 'default' } } },
     })
     const code = `import { call } from 'tools'; export default await call('who', {})`
@@ -777,7 +777,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(
-      host.hydrate({ modules: { 'durable-isolates:internal': { shim: 'export const x = 1' } } }),
+      host.prepare({ modules: { 'durable-isolates:internal': { shim: 'export const x = 1' } } }),
     ).rejects.toThrow(/reserved module specifier/)
   })
 })

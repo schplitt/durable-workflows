@@ -7,7 +7,7 @@ import { durableWorkflowHost, INTERNAL_SPECIFIER, WORKFLOW_SPECIFIER } from '../
 // The authoring surface is tested end-to-end through the durable-workflows host,
 // which wraps the REAL kernel. The caller mounts ONLY a plugin (`test:tools`,
 // whose shim is itself built on `durable-workflows:internal`); the core modules
-// and the workflow definition are injected by `hydrate`, and the kernel injects
+// and the workflow definition are injected by `prepare`, and the kernel injects
 // its own `durable-isolates:internal`. `execute({ input })` builds the main-world
 // entry internally — the workflow author never mounts internals or writes the
 // entry, and input is baked into the entry as JSON (never a bridge call).
@@ -28,22 +28,22 @@ afterAll(async () => {
   await host.dispose()
 })
 
-// Hydrate a runner for one workflow definition + the tools plugin.
-function hydrate(workflow: string): Promise<WorkflowRunner> {
-  return host.hydrate({ workflow, plugins: { [TOOLS_SPECIFIER]: { shim: TOOLS_SHIM } } })
+// Prepare a runner for one workflow definition + the tools plugin.
+function prepare(workflow: string): Promise<WorkflowRunner> {
+  return host.prepare({ workflow, plugins: { [TOOLS_SPECIFIER]: { shim: TOOLS_SHIM } } })
 }
 
-describe('host.hydrate', () => {
+describe('host.prepare', () => {
   test('rejects a plugin that shadows a reserved specifier', async () => {
     await expect(
-      host.hydrate({ workflow: 'export default null', plugins: { [WORKFLOW_SPECIFIER]: { shim: '' } } }),
+      host.prepare({ workflow: 'export default null', plugins: { [WORKFLOW_SPECIFIER]: { shim: '' } } }),
     ).rejects.toThrow(/reserved module specifier/)
   }, 15_000)
 })
 
 describe('input', () => {
   test('run receives the JSON input baked into the generated entry (no bridge call)', async () => {
-    const runner = await hydrate(`import { defineWorkflow } from '${WORKFLOW_SPECIFIER}'
+    const runner = await prepare(`import { defineWorkflow } from '${WORKFLOW_SPECIFIER}'
       export default defineWorkflow({ async run({ input }) { return input.greeting + '!' } })`)
 
     const r1 = await runner.execute({ input: { greeting: 'hi' }, cache: {} }).result
@@ -64,7 +64,7 @@ describe('step.do', () => {
         return 5
       },
     }
-    const runner = await hydrate(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
+    const runner = await prepare(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
       import { probe } from '${TOOLS_SPECIFIER}'
       export default defineWorkflow({
         async run({ input }) {
@@ -88,7 +88,7 @@ describe('step.do', () => {
   }, 15_000)
 
   test('nested sequential step.do: keys concatenate; the outer commit alone answers replays', async () => {
-    const runner = await hydrate(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
+    const runner = await prepare(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
       export default defineWorkflow({
         async run() {
           return await step.do('outer', async () => {
@@ -112,7 +112,7 @@ describe('step.do', () => {
   }, 15_000)
 
   test('nested PARALLEL step.do: each branch keys under itself (async context)', async () => {
-    const runner = await hydrate(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
+    const runner = await prepare(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
       export default defineWorkflow({
         async run() {
           const branch = (name) => step.do(name, async () => {
@@ -145,7 +145,7 @@ describe('step.do', () => {
         return answer
       },
     }
-    const runner = await hydrate(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
+    const runner = await prepare(`import { defineWorkflow, step } from '${WORKFLOW_SPECIFIER}'
       import { approve } from '${TOOLS_SPECIFIER}'
       export default defineWorkflow({
         async run() {

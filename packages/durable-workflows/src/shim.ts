@@ -100,7 +100,7 @@ export function defineWorkflow(definition) {
  * The core author-facing modules, keyed by their canonical specifier — the
  * single source of truth for what the engine mounts into every prefix. The
  * engine spreads this together with the user's plugins (and any `alias`
- * remounts) when it calls the kernel's `hydrate`; workflow authors never mount
+ * remounts) when it calls the kernel's `prepare`; workflow authors never mount
  * them, and the kernel does not inject them (it only injects its OWN
  * `durable-isolates:internal`). Exposing the bundle keeps the engine and tests
  * from drifting from these definitions.

@@ -20,7 +20,7 @@ export interface DurableGlobalInput {
   payload: unknown;
 }
 export interface DurableWorkflowHost {
-  hydrate: (_: WorkflowHydrateOptions) => Promise<WorkflowRunner>;
+  prepare: (_: WorkflowPrepareOptions) => Promise<WorkflowRunner>;
   dispose: () => Promise<void>;
 }
 export interface DurableWorkflowsEngine {
@@ -79,15 +79,15 @@ export interface WorkflowExecuteOptions {
   globals?: PerExecuteGlobals;
   limits?: Partial<ResourceLimits>;
 }
-export interface WorkflowHydrateOptions {
-  workflow: string;
-  plugins?: Readonly<Record<string, ModuleDefinition>>;
-  limits?: Partial<ResourceLimits>;
-}
 export interface WorkflowInstanceHandle {
   readonly id: string;
   status: () => Promise<InstanceStatus>;
   outcome: () => Promise<InstanceOutcome | null>;
+}
+export interface WorkflowPrepareOptions {
+  workflow: string;
+  plugins?: Readonly<Record<string, ModuleDefinition>>;
+  limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowRunner {
   execute: (_: WorkflowExecuteOptions) => ExecuteHandle;

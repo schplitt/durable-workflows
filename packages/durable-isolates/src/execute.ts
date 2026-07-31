@@ -42,7 +42,7 @@ type CallEnvelope
 export interface ExecuteRunParams {
   prefix: Prefix<HostGlobals, Record<string, never>>
   defaults: Map<string, HostGlobal>
-  hydrateLimits: Partial<ResourceLimits> | undefined
+  prepareLimits: Partial<ResourceLimits> | undefined
   code: string
   cache: BoundaryCache
   globals: PerExecuteGlobals | undefined
@@ -69,7 +69,7 @@ export interface ExecuteRunParams {
  * @param params the prefix, default globals, code, cache, per-run globals and limits
  */
 export function executeRun(params: ExecuteRunParams): ExecuteHandle {
-  const { prefix, defaults, hydrateLimits, code, globals, executeLimits } = params
+  const { prefix, defaults, prepareLimits, code, globals, executeLimits } = params
 
   const registry = new Map(defaults)
   if (globals !== undefined) {
@@ -166,10 +166,10 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     throw settled.error
   }
 
-  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...hydrateLimits, ...executeLimits }
+  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...prepareLimits, ...executeLimits }
 
   const result = (async (): Promise<ExecuteResult> => {
-    const result = await prefix.run({
+    const result = await prefix.execute({
       code,
       globals: {
         [DURABLE_CALL_GLOBAL]: callBridge,

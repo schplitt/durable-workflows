@@ -27,7 +27,7 @@ import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
 /**
  * Bind ONE iso4 sandbox — a single connection to the Rust core holding the
  * `maxIsolates` pool that budgets every concurrent run across every prefix
- * hydrated on it. Created lazily on the first `hydrate`, reused thereafter;
+ * prepared on it. Created lazily on the first `prepare`, reused thereafter;
  * `dispose()` tears it (and all its prefixes) down.
  */
 export type CreateDurableIsolates = (options?: DurableIsolatesOptions) => DurableIsolates
@@ -36,25 +36,25 @@ export interface DurableIsolatesOptions {
   /**
    * iso4 sandbox options — the one Rust bind and its `maxIsolates` pool.
    * Resource LIMITS are not set here: they are per-run execution caps,
-   * configured on `hydrate` (default) and `execute` (override).
+   * configured on `prepare` (default) and `execute` (override).
    */
   sandbox?: SandboxOptions
 }
 
 export interface DurableIsolates {
   /**
-   * Hydrate a prefix from a set of mounted modules — precompiles their shims
+   * Prepare a prefix from a set of mounted modules — precompiles their shims
    * (plus `durable-isolates:internal`) into a V8 startup snapshot. Many prefixes
    * share the one sandbox and its isolate pool.
    */
-  hydrate: (options: HydrateOptions) => Promise<DurableIsolatesRunner>
+  prepare: (options: PrepareOptions) => Promise<DurableIsolatesRunner>
   /**
-   * Tear down the sandbox and every prefix hydrated on it.
+   * Tear down the sandbox and every prefix prepared on it.
    */
   dispose: () => Promise<void>
 }
 
-export interface HydrateOptions {
+export interface PrepareOptions {
   /**
    * The mounted modules. Keys ARE the virtual module specifiers — the mount
    * points in-sandbox code imports (e.g. `import { request } from 'cumulocity'`).
@@ -124,7 +124,7 @@ export type GlobalMap = Readonly<Record<string, HostGlobal>>
 export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Runner — a hydrated prefix; one replay turn per execute
+// Runner — a prepared prefix; one replay turn per execute
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface DurableIsolatesRunner {
@@ -164,7 +164,7 @@ export interface ExecuteOptions {
    */
   globals?: PerExecuteGlobals
   /**
-   * iso4 resource limits for this run, overriding the prefix's `hydrate`
+   * iso4 resource limits for this run, overriding the prefix's `prepare`
    * default.
    */
   limits?: Partial<ResourceLimits>

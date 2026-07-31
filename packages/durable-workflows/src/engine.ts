@@ -10,7 +10,7 @@
  *
  *   load the instance record + its boundary cache from the store
  *     → resolve the pinned definition version via the store's `getDefinition`
- *     → hydrate (or reuse) a runner for that version, mounted with the plugins
+ *     → prepare (or reuse) a runner for that version, mounted with the plugins
  *     → execute one turn with per-run globals carrying the instance metadata
  *     → persist the grown cache and the new instance status
  *     → return a RunOutcome.
@@ -119,7 +119,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
   for (const [aliasSpecifier, canonical] of Object.entries(alias)) {
     if (Object.hasOwn(mountedModules, aliasSpecifier))
       throw new Error(`durable-workflows: alias "${aliasSpecifier}" collides with a mounted plugin`)
-    // A reserved-specifier alias key is rejected by the host on hydrate; the
+    // A reserved-specifier alias key is rejected by the host on prepare; the
     // canonical target is a reserved core module, which is what we re-export.
     mountedModules[aliasSpecifier] = { shim: `export * from '${canonical}'` }
   }
@@ -139,7 +139,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
 
   // Compiled runners, one per pinned definition version, reused across every run
   // of that version. Keyed by `workflow@version`; the promise is cached so
-  // concurrent first runs share one hydrate, and a failed hydrate is evicted.
+  // concurrent first runs share one prepare, and a failed prepare is evicted.
   const runners = new Map<string, Promise<WorkflowRunner>>()
   function ensureRunner(workflow: string, version: string, def?: ResolvedDefinition): Promise<WorkflowRunner> {
     const key = `${workflow}@${version}`
@@ -149,7 +149,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
         const resolved = def ?? await store.getDefinition(workflow, version)
         if (resolved === null)
           throw new Error(`durable-workflows: no definition for "${workflow}" @ "${version}"`)
-        return host.hydrate({
+        return host.prepare({
           workflow: resolved.code,
           plugins: mountedModules,
           limits: { ...DEFAULT_LIMITS, ...limits, ...resolved.limits },
@@ -174,7 +174,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
 
   // One replay turn against the current record. Resolves the runner, executes
   // with per-run globals, persists the grown cache and the new status, emits
-  // events, and returns the outcome. An infrastructure failure (resolve/hydrate/
+  // events, and returns the outcome. An infrastructure failure (resolve/prepare/
   // execute/store) rejects WITHOUT transitioning — nothing is persisted past the
   // point it threw.
   async function runTurn(record: InstanceRecord, def?: ResolvedDefinition): Promise<RunOutcome> {

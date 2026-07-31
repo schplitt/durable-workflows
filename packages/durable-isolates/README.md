@@ -29,7 +29,7 @@ pnpm add durable-isolates
 import { durableIsolates } from 'durable-isolates'
 
 const di = durableIsolates()
-const runner = await di.hydrate({
+const runner = await di.prepare({
   modules: {
     reports: {
       shim: `
