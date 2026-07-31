@@ -7,7 +7,7 @@
  * so referencing them would invert the dependency). This host is where the
  * workflow layer adds its own surface:
  *
- * - `hydrate({ workflow, plugins })` mounts the workflow definition plus the
+ * - `prepare({ workflow, plugins })` mounts the workflow definition plus the
  *   caller's plugins, ALWAYS injecting the core modules
  *   (`durable-workflows:workflow` + `:internal`) that every workflow and plugin
  *   shim imports — the caller never mounts them, and a plugin may not shadow a
@@ -22,7 +22,7 @@ import type {
   DurableIsolatesOptions,
   ExecuteHandle,
   ModuleDefinition,
-  PerExecuteHandlers,
+  PerExecuteGlobals,
 } from 'durable-isolates'
 import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import { durableIsolates } from 'durable-isolates'
@@ -34,7 +34,7 @@ import { coreModules } from './shim'
  */
 const DEFINITION_SPECIFIER = 'durable-workflows:definition'
 
-export interface WorkflowHydrateOptions {
+export interface WorkflowPrepareOptions {
   /**
    * The workflow definition's bundled ESM source — `export default
    * defineWorkflow({ run })` (importing `defineWorkflow` from
@@ -50,7 +50,7 @@ export interface WorkflowHydrateOptions {
   /**
    * Default iso4 resource limits for every `execute` on this runner;
    * `WorkflowExecuteOptions.limits` overrides per run. Forwarded to the kernel's
-   * `hydrate`.
+   * `prepare`.
    */
   limits?: Partial<ResourceLimits>
 }
@@ -66,11 +66,11 @@ export interface WorkflowExecuteOptions {
    */
   cache: BoundaryCache
   /**
-   * Per-run host handlers for the mounted plugins, keyed by operation name.
+   * Per-run host globals for the mounted plugins, keyed by operation name.
    */
-  handlers?: PerExecuteHandlers
+  globals?: PerExecuteGlobals
   /**
-   * iso4 resource limits for this run, overriding the runner's `hydrate` default.
+   * iso4 resource limits for this run, overriding the runner's `prepare` default.
    */
   limits?: Partial<ResourceLimits>
 }
@@ -89,10 +89,10 @@ export interface WorkflowRunner {
 
 export interface DurableWorkflowHost {
   /**
-   * Hydrate a runner for one workflow definition, auto-injecting the core
+   * Prepare a runner for one workflow definition, auto-injecting the core
    * modules and mounting the caller's plugins.
    */
-  hydrate: (options: WorkflowHydrateOptions) => Promise<WorkflowRunner>
+  prepare: (options: WorkflowPrepareOptions) => Promise<WorkflowRunner>
   /**
    * Await in-flight work and tear down the underlying sandbox.
    */
@@ -101,14 +101,14 @@ export interface DurableWorkflowHost {
 
 /**
  * Create a durable-workflows host. Binds a `durable-isolates` sandbox internally
- * (created lazily on the first `hydrate`) and exposes the workflow-shaped
- * `hydrate`/`execute` surface. See {@link DurableWorkflowHost}.
+ * (created lazily on the first `prepare`) and exposes the workflow-shaped
+ * `prepare`/`execute` surface. See {@link DurableWorkflowHost}.
  * @param options sandbox options forwarded to the underlying durable-isolates host
  */
 export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWorkflowHost {
   const host = durableIsolates(options)
   return {
-    hydrate: async ({ workflow, plugins = {}, limits }): Promise<WorkflowRunner> => {
+    prepare: async ({ workflow, plugins = {}, limits }): Promise<WorkflowRunner> => {
       for (const specifier of Object.keys(plugins)) {
         if (Object.hasOwn(coreModules, specifier) || specifier === DEFINITION_SPECIFIER) {
           throw new Error(
@@ -117,17 +117,17 @@ export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWo
           )
         }
       }
-      const runner = await host.hydrate({
+      const runner = await host.prepare({
         modules: { ...coreModules, [DEFINITION_SPECIFIER]: { shim: workflow }, ...plugins },
         ...(limits === undefined ? {} : { limits }),
       })
       return {
-        execute: ({ input, cache, handlers, limits: runLimits }) => {
+        execute: ({ input, cache, globals, limits: runLimits }) => {
           const code = `import workflow from '${DEFINITION_SPECIFIER}'\nexport default await workflow(${JSON.stringify(input) ?? 'undefined'})`
           return runner.execute({
             code,
             cache,
-            ...(handlers === undefined ? {} : { handlers }),
+            ...(globals === undefined ? {} : { globals }),
             ...(runLimits === undefined ? {} : { limits: runLimits }),
           })
         },

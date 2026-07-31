@@ -139,14 +139,14 @@ export interface DurableWorkflowsEngine {
   get: (instanceId: string) => Promise<WorkflowInstanceHandle | null>
   /**
    * THE single continuation entry point — called by the application's own
-   * trigger wiring (its cron, its timer service, its webhook handlers). The
+   * trigger wiring (its cron, its timer service, its webhook globals). The
    * engine never wakes anything itself.
    *
    * Plain re-execution: a fresh replay passes through the cache and
-   * re-dispatches every still-waiting operation's handler, which consults host
+   * re-dispatches every still-waiting operation's global, which consults host
    * state (the plugin's own backend, the clock, an approval row) and proceeds,
    * throws, or suspends again. There is no delivery argument and no token — a
-   * resolved value reaches the workflow because the handler now RETURNS it on
+   * resolved value reaches the workflow because the global now RETURNS it on
    * re-dispatch, not because anything is injected into the cache. If nothing is
    * due the run just suspends again (a harmless no-op). Returns the outcome.
    */
@@ -213,8 +213,8 @@ interface RunOutcomeBase {
  * A durable operation that suspended this run, surfaced so the caller's own
  * wiring can react (register a timer, POST a job, create an approval ticket)
  * and later resume with a plain `continueWorkflow`. `stepId` is the boundary
- * key, `operation` the plugin operation name, `payload` whatever the handler
- * passed to `SuspendIsolate`. Usually the handler already did the outward work
+ * key, `operation` the plugin operation name, `payload` whatever the global
+ * passed to `SuspendIsolate`. Usually the global already did the outward work
  * before suspending, so this is mostly informational; the bare escape-hatch
  * plugins (raw events) are where the caller genuinely acts on it.
  */
@@ -295,17 +295,17 @@ export type InstanceStatus = InstanceRecord['status']
  * instances go to a new engine — routing and drain are application scope.
  *
  * Plugins repeat the core's adapter pattern one level down, in one of two
- * packaging shapes (both this same `{ id, shim, handlers }` object):
- *   - the plugin ships the SHIM and the handler LOGIC and takes its deployment
+ * packaging shapes (both this same `{ id, shim, globals }` object):
+ *   - the plugin ships the SHIM and the global LOGIC and takes its deployment
  *     backend as a factory parameter (a well-defined external service: the
  *     agents plugin takes an agent-service client, a fetch plugin the iso4
- *     fetch handler);
- *   - the plugin ships only the SHIM and the dev supplies the handler, because
+ *     fetch global);
+ *   - the plugin ships only the SHIM and the dev supplies the global, because
  *     the mechanism is irreducibly their infra (the `time`/sleep plugin: where
  *     and how a wake-up is registered — cron row, Postgres NOTIFY, setTimeout
- *     — and what fires it are the dev's, so the handler is theirs, guided by
+ *     — and what fires it are the dev's, so the global is theirs, guided by
  *     jsdoc).
- * Either way the dev wires the backend (or the handler) to their infra exactly
+ * Either way the dev wires the backend (or the global) to their infra exactly
  * like they wire the core's store to their database.
  */
 export interface DurableWorkflowsPlugin {
@@ -319,34 +319,34 @@ export interface DurableWorkflowsPlugin {
    * semver'd shim-facing module, itself a thin wrapper over the kernel's
    * `durable-isolates:internal` that enforces the leaf rule and namespaces
    * step ids into boundary keys. A durable-operation call forms an auto step
-   * id (the boundary key) and routes to this plugin's handlers by name. No
-   * token machinery exists: an operation that must wait suspends by its handler
-   * throwing `SuspendIsolate`, and resume is plain re-execution — the handler
+   * id (the boundary key) and routes to this plugin's globals by name. No
+   * token machinery exists: an operation that must wait suspends by its global
+   * throwing `SuspendIsolate`, and resume is plain re-execution — the global
    * consults host state to proceed. `internal` is for shims only:
    * registration-time import scanning rejects workflow bundles that import it.
    */
   shim: string
   /**
-   * Host-side handlers keyed by operation `name`. The plugin's factory closes
-   * over its backend (and any auth provider); a handler provisions credentials
+   * Host-side globals keyed by operation `name`. The plugin's factory closes
+   * over its backend (and any auth provider); a global provisions credentials
    * itself per call via that provider (`auth(instanceId)`), so every resume
    * runs against freshly provisioned secrets that never enter the sandbox.
    */
-  handlers: Readonly<Record<string, DurableHandler>>
+  globals: Readonly<Record<string, DurableGlobal>>
 }
 
 /**
- * A host-side handler for one durable operation `name`. Invoked when its
+ * A host-side global for one durable operation `name`. Invoked when its
  * boundary is not already settled in the cache — a cache hit never re-dispatches
- * it. A `waiting` boundary IS re-dispatched (the resume path): the handler
+ * it. A `waiting` boundary IS re-dispatched (the resume path): the global
  * consults host state and either returns a value (→ completed boundary), throws
  * `SuspendIsolate` (→ still waiting), or throws anything else (→ failed
  * boundary, re-thrown deterministically on replay). It receives ONE structured
  * input: the sandbox `payload` kept strictly separate from engine metadata.
  */
-export type DurableHandler = (input: DurableHandlerInput) => unknown
+export type DurableGlobal = (input: DurableGlobalInput) => unknown
 
-export interface DurableHandlerInput {
+export interface DurableGlobalInput {
   instanceId: string
   workflow: string
   /**
@@ -389,7 +389,7 @@ export type ErrorClass = 'permanent' | 'transient'
 /**
  * How a failure is surfaced (`RunOutcome` failed, `FailedInstanceRecord`). This
  * layer's shape is the kernel's recorded error — the plain
- * `{ name, message, ...ownFields }` a thrown handler error becomes crossing the
+ * `{ name, message, ...ownFields }` a thrown global error becomes crossing the
  * iso4 bridge — lifted into a named shape. `data` carries the thrown error's
  * own fields verbatim; it is re-thrown into the sandbox on replay, so
  * catch-branches see it identically. `class` is an optional verdict a plugin
@@ -437,7 +437,7 @@ interface InstanceRecordBase {
   input?: unknown
   /**
    * Monotonic run counter — incremented per continuation; feeds
-   * `DurableHandlerInput.run`, `RunOutcome.run` and `InstanceOutcome.runs`.
+   * `DurableGlobalInput.run`, `RunOutcome.run` and `InstanceOutcome.runs`.
    */
   runs: number
   createdAt: string

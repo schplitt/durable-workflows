@@ -37,16 +37,16 @@ export const WORKFLOW_SPECIFIER = 'durable-workflows:workflow'
  *
  * `operation(name, ...args)` — a durable OPERATION call: forms an auto step id
  * with the kernel's `nextKey` (`name#0`, `name#1`, … within the current scope)
- * and routes to the host handler `name`. It forwards the step id FIRST, then the
- * caller's `args` — the kernel hands a handler only what the shim forwards and
+ * and routes to the host global `name`. It forwards the step id FIRST, then the
+ * caller's `args` — the kernel hands a global only what the shim forwards and
  * never the boundary key, so carrying it in the args is how the engine recovers
- * `stepId` when it builds the handler's `{ instanceId, workflow, run, stepId,
+ * `stepId` when it builds the global's `{ instanceId, workflow, run, stepId,
  * payload }` input (it strips this leading id and passes the rest as `payload`).
  * This is what plugin shims build their capability on (e.g. `export const sleep =
  * ms => operation('sleep', ms)`).
  *
  * `boundary(id, fn)` — the nestable BOUNDARY: `fn` runs in-sandbox, its return
- * value is committed, and `id` is prepended as the ambient prefix so inner
+ * value is committed, and `id` is prepended as the ambient scope so inner
  * boundary/operation keys concatenate under it. A hit skips `fn` wholesale. This
  * is what `step.do` maps onto — the step id IS the boundary key (used verbatim,
  * so duplicate ids at one level collide: the documented determinism contract).
@@ -100,7 +100,7 @@ export function defineWorkflow(definition) {
  * The core author-facing modules, keyed by their canonical specifier — the
  * single source of truth for what the engine mounts into every prefix. The
  * engine spreads this together with the user's plugins (and any `alias`
- * remounts) when it calls the kernel's `hydrate`; workflow authors never mount
+ * remounts) when it calls the kernel's `prepare`; workflow authors never mount
  * them, and the kernel does not inject them (it only injects its OWN
  * `durable-isolates:internal`). Exposing the bundle keeps the engine and tests
  * from drifting from these definitions.

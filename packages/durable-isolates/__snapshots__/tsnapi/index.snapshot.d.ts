@@ -11,7 +11,7 @@ export interface CompletedResult extends ExecuteResultBase {
   result: unknown;
 }
 export interface DurableIsolates {
-  hydrate: (_: HydrateOptions) => Promise<DurableIsolatesRunner>;
+  prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
   dispose: () => Promise<void>;
 }
 export interface DurableIsolatesOptions {
@@ -28,7 +28,7 @@ export interface ExecuteHandle {
 export interface ExecuteOptions {
   code: string;
   cache: BoundaryCache;
-  handlers?: PerExecuteHandlers;
+  globals?: PerExecuteGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface FailedBoundary extends BoundaryRecordBase {
@@ -39,18 +39,18 @@ export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
   error: unknown;
 }
-export interface HydrateOptions {
-  modules: Readonly<Record<string, ModuleDefinition>>;
-  limits?: Partial<ResourceLimits>;
-}
 export interface ModuleDefinition {
   shim: string;
-  handlers?: HandlerMap;
+  globals?: GlobalMap;
 }
 export interface PendingOperation {
   id: string;
   name: string;
   payload: unknown;
+}
+export interface PrepareOptions {
+  modules: Readonly<Record<string, ModuleDefinition>>;
+  limits?: Partial<ResourceLimits>;
 }
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";
@@ -67,9 +67,9 @@ export type BoundaryCache = Record<string, BoundaryRecord>;
 export type BoundaryRecord = CompletedBoundary | FailedBoundary | WaitingBoundary;
 export type CreateDurableIsolates = (_?: DurableIsolatesOptions) => DurableIsolates;
 export type ExecuteResult = CompletedResult | SuspendedResult | FailedResult;
-export type HandlerMap = Readonly<Record<string, HostHandler>>;
-export type HostHandler = (..._: unknown[]) => unknown;
-export type PerExecuteHandlers = Readonly<Record<string, HostHandler>>;
+export type GlobalMap = Readonly<Record<string, HostGlobal>>;
+export type HostGlobal = (..._: unknown[]) => unknown;
+export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
 // #endregion
 
 // #region Classes

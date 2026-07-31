@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'vitest'
 import { SuspendIsolate } from 'durable-isolates'
 import type {
-  DurableHandlerInput,
+  DurableGlobalInput,
   DurableWorkflowsEngine,
   DurableWorkflowsPlugin,
 } from '../src'
@@ -11,7 +11,7 @@ import { durableWorkflows, INTERNAL_SPECIFIER, memoryStore, WORKFLOW_SPECIFIER }
 // its `deploy` helper — the test's stand-in for the app's deploy layer), and
 // plugin shims built on `durable-workflows:internal` mounted on a REAL sandbox.
 // Every assertion drives the whole chain
-// (engine → :workflow → :internal → durable-isolates:internal → host → handler).
+// (engine → :workflow → :internal → durable-isolates:internal → host → global).
 
 const APPROVALS_SPECIFIER = 'test:approvals'
 const APPROVALS_SHIM = /* js */ `
@@ -20,7 +20,7 @@ const APPROVALS_SHIM = /* js */ `
   export const tick = () => operation('tick')
 `
 
-// A test harness bundling engine + the store + captured handler inputs, so each
+// A test harness bundling engine + the store + captured global inputs, so each
 // test can compose exactly what it needs and dispose cleanly. The store's
 // `getDefinition` is instrumented to record every call, so tests can assert
 // version pinning.
@@ -32,13 +32,13 @@ function harness(pluginOverrides?: Partial<DurableWorkflowsPlugin>) {
     resolveCalls.push(version === undefined ? { name } : { name, version })
     return rawGetDefinition(name, version)
   }
-  const seen: DurableHandlerInput[] = []
+  const seen: DurableGlobalInput[] = []
   let approvalAnswer: string | undefined
 
   const approvals: DurableWorkflowsPlugin = {
     id: 'approvals',
     shim: APPROVALS_SHIM,
-    handlers: {
+    globals: {
       approve: (input) => {
         seen.push(input)
         if (approvalAnswer === undefined)
@@ -120,8 +120,8 @@ describe('create', () => {
   }, 20_000)
 })
 
-describe('handler input', () => {
-  test('handler receives { instanceId, workflow, run, stepId, payload } with payload = full arg list', async () => {
+describe('global input', () => {
+  test('global receives { instanceId, workflow, run, stepId, payload } with payload = full arg list', async () => {
     const h = harness()
     active = h
     h.setAnswer('yes')

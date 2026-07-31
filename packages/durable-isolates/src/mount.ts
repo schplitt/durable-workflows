@@ -1,5 +1,5 @@
 import type { HostGlobals, Imports } from '@iso4/sandbox'
-import type { HostHandler, ModuleDefinition } from './types'
+import type { HostGlobal, ModuleDefinition } from './types'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER } from './shim'
 
 /**
@@ -44,28 +44,28 @@ export function precompileGlobals(): HostGlobals {
 }
 
 /**
- * Flatten the modules' default handlers into one `name → handler` registry,
+ * Flatten the modules' default globals into one `name → global` registry,
  * erroring on a cross-module name collision (routing is flat by operation name).
  * @param modules the mounted module definitions
  */
-export function resolveDefaultHandlers(
+export function resolveDefaultGlobals(
   modules: Readonly<Record<string, ModuleDefinition>>,
-): Map<string, HostHandler> {
-  const index = new Map<string, HostHandler>()
+): Map<string, HostGlobal> {
+  const index = new Map<string, HostGlobal>()
   const owner = new Map<string, string>()
   for (const [specifier, def] of Object.entries(modules)) {
-    if (def.handlers === undefined)
+    if (def.globals === undefined)
       continue
-    for (const [name, handler] of Object.entries(def.handlers)) {
+    for (const [name, global] of Object.entries(def.globals)) {
       const clash = owner.get(name)
       if (clash !== undefined) {
         throw new Error(
-          `durable-isolates: duplicate handler "${name}" mounted by both "${clash}" and "${specifier}" `
+          `durable-isolates: duplicate global "${name}" mounted by both "${clash}" and "${specifier}" `
           + '(routing is flat by operation name; names must be unique across modules)',
         )
       }
       owner.set(name, specifier)
-      index.set(name, handler)
+      index.set(name, global)
     }
   }
   return index

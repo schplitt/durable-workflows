@@ -12,7 +12,7 @@ export interface CreateOptions {
   instanceId?: string;
   version?: string;
 }
-export interface DurableHandlerInput {
+export interface DurableGlobalInput {
   instanceId: string;
   workflow: string;
   run: number;
@@ -20,7 +20,7 @@ export interface DurableHandlerInput {
   payload: unknown;
 }
 export interface DurableWorkflowHost {
-  hydrate: (_: WorkflowHydrateOptions) => Promise<WorkflowRunner>;
+  prepare: (_: WorkflowPrepareOptions) => Promise<WorkflowRunner>;
   dispose: () => Promise<void>;
 }
 export interface DurableWorkflowsEngine {
@@ -44,7 +44,7 @@ export interface DurableWorkflowsOptions {
 export interface DurableWorkflowsPlugin {
   id: string;
   shim: string;
-  handlers: Readonly<Record<string, DurableHandler>>;
+  globals: Readonly<Record<string, DurableGlobal>>;
 }
 export interface FailedInstanceRecord extends InstanceRecordBase {
   status: "failed";
@@ -76,18 +76,18 @@ export interface TerminatedInstanceRecord extends InstanceRecordBase {
 export interface WorkflowExecuteOptions {
   input?: unknown;
   cache: BoundaryCache;
-  handlers?: PerExecuteHandlers;
-  limits?: Partial<ResourceLimits>;
-}
-export interface WorkflowHydrateOptions {
-  workflow: string;
-  plugins?: Readonly<Record<string, ModuleDefinition>>;
+  globals?: PerExecuteGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowInstanceHandle {
   readonly id: string;
   status: () => Promise<InstanceStatus>;
   outcome: () => Promise<InstanceOutcome | null>;
+}
+export interface WorkflowPrepareOptions {
+  workflow: string;
+  plugins?: Readonly<Record<string, ModuleDefinition>>;
+  limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowRunner {
   execute: (_: WorkflowExecuteOptions) => ExecuteHandle;
@@ -106,7 +106,7 @@ export interface WorkflowStore {
 
 // #region Types
 export type DefineWorkflowsPlugin = <TPlugin extends DurableWorkflowsPlugin>(_: TPlugin) => TPlugin;
-export type DurableHandler = (_: DurableHandlerInput) => unknown;
+export type DurableGlobal = (_: DurableGlobalInput) => unknown;
 export type DurableWorkflows = (_: DurableWorkflowsOptions) => DurableWorkflowsEngine;
 export type EngineEvent = {
   type: "instance";

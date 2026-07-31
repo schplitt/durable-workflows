@@ -4,9 +4,9 @@ import type {
   BoundaryRecord,
   ExecuteHandle,
   ExecuteResult,
-  HostHandler,
+  HostGlobal,
   PendingOperation,
-  PerExecuteHandlers,
+  PerExecuteGlobals,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL } from './shim'
@@ -27,7 +27,7 @@ function never(): Promise<never> {
 }
 
 /**
- * Sentinel resolved (never thrown) by a dispatch whose handler suspended, so
+ * Sentinel resolved (never thrown) by a dispatch whose global suspended, so
  * the in-flight dispatch promise always settles and the drain can await it.
  */
 const SUSPENDED = Symbol('durable-isolates.suspended')
@@ -41,11 +41,11 @@ type CallEnvelope
 
 export interface ExecuteRunParams {
   prefix: Prefix<HostGlobals, Record<string, never>>
-  defaults: Map<string, HostHandler>
-  hydrateLimits: Partial<ResourceLimits> | undefined
+  defaults: Map<string, HostGlobal>
+  prepareLimits: Partial<ResourceLimits> | undefined
   code: string
   cache: BoundaryCache
-  handlers: PerExecuteHandlers | undefined
+  globals: PerExecuteGlobals | undefined
   executeLimits: Partial<ResourceLimits> | undefined
 }
 
@@ -54,27 +54,27 @@ export interface ExecuteRunParams {
  * back the three primitives:
  *
  * - `__di_call(key, name, args)` — answers the boundary at `key` from the cache
- *   or dispatches the `name` handler, recording the result. A handler throwing
+ *   or dispatches the `name` global, recording the result. A global throwing
  *   `SuspendIsolate` writes a waiting record and aborts. A `waiting` record is
  *   NOT terminal on replay — it re-dispatches (that is the one resume path), so
- *   the handler (consulting host state) can proceed, suspend again, or throw.
+ *   the global (consulting host state) can proceed, suspend again, or throw.
  * - `__di_lookup(key)` — non-memoized read of the live cache (checkpoint check).
  * - `__di_commit(key, value)` — record a completed boundary from the sandbox.
  *
- * Every in-flight handler dispatch is tracked and DRAINED before the result is
+ * Every in-flight global dispatch is tracked and DRAINED before the result is
  * built (on every outcome): a dispatch racing an abort or the run's completion
  * still lands in the cache, while its resolution into a dead isolate is a
  * harmless no-op. `handle.suspend()` aborts the isolate and resolves after the
  * drain — the external-teardown path.
- * @param params the prefix, default handlers, code, cache, per-run handlers and limits
+ * @param params the prefix, default globals, code, cache, per-run globals and limits
  */
 export function executeRun(params: ExecuteRunParams): ExecuteHandle {
-  const { prefix, defaults, hydrateLimits, code, handlers, executeLimits } = params
+  const { prefix, defaults, prepareLimits, code, globals, executeLimits } = params
 
   const registry = new Map(defaults)
-  if (handlers !== undefined) {
-    for (const [name, handler] of Object.entries(handlers))
-      registry.set(name, handler)
+  if (globals !== undefined) {
+    for (const [name, global] of Object.entries(globals))
+      registry.set(name, global)
   }
 
   const cache: BoundaryCache = { ...params.cache }
@@ -88,19 +88,19 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       seqNext = r.seq + 1
   }
 
-  // Run one handler and record the boundary. Always SETTLES (suspension
+  // Run one global and record the boundary. Always SETTLES (suspension
   // resolves the sentinel) so the drain can await every dispatch.
   const dispatch = async (key: string, name: string, args: unknown[], seq: number): Promise<CallEnvelope | typeof SUSPENDED> => {
-    const handler = registry.get(name)
-    if (handler === undefined) {
+    const global = registry.get(name)
+    if (global === undefined) {
       // Plain, persistable record (see the catch below); iso4 rebuilds it as an
       // Error in the sandbox when the bridge re-throws it.
-      const error = { name: 'Error', message: `durable-isolates: no handler for "${name}"` }
+      const error = { name: 'Error', message: `durable-isolates: no global for "${name}"` }
       cache[key] = { seq, status: 'failed', error }
       return { ok: false, error }
     }
     try {
-      const value = await handler(...args)
+      const value = await global(...args)
       cache[key] = { seq, status: 'completed', value }
       return { ok: true, value }
     } catch (e) {
@@ -136,7 +136,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   }
 
   // `__di_call` — answer the boundary at `key` from the cache or dispatch its
-  // handler. Resolves with the boundary's value on success and REJECTS with the
+  // global. Resolves with the boundary's value on success and REJECTS with the
   // recorded error on failure: iso4 (>=0.2.2) delivers a rejecting bridge to the
   // sandbox `catch` faithfully (rebuilt as a real Error with name/message/fields),
   // so no envelope unwrapping or error reconstruction is needed sandbox-side.
@@ -166,10 +166,10 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     throw settled.error
   }
 
-  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...hydrateLimits, ...executeLimits }
+  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...prepareLimits, ...executeLimits }
 
   const result = (async (): Promise<ExecuteResult> => {
-    const result = await prefix.run({
+    const result = await prefix.execute({
       code,
       globals: {
         [DURABLE_CALL_GLOBAL]: callBridge,

@@ -17,7 +17,7 @@ pnpm add durable-isolates
 ## Features
 
 - **Durable by key.** A completed operation is answered from the cache and never runs twice. A fresh one runs for real.
-- **Pause and continue.** A host handler can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
+- **Pause and continue.** A host global can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
 - **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
 
@@ -29,7 +29,7 @@ pnpm add durable-isolates
 import { durableIsolates } from 'durable-isolates'
 
 const di = durableIsolates()
-const runner = await di.hydrate({
+const runner = await di.prepare({
   modules: {
     reports: {
       shim: `
@@ -44,7 +44,7 @@ let cache = {}
 const r = await runner.execute({
   code: `import { load } from 'reports'; export default await load('r-1')`,
   cache,
-  handlers: { load: (id) => db.reports.get(id) },
+  globals: { load: (id) => db.reports.get(id) },
 }).result
 
 if (r.outcome === 'completed')

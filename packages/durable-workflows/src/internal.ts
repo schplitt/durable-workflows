@@ -21,25 +21,25 @@
  * A durable OPERATION call — the primitive every waiting/host-backed capability
  * is built on. Forms an auto step id (the boundary key) from `name` via the
  * kernel's ambient `nextKey` (`name#0`, `name#1`, … per scope) and routes to the
- * host handler registered under `name`. Over the wire it forwards the step id
- * first, then `args` (the kernel never passes a handler its boundary key, so the
+ * host global registered under `name`. Over the wire it forwards the step id
+ * first, then `args` (the kernel never passes a global its boundary key, so the
  * engine recovers `stepId` from this leading id and treats the rest as
  * `payload`). Resolves with the
- * boundary's value, rejects with a recorded/handler error, and never settles
- * when the handler suspends (the run is aborted). Answered from the cache on
- * replay — the handler runs at most once per boundary until re-dispatch.
+ * boundary's value, rejects with a recorded/global error, and never settles
+ * when the global suspends (the run is aborted). Answered from the cache on
+ * replay — the global runs at most once per boundary until re-dispatch.
  */
 export type Operation = (name: string, ...args: unknown[]) => Promise<unknown>
 
 /**
  * The nestable BOUNDARY — the primitive `step.do` maps onto. On a cache hit the
  * value is returned WITHOUT running `fn`; on a miss `fn` runs in-sandbox, its
- * result is committed, and `id` is prepended as the ambient prefix while `fn`
+ * result is committed, and `id` is prepended as the ambient scope while `fn`
  * runs so inner boundary/operation keys concatenate under it (`id/inner#0`).
  * `id` is used verbatim as the boundary key: two boundaries with the same `id`
  * at the same level collide onto one record — the documented determinism
  * contract, not an enforced guard. Bodies must run sequentially (the ambient
- * prefix is not async-context-safe until iso4#23 lands).
+ * scope is not async-context-safe until iso4#23 lands).
  */
 export type Boundary = <T>(id: string, fn: () => T | Promise<T>) => Promise<T>
 

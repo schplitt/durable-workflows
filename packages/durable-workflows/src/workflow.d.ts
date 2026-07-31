@@ -45,7 +45,7 @@ declare module 'durable-workflows:workflow' {
    * `do` is also the scope: calling `step.do` inside a `step.do` body nests, and
    * the inner ids concatenate under the outer one. There is no separate scope or
    * substep API. Nested bodies run correctly whether sequential OR parallel
-   * (`Promise.all`) — the ambient key prefix is carried through async context.
+   * (`Promise.all`) — the ambient key scope is carried through async context.
    * A body that mixes raw side effects with nested durable calls re-runs until
    * those calls complete: the documented determinism contract, not a guard.
    */

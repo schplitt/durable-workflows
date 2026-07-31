@@ -35,7 +35,7 @@ export const DURABLE_COMMIT_GLOBAL = '__di_commit'
  *
  * `durableCall(key, name, ...args)` — the host-backed durable primitive. The
  * host answers the boundary keyed by `key` from the cache, or forwards ALL
- * `args` to the mounted handler `name`. The bridge resolves with the boundary's
+ * `args` to the mounted global `name`. The bridge resolves with the boundary's
  * value on success and REJECTS with the recorded error on failure.
  * On suspension the host aborts the run, so the returned promise never settles.
  *
@@ -43,15 +43,15 @@ export const DURABLE_COMMIT_GLOBAL = '__di_commit'
  * `durableCommit(key, value)` — record a completed boundary from the sandbox.
  * `boundary(key, fn)` — checkpoint sugar: hit → cached value without running
  * `fn`; miss → run `fn`, commit, return. Nestable: `key` joins the ambient
- * prefix while `fn` runs, so inner keys concatenate with `/`. The prefix is
+ * scope while `fn` runs, so inner keys concatenate with `/`. The scope is
  * carried through iso4's `AsyncLocalStorage` (0.3.0+), so it survives `await`
  * and stays isolated per branch under `Promise.all` — nested boundaries may run
  * sequentially OR in parallel and still key deterministically. Bodies containing
  * further durable work re-run on every replay until committed.
- * `nextKey(name)` — ambient auto-key former for shims: current prefix + name +
- * a per-scope-per-name counter. The prefix comes from the async-context store;
+ * `nextKey(name)` — ambient auto-key former for shims: current scope + name +
+ * a per-scope-per-name counter. The scope comes from the async-context store;
  * the counter is plain module state keyed by the full scoped path (distinct per
- * prefix, so parallel scopes never share one) and resets every replay.
+ * scope, so parallel scopes never share one) and resets every replay.
  *
  * `AsyncLocalStorage` is imported from `node:async_hooks` — available to run
  * (postfix) code, which is where these functions execute; constructing the
@@ -61,9 +61,9 @@ export const DURABLE_COMMIT_GLOBAL = '__di_commit'
 export const internalShim: string = /* js */ `
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-const __di_scope = new AsyncLocalStorage();
+const __di_als = new AsyncLocalStorage();
 const __di_counters = Object.create(null);
-const __di_prefix = () => __di_scope.getStore() ?? [];
+const __di_scope = () => __di_als.getStore() ?? [];
 
 export async function durableCall(key, name, ...args) {
   return await globalThis.${DURABLE_CALL_GLOBAL}(String(key), String(name), args);
@@ -78,17 +78,17 @@ export async function durableCommit(key, value) {
 }
 
 export function nextKey(name) {
-  const scoped = [...__di_prefix(), String(name)].join('/');
+  const scoped = [...__di_scope(), String(name)].join('/');
   const n = __di_counters[scoped] = (__di_counters[scoped] || 0) + 1;
   return scoped + '#' + (n - 1);
 }
 
 export async function boundary(key, fn) {
-  const parent = __di_prefix();
+  const parent = __di_scope();
   const full = [...parent, String(key)].join('/');
   const r = await durableLookup(full);
   if (r && r.hit) return r.value;
-  return await __di_scope.run([...parent, String(key)], async () => {
+  return await __di_als.run([...parent, String(key)], async () => {
     const value = await fn();
     await durableCommit(full, value);
     return value;
