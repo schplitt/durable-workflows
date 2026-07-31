@@ -24,7 +24,7 @@ catalog:
   eslint: ^10.8.0
   tsdown: ^0.22.14
   tsnapi: ^1.2.0
-  typescript: ^7.0.2
+  typescript: ^6.0.3
   vitest: ^4.1.10
 
 onlyBuiltDependencies:
