@@ -4,7 +4,7 @@ The replay kernel behind [`durable-workflows`](../durable-workflows), built on [
 
 Run a program in a sandbox and make chosen operations durable. Their results live in a cache you persist, so a run can pause, survive a restart, and continue later. Resume is always the same move: run it again with the cache you saved.
 
-> Node >= 26, ESM only.
+> Node >= 24, ESM only.
 
 ## Install
 
