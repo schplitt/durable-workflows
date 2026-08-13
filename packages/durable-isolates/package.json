@@ -1,6 +1,6 @@
 {
   "name": "durable-isolates",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "The replay kernel for durable-workflows: durably execute one isolate program over a log, built on top of iso4",
   "keywords": [
