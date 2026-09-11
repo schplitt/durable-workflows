@@ -33,13 +33,15 @@ export function toPrepareImports(modules: Readonly<Record<string, ModuleDefiniti
 
 /**
  * The three bridge globals declared at prepare (each rebound per run):
- * one per durable primitive — call, lookup, commit.
+ * one per durable primitive — call, lookup, commit. Declared non-enumerable
+ * so enumeration-driven sandbox code (`Object.keys(globalThis)`, spreads)
+ * never sweeps them up — the shim reaches them by name.
  */
 export function prepareGlobals(): HostGlobals {
   return {
-    [DURABLE_CALL_GLOBAL]: unbound,
-    [DURABLE_LOOKUP_GLOBAL]: unbound,
-    [DURABLE_COMMIT_GLOBAL]: unbound,
+    [DURABLE_CALL_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
+    [DURABLE_LOOKUP_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
+    [DURABLE_COMMIT_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
   }
 }
 
