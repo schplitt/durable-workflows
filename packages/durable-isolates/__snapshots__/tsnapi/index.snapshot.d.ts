@@ -82,3 +82,12 @@ export declare class SuspendIsolate extends Error {
 // #region Variables
 export declare const durableIsolates: CreateDurableIsolates;
 // #endregion
+
+// #region Referenced (internal)
+interface BoundaryRecordBase {
+  seq: number;
+}
+interface ExecuteResultBase {
+  cache: BoundaryCache;
+}
+// #endregion

@@ -159,3 +159,27 @@ export declare function memoryStore(): MemoryWorkflowStore;
 export declare const INTERNAL_SPECIFIER: string;
 export declare const WORKFLOW_SPECIFIER: string;
 // #endregion
+
+// #region Referenced (internal)
+interface InstanceOutcomeBase {
+  instanceId: string;
+  workflow: string;
+  version: string;
+  runs: number;
+  createdAt: string;
+  finishedAt: string;
+}
+interface InstanceRecordBase {
+  instanceId: string;
+  workflow: string;
+  version: string;
+  input?: unknown;
+  runs: number;
+  createdAt: string;
+  updatedAt: string;
+}
+interface RunOutcomeBase {
+  instanceId: string;
+  run: number;
+}
+// #endregion
