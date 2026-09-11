@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -20,15 +20,15 @@ jobs:
       id-token: write # required for npm OIDC trusted publishing
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 26
 
@@ -39,7 +39,7 @@ jobs:
         run: pnpm -r --filter="./packages/*" build
 
       - name: Create Version PR or publish
-        uses: changesets/action@v1
+        uses: changesets/action@v2.1.2
         with:
           version: pnpm exec changeset version
           publish: pnpm exec changeset publish

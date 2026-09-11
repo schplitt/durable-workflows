@@ -20,7 +20,7 @@ let host: DurableIsolates
 let runner: DurableIsolatesRunner
 
 beforeAll(async () => {
-  host = durableIsolates({ sandbox: { maxIsolates: 4 } })
+  host = durableIsolates()
   runner = await host.prepare({ modules: { tools: { shim: SHIM } } })
 }, 30_000)
 
