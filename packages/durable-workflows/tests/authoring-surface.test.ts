@@ -21,7 +21,7 @@ const TOOLS_SHIM = /* js */ `
 let host: DurableWorkflowHost
 
 beforeAll(() => {
-  host = durableWorkflowHost({ sandbox: { maxIsolates: 4 } })
+  host = durableWorkflowHost()
 })
 
 afterAll(async () => {

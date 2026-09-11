@@ -58,7 +58,6 @@ function harness(pluginOverrides?: Partial<DurableWorkflowsPlugin>) {
     const engine = durableWorkflows({
       store,
       plugins: { [APPROVALS_SPECIFIER]: approvals },
-      sandbox: { maxIsolates: 4 },
       ...extra,
     })
     engines.push(engine)
