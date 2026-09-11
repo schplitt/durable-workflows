@@ -5,11 +5,11 @@ import type {
   DurableIsolates,
   DurableIsolatesRunner,
 } from './types'
-import { precompileGlobals, resolveDefaultGlobals, toPrecompileImports } from './mount'
+import { prepareGlobals, resolveDefaultGlobals, toPrepareImports } from './mount'
 import { executeRun } from './execute'
 
 /**
- * Bind one iso4 sandbox (the Rust core + isolate pool). The sandbox is created
+ * Bind one iso4 sandbox (the Rust core). The sandbox is created
  * lazily on the first `prepare` and reused for every prefix; `dispose()` tears
  * it — and all its prefixes — down. See {@link CreateDurableIsolates}.
  * @param options the sandbox options for the one iso4 bind
@@ -30,8 +30,8 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
       const sandbox = await getSandbox()
       const prefix: Prefix<HostGlobals, Record<string, never>> = await sandbox.prepare({
         code: '',
-        globals: precompileGlobals(),
-        imports: toPrecompileImports(modules),
+        globals: prepareGlobals(),
+        imports: toPrepareImports(modules),
       })
 
       const runner: DurableIsolatesRunner = {

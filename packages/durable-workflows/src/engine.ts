@@ -38,13 +38,6 @@ import { randomUUID } from 'node:crypto'
 import { durableWorkflowHost } from './host'
 
 /**
- * Engine sandbox defaults (differing from iso4's own) — see
- * {@link DurableWorkflowsOptions.sandbox}. Replay runs are mostly I/O-idle, so
- * far more concurrent runs than cores is fine.
- */
-const DEFAULT_SANDBOX = { maxIsolates: 45 }
-
-/**
  * Engine per-run limit defaults (differing from iso4's and the kernel's) — see
  * {@link DurableWorkflowsOptions.limits}. Merged UNDER `options.limits` and a
  * definition's own `limits`, so explicit settings always win.
@@ -109,7 +102,7 @@ function outcomeOf(record: InstanceRecord): InstanceOutcome | null {
 export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkflowsEngine {
   const { store, plugins = {}, alias = {}, limits, onEvent } = options
 
-  const host = durableWorkflowHost({ sandbox: { ...DEFAULT_SANDBOX, ...options.sandbox } })
+  const host = durableWorkflowHost({ sandbox: { ...options.sandbox } })
 
   // Mount modules built ONCE for the engine's lifetime: each plugin's in-sandbox
   // shim, plus a tiny re-export module per `alias` remapping a core specifier.

@@ -12,7 +12,7 @@ Run a program in a sandbox and make chosen operations durable. Their results liv
 pnpm add durable-isolates
 ```
 
-`@iso4/sandbox` is a peer you provide. `@iso4/fetch` is optional, for a durable HTTP capability.
+`@iso4/sandbox` is included as a regular dependency. `@iso4/fetch` is optional, for a durable HTTP capability.
 
 ## Features
 
