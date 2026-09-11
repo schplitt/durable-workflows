@@ -780,4 +780,13 @@ describe('mount guards', () => {
       host.prepare({ modules: { 'durable-isolates:internal': { shim: 'export const x = 1' } } }),
     ).rejects.toThrow(/reserved module specifier/)
   })
+
+  test('the bridge globals are non-enumerable — a globalThis sweep never sees them', async () => {
+    const code = `export default Object.keys(globalThis).filter(k => k.startsWith('__di_'))`
+    const r = await runner.execute({ code, cache: {} }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual([])
+  }, 15_000)
 })
