@@ -1,5 +1,12 @@
 # durable-isolates
 
+## 0.1.3
+
+### Patch Changes
+
+- e5ae914: fix: declare the `__di_call`/`__di_lookup`/`__di_commit` bridge globals non-enumerable — enumeration-driven sandbox code (`Object.keys(globalThis)`, spreads) no longer sweeps them up. Hygiene only: the kernel shim still reaches them by name, and per-run rebinding is unchanged.
+- 1c21c3b: chore: update to `@iso4/sandbox` 0.5 — `maxIsolates` is gone (`maxConcurrentRuns`/`memoryBudgetMb` govern concurrency and residency now), and docs/comments are aligned with the new iso4 surface
+
 ## 0.1.2
 
 ### Patch Changes
