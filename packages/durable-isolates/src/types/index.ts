@@ -21,31 +21,32 @@
 import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Host — owns the one iso4 sandbox (Rust bind + isolate pool)
+// Host — owns the one iso4 sandbox (the Rust bind)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Bind ONE iso4 sandbox — a single connection to the Rust core holding the
- * `maxIsolates` pool that budgets every concurrent run across every prefix
- * prepared on it. Created lazily on the first `prepare`, reused thereafter;
- * `dispose()` tears it (and all its prefixes) down.
+ * Bind ONE iso4 sandbox — a single connection to the Rust core whose
+ * `maxConcurrentRuns` admission cap and memory budget govern every run across
+ * every prefix prepared on it. Created lazily on the first `prepare`, reused
+ * thereafter; `dispose()` tears it (and all its prefixes) down.
  */
 export type CreateDurableIsolates = (options?: DurableIsolatesOptions) => DurableIsolates
 
 export interface DurableIsolatesOptions {
   /**
-   * iso4 sandbox options — the one Rust bind and its `maxIsolates` pool.
-   * Resource LIMITS are not set here: they are per-run execution caps,
-   * configured on `prepare` (default) and `execute` (override).
+   * iso4 sandbox options — the one Rust bind: `maxConcurrentRuns`,
+   * `memoryBudgetMb`, per-isolate `memoryMb`. Resource LIMITS are not set
+   * here: they are per-run execution caps, configured on `prepare` (default)
+   * and `execute` (override).
    */
   sandbox?: SandboxOptions
 }
 
 export interface DurableIsolates {
   /**
-   * Prepare a prefix from a set of mounted modules — precompiles their shims
-   * (plus `durable-isolates:internal`) into a V8 startup snapshot. Many prefixes
-   * share the one sandbox and its isolate pool.
+   * Prepare a prefix from a set of mounted modules — their shims (plus
+   * `durable-isolates:internal`) become the prefix source, served by warm
+   * resident instances. Many prefixes share the one sandbox and its run slots.
    */
   prepare: (options: PrepareOptions) => Promise<DurableIsolatesRunner>
   /**

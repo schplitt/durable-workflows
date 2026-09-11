@@ -3,21 +3,21 @@ import type { HostGlobal, ModuleDefinition } from './types'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER } from './shim'
 
 /**
- * Precompile-time placeholder — every run rebinds the bridge, so it's never hit.
+ * Prepare-time placeholder — every run rebinds the bridge, so it's never hit.
  */
 function unbound(): never {
   throw new Error('durable-isolates: bridge global called outside a run')
 }
 
 /**
- * Build the iso4 `precompile` imports from the mounted modules: each module's
+ * Build the iso4 `prepare` imports from the mounted modules: each module's
  * shim under its specifier, plus the `durable-isolates:internal` module.
  * Throws if a mounted specifier collides with the reserved kernel module —
  * `durable-isolates:internal` is compiled into every prefix and must not be
  * shadowed by a caller-supplied shim.
  * @param modules the mounted module definitions
  */
-export function toPrecompileImports(modules: Readonly<Record<string, ModuleDefinition>>): Imports {
+export function toPrepareImports(modules: Readonly<Record<string, ModuleDefinition>>): Imports {
   const imports: Record<string, string> = { [INTERNAL_SPECIFIER]: internalShim }
   for (const [specifier, def] of Object.entries(modules)) {
     if (specifier === INTERNAL_SPECIFIER) {
@@ -32,10 +32,10 @@ export function toPrecompileImports(modules: Readonly<Record<string, ModuleDefin
 }
 
 /**
- * The three bridge globals declared at precompile (each rebound per run):
+ * The three bridge globals declared at prepare (each rebound per run):
  * one per durable primitive — call, lookup, commit.
  */
-export function precompileGlobals(): HostGlobals {
+export function prepareGlobals(): HostGlobals {
   return {
     [DURABLE_CALL_GLOBAL]: unbound,
     [DURABLE_LOOKUP_GLOBAL]: unbound,

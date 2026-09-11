@@ -12,7 +12,7 @@
  */
 
 /**
- * Shape of the host bridge global — declared at precompile, rebound per run.
+ * Shape of the host bridge global — declared at prepare, rebound per run.
  */
 export type BridgeGlobals = Record<string, (...args: unknown[]) => unknown>
 
@@ -44,7 +44,7 @@ export const DURABLE_COMMIT_GLOBAL = '__di_commit'
  * `boundary(key, fn)` — checkpoint sugar: hit → cached value without running
  * `fn`; miss → run `fn`, commit, return. Nestable: `key` joins the ambient
  * scope while `fn` runs, so inner keys concatenate with `/`. The scope is
- * carried through iso4's `AsyncLocalStorage` (0.3.0+), so it survives `await`
+ * carried through iso4's `AsyncLocalStorage`, so it survives `await`
  * and stays isolated per branch under `Promise.all` — nested boundaries may run
  * sequentially OR in parallel and still key deterministically. Bodies containing
  * further durable work re-run on every replay until committed.
@@ -56,7 +56,7 @@ export const DURABLE_COMMIT_GLOBAL = '__di_commit'
  * `AsyncLocalStorage` is imported from `node:async_hooks` — available to run
  * (postfix) code, which is where these functions execute; constructing the
  * store at module scope and calling `run`/`getStore` at dispatch time is fine
- * for a precompiled import. Only `run`/`getStore` are used (the 0.3.0 subset).
+ * for a prepared import. Only `run`/`getStore` are used (iso4's supported subset).
  */
 export const internalShim: string = /* js */ `
 import { AsyncLocalStorage } from 'node:async_hooks';
