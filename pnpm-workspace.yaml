@@ -18,7 +18,7 @@ packages:
 catalog:
   '@changesets/cli': ^3.0.2
   '@iso4/fetch': ^0.0.2
-  '@iso4/sandbox': ^0.5.3
+  '@iso4/sandbox': ^0.6.0
   '@schplitt/eslint-config': ^1.5.4
   '@types/node': ^26.5.1
   eslint: ^10.10.0

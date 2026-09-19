@@ -114,8 +114,8 @@ catalogs:
       specifier: ^0.0.2
       version: 0.0.2
     '@iso4/sandbox':
-      specifier: ^0.5.3
-      version: 0.5.3
+      specifier: ^0.6.0
+      version: 0.6.0
     '@schplitt/eslint-config':
       specifier: ^1.5.4
       version: 1.5.4
@@ -165,7 +165,7 @@ importers:
     dependencies:
       '@iso4/sandbox':
         specifier: 'catalog:'
-        version: 0.5.3
+        version: 0.6.0
     devDependencies:
       '@iso4/fetch':
         specifier: 'catalog:'
@@ -767,33 +767,33 @@ packages:
     resolution: {integrity: sha512-J9ED13SnJAjCsVUdu95akeMwMSPpjlko2CuxNzZLfpMtmBm7wgXnnyhVLTljxIhfwxVhTdpSJb2v8854WfQ4Ow==}
     engines: {node: '>=24.0.0'}
 
-  '@iso4/sandbox@0.5.3':
-    resolution: {integrity: sha512-KYnF+yrbUZasLkAfRtgTw4cg1zWQC8oMRn51DPl87Gmtlv2Kt328ATmeOGemb7J7qriBHBfIBvFYy/JCtbUCNg==}
+  '@iso4/sandbox@0.6.0':
+    resolution: {integrity: sha512-wAosL2bBMhCzmZmf2TTkpQsvTB39BALmY39LkFKgNLYHiQ8cgpmCFkzj04D+EFMSZcKoAc3PsHjd4MLxVnP3XA==}
     engines: {node: '>=24.0.0'}
 
-  '@iso4/v8-darwin-arm64@0.5.3':
-    resolution: {integrity: sha512-Mh3BIFy1WbZbkNzidNihyJDZFNWNrJGzLuHQxetOBcyuI4f15GvuPP2nsIOyF1S6pwygmZa8dMa4ZThawCUrdQ==}
+  '@iso4/v8-darwin-arm64@0.6.0':
+    resolution: {integrity: sha512-0q1w6bdgNYdAK1GTn0ybgJ1sex8kCO1NB7yKv2dQRfzvSHP5H1QZdfmWMjMaVEEfjcqIMmAw3mTLuiW4M4ia4w==}
     engines: {node: '>=24.0.0'}
     cpu: [arm64]
     os: [darwin]
     hasBin: true
 
-  '@iso4/v8-darwin-x64@0.5.3':
-    resolution: {integrity: sha512-Bbtqm1FP0jSNKhNME9rfAA4h7K9GBh8nuymvJ0MhjeO+3v1Qgd3FVK69Utky/FQPeuaYoc+cRkhVp/f9Ufu0IA==}
+  '@iso4/v8-darwin-x64@0.6.0':
+    resolution: {integrity: sha512-d6VIUp6elOQVEocoljLwAloTgFLKwmOSxX2VU5sf4wuGauZaCjcf2Zi+fq3syL/k2WhYgv2mVl5kRcX5esrJVA==}
     engines: {node: '>=24.0.0'}
     cpu: [x64]
     os: [darwin]
     hasBin: true
 
-  '@iso4/v8-linux-arm64-gnu@0.5.3':
-    resolution: {integrity: sha512-sRWMJZXTQj19W8ChjaW89UDUrd56WxB6TMbKFiAMl1zTwuUOeSt8+EQrmZBWXIWQTPeqtA7l8rVr3jvRZpIu5A==}
+  '@iso4/v8-linux-arm64-gnu@0.6.0':
+    resolution: {integrity: sha512-ZVFKOgXabEMtkpBz2zwXQcd9G3qli292BKcIaMdq+adYwvFYyY56rMbYO8LlKoxWMGMD85jp1wfY+9XrRrlasQ==}
     engines: {node: '>=24.0.0'}
     cpu: [arm64]
     os: [linux]
     hasBin: true
 
-  '@iso4/v8-linux-x64-gnu@0.5.3':
-    resolution: {integrity: sha512-k54dETNJRE6MGjvZos3pbhD9JwGxq5+BpJblWJbughm9mykwLK1TqSCMo838CAxrf2gBH+QT5E3aSA003S631g==}
+  '@iso4/v8-linux-x64-gnu@0.6.0':
+    resolution: {integrity: sha512-pmOaUDuWAiVNhxbwuhUPG9KpWheV6H1n8yHpRrlDlVxSg685uTfd5hfs1DxGsFoDyNYmhvZszOaX0Tn/zWgY0g==}
     engines: {node: '>=24.0.0'}
     cpu: [x64]
     os: [linux]
@@ -4288,23 +4288,23 @@ snapshots:
       rou3: 0.8.1
       undici: 6.27.0
 
-  '@iso4/sandbox@0.5.3':
+  '@iso4/sandbox@0.6.0':
     optionalDependencies:
-      '@iso4/v8-darwin-arm64': 0.5.3
-      '@iso4/v8-darwin-x64': 0.5.3
-      '@iso4/v8-linux-arm64-gnu': 0.5.3
-      '@iso4/v8-linux-x64-gnu': 0.5.3
+      '@iso4/v8-darwin-arm64': 0.6.0
+      '@iso4/v8-darwin-x64': 0.6.0
+      '@iso4/v8-linux-arm64-gnu': 0.6.0
+      '@iso4/v8-linux-x64-gnu': 0.6.0
 
-  '@iso4/v8-darwin-arm64@0.5.3':
+  '@iso4/v8-darwin-arm64@0.6.0':
     optional: true
 
-  '@iso4/v8-darwin-x64@0.5.3':
+  '@iso4/v8-darwin-x64@0.6.0':
     optional: true
 
-  '@iso4/v8-linux-arm64-gnu@0.5.3':
+  '@iso4/v8-linux-arm64-gnu@0.6.0':
     optional: true
 
-  '@iso4/v8-linux-x64-gnu@0.5.3':
+  '@iso4/v8-linux-x64-gnu@0.6.0':
     optional: true
 
   '@jridgewell/resolve-uri@3.1.2': {}
@@ -4890,8 +4890,8 @@ snapshots:
 
   '@typescript-eslint/project-service@8.50.1(typescript@6.0.3)':
     dependencies:
-      '@typescript-eslint/tsconfig-utils': 8.65.0(typescript@6.0.3)
-      '@typescript-eslint/types': 8.65.0
+      '@typescript-eslint/tsconfig-utils': 8.70.0(typescript@6.0.3)
+      '@typescript-eslint/types': 8.70.0
       debug: 4.4.3
       typescript: 6.0.3
     transitivePeerDependencies:
@@ -5858,6 +5858,10 @@ snapshots:
     optionalDependencies:
       picomatch: 4.0.5
 
+  fdir@6.5.0(picomatch@4.0.7):
+    optionalDependencies:
+      picomatch: 4.0.7
+
   file-entry-cache@11.1.5:
     dependencies:
       flat-cache: 6.1.23
@@ -6124,7 +6128,7 @@ snapshots:
 
   magic-string@0.30.21:
     dependencies:
-      '@jridgewell/sourcemap-codec': 1.5.5
+      '@jridgewell/sourcemap-codec': 1.6.0
 
   magic-string@1.0.0:
     dependencies:
@@ -7006,7 +7010,7 @@ snapshots:
 
   ts-declaration-location@1.0.7(typescript@6.0.3):
     dependencies:
-      picomatch: 4.0.5
+      picomatch: 4.0.7
       typescript: 6.0.3
     optional: true
 
@@ -7154,8 +7158,8 @@ snapshots:
   vite@7.3.0(@types/node@24.13.2)(jiti@2.6.1)(yaml@2.9.0):
     dependencies:
       esbuild: 0.27.2
-      fdir: 6.5.0(picomatch@4.0.5)
-      picomatch: 4.0.5
+      fdir: 6.5.0(picomatch@4.0.7)
+      picomatch: 4.0.7
       postcss: 8.5.6
       rollup: 4.54.0
       tinyglobby: 0.2.17
@@ -7168,8 +7172,8 @@ snapshots:
   vite@7.3.0(@types/node@26.5.1)(jiti@2.6.1)(yaml@2.9.0):
     dependencies:
       esbuild: 0.27.2
-      fdir: 6.5.0(picomatch@4.0.5)
-      picomatch: 4.0.5
+      fdir: 6.5.0(picomatch@4.0.7)
+      picomatch: 4.0.7
       postcss: 8.5.6
       rollup: 4.54.0
       tinyglobby: 0.2.17

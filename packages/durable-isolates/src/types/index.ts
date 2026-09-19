@@ -25,19 +25,20 @@ import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Bind ONE iso4 sandbox — a single connection to the Rust core whose
- * `maxConcurrentRuns` admission cap and memory budget govern every run across
- * every prefix prepared on it. Created lazily on the first `prepare`, reused
- * thereafter; `dispose()` tears it (and all its prefixes) down.
+ * Bind ONE iso4 sandbox — a single connection to the Rust core whose run
+ * admission (the runtime's own derived concurrency, unless `maxConcurrentRuns`
+ * pins it) and memory budget govern every run across every prefix prepared on
+ * it. Created lazily on the first `prepare`, reused thereafter; `dispose()`
+ * tears it (and all its prefixes) down.
  */
 export type CreateDurableIsolates = (options?: DurableIsolatesOptions) => DurableIsolates
 
 export interface DurableIsolatesOptions {
   /**
    * iso4 sandbox options — the one Rust bind: `maxConcurrentRuns`,
-   * `memoryBudgetMb`, per-isolate `memoryMb`. Resource LIMITS are not set
-   * here: they are per-run execution caps, configured on `prepare` (default)
-   * and `execute` (override).
+   * `memoryBudgetMb`, `hostReserveMb`, per-isolate `memoryMb`. Resource LIMITS
+   * are not set here: they are per-run execution caps, configured on `prepare`
+   * (default) and `execute` (override).
    */
   sandbox?: SandboxOptions
 }
