@@ -29,13 +29,15 @@ export interface DurableWorkflowsOptions {
    * sandbox subprocess — two engines (e.g. two runtime-surface versions)
    * means two processes.
    *
-   * The engine sets no defaults of its own — iso4's apply: `maxConcurrentRuns`
-   * defaults to the core count (bounded by the memory budget), and resident
-   * warm-instance memory is governed by `memoryBudgetMb`. Replay runs are
-   * mostly I/O-idle (bridge waits don't burn CPU), so raising
-   * `maxConcurrentRuns` well above the core count is a cheap win when many
-   * runs are concurrently ACTIVE, including long-executing step bodies: one
-   * held slot per run for up to the wall budget; excess continuations queue.
+   * The engine sets no defaults of its own — iso4's apply: left unset,
+   * `maxConcurrentRuns` is sized by the runtime from the shape of the runs it
+   * is serving and follows it as that shape changes; resident warm-instance
+   * memory is governed by `memoryBudgetMb`. Replay runs are mostly I/O-idle
+   * (bridge waits don't burn CPU) — the derived number tracks that on its
+   * own, so PIN `maxConcurrentRuns` only on a measured workload, and only for
+   * runs that are concurrently ACTIVE, long-executing step bodies included:
+   * one held slot per run for up to the wall budget; excess continuations
+   * queue.
    */
   sandbox?: SandboxOptions
   /**
