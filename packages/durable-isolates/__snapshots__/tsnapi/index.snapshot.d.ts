@@ -39,7 +39,7 @@ export interface FailedBoundary extends BoundaryRecordBase {
 }
 export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
-  error: unknown;
+  error: RunError;
 }
 export interface ModuleDefinition {
   shim: string;

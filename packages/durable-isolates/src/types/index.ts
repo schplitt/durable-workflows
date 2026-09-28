@@ -18,7 +18,7 @@
  * router. Determinism is a documented contract (deterministic keys, no
  * time/randomness in branches), not an enforced one: a key miss simply runs.
  */
-import type { ResourceLimits, Sandbox, SandboxOptions } from '@iso4/sandbox'
+import type { ResourceLimits, RunError, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Host — owns the one iso4 sandbox (the Rust bind)
@@ -251,16 +251,14 @@ export interface SuspendedResult extends ExecuteResultBase {
 export interface FailedResult extends ExecuteResultBase {
   outcome: 'failed'
   /**
-   * The failure — iso4's `RunError`, passed through VERBATIM (never wrapped):
-   * `code` (`ERR_USER_CODE`, `ERR_HOST_BRIDGE`, `ERR_CPU_TIMEOUT`,
-   * `ERR_WALL_TIMEOUT`, `ERR_MEMORY_LIMIT`, `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`,
-   * `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL`, …), `name`, `message`, `stack`,
-   * `fields`. Capacity refusals (`ERR_QUEUE_FULL`, `ERR_CAPACITY_MEMORY`) land
-   * here too — iso4 resolves them as failed runs rather than rejecting. Typed
-   * `unknown`: the kernel does not model a shape; narrow it to `RunError`
-   * (from `durable-isolates/types/iso4`) to read `code`.
+   * The failure — iso4's `RunError`, passed through verbatim (never
+   * wrapped). Switch on `code` (`RunErrorCode`): user errors
+   * (`ERR_USER_CODE`, `ERR_HOST_BRIDGE`), limit breaches (`ERR_CPU_TIMEOUT`,
+   * `ERR_MEMORY_LIMIT`, …) and capacity refusals (`ERR_QUEUE_FULL`,
+   * `ERR_CAPACITY_MEMORY`, which iso4 resolves as failed runs rather than
+   * rejecting) all land here.
    */
-  error: unknown
+  error: RunError
 }
 
 /**

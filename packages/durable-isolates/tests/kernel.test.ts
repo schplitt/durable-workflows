@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
-import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, PerExecuteGlobals } from '../src'
+import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
 import { durableIsolates, SuspendIsolate } from '../src'
-import type { RunError } from '../src/types/iso4'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -576,7 +575,7 @@ describe('error plane', () => {
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
-    expect((r1.error as { message?: string }).message).toContain('kaboom')
+    expect(r1.error.message).toContain('kaboom')
     expect(booms).toBe(1)
 
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
@@ -690,7 +689,7 @@ describe('error plane', () => {
     expect(r.outcome).toBe('failed')
     if (r.outcome !== 'failed')
       return
-    const err = r.error as { name?: string, message?: string, fields?: Record<string, unknown> }
+    const err = r.error
     expect(err.name).toBe('PaymentError')
     expect(err.message).toBe('boom')
     expect(err.fields?.status).toBe(402) // iso4 nests non-reserved props under `fields`
@@ -834,8 +833,8 @@ describe('sandbox access (getSandbox)', () => {
 })
 
 describe('iso4 error codes pass through verbatim', () => {
-  const codeOf = (r: { outcome: string, error?: unknown }): string | undefined =>
-    r.outcome === 'failed' ? (r.error as RunError).code : undefined
+  const codeOf = (r: ExecuteResult): string | undefined =>
+    r.outcome === 'failed' ? r.error.code : undefined
 
   test('ERR_CPU_TIMEOUT', async () => {
     const r = await runner.execute({ code: `while (true) {}`, cache: {}, limits: { cpuTimeMs: 50 } }).result
