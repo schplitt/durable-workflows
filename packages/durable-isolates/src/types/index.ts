@@ -69,7 +69,7 @@ export interface DurableIsolates {
 export interface PrepareOptions {
   /**
    * The mounted modules. Keys ARE the virtual module specifiers — the mount
-   * points in-sandbox code imports (e.g. `import { request } from 'cumulocity'`).
+   * points in-sandbox code imports (e.g. `import { request } from 'acme'`).
    */
   modules: Readonly<Record<string, ModuleDefinition>>
   /**

@@ -54,13 +54,13 @@ export interface DurableWorkflowsOptions {
    * Always a record: keys ARE the mount points — the virtual module
    * specifiers workflow code imports. Only what is mounted exists in the
    * sandbox, so a deployment can expose a fully custom namespace over the
-   * first-party plugins (e.g. `{ 'cumulocity:sleep': timePlugin(...) }`).
+   * first-party plugins (e.g. `{ 'acme:sleep': timePlugin(...) }`).
    * Core modules (`durable-workflows:workflow`) are remounted via `alias`.
    */
   plugins?: Readonly<Record<string, DurableWorkflowsPlugin>>
   /**
    * Additional or replacement specifiers for CORE modules, e.g.
-   * `{ 'cumulocity:workflow': 'durable-workflows:workflow' }` (alias →
+   * `{ 'acme:workflow': 'durable-workflows:workflow' }` (alias →
    * canonical). The types-side counterpart is a thin ambient re-export
    * d.ts shipped by the whitelabeling package.
    */
