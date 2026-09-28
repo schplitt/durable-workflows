@@ -69,6 +69,34 @@ setInterval(async () => {
 
 A failed run resolves with `{ outcome: 'failed', error }`, where `error` is iso4's `RunError` passed through unchanged. Its `code` (`ERR_CPU_TIMEOUT`, `ERR_WALL_TIMEOUT`, `ERR_MEMORY_LIMIT`, `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`, `ERR_QUEUE_FULL`, `ERR_CAPACITY_MEMORY`, …) is intact. Capacity refusals come back this way too, not as a rejected promise.
 
+## Per-run metrics
+
+Every result also carries `run`, which is iso4's own result for that turn, passed through unchanged. It has the per-run clocks (`durationMs`, `wallTimeMs`, `cpuTimeMs`, `queueWaitMs`), `heapUsedBytes`, `bridgeCalls` and `stdout`/`stderr`. Which iso4 arm you get depends on `outcome`:
+
+| `outcome`   | `run`              | Notes                                                                                                      |
+| ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `completed` | `RunSuccess`       | `queueWaitMs` only when the run queued for a slot                                                          |
+| `failed`    | `RunFailure`       | `run.error` is `error`; no `queueWaitMs` on `ERR_QUEUE_FULL` (refused before admission)                    |
+| `suspended` | iso4's aborted arm | Numbers up to the pause; no `queueWaitMs` or `heapUsedBytes`; zero timings if aborted in a tight sync loop |
+
+The clocks stop when the isolate settles. Letting in-flight dispatches finish afterwards (the drain) is not counted.
+
+`bridgeCalls` includes the kernel's own bridge calls. Every durable call (a cache hit or a dispatch) crosses as `__di_call`, and checkpoints cross as `__di_lookup` and `__di_commit`. Entries carry no arguments, so a `__di_call` entry does not say which operation it was. Use `KERNEL_BRIDGE_GLOBALS` to split them out:
+
+<!-- eslint-skip -->
+
+```ts
+import { KERNEL_BRIDGE_GLOBALS } from 'durable-isolates'
+
+const r = await runner.execute({ code, cache }).result
+const { wallTimeMs, cpuTimeMs, bridgeCalls } = r.run
+const kernel = bridgeCalls.filter(c => KERNEL_BRIDGE_GLOBALS.some(n => n === c.name))
+```
+
+## `waitUntil` is not durable
+
+iso4 lets sandbox code register background work with `waitUntil`, which keeps running after the run's result has been delivered. Durable calls and checkpoints are not supported inside that work. By the time it runs, `execute` has already returned, so anything it records would be written into a `cache` you may already have saved. Keep durable calls on the awaited path of the program.
+
 ## License
 
 MIT

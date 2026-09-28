@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
-import { durableIsolates, SuspendIsolate } from '../src'
+import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -901,4 +901,126 @@ describe('iso4 error codes pass through verbatim', () => {
       await di.dispose()
     }
   }, 30_000)
+})
+
+describe('per-run metrics (iso4 result passed through as `run`)', () => {
+  test('completed: RunSuccess verbatim — clocks, heap, logs, kernel bridge calls', async () => {
+    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const code = `import { call } from 'tools'; console.log('hi'); export default await call('ping')`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.run.status).toBe('completed')
+    expect(r.run.exports.default).toBe(r.result)
+    expect(r.run.cpuTimeMs).toBeLessThanOrEqual(r.run.wallTimeMs)
+    expect(r.run.wallTimeMs).toBeLessThanOrEqual(r.run.durationMs)
+    expect(typeof r.run.heapUsedBytes).toBe('number') // prefix runs report it
+    expect(r.run.stdout).toEqual(['hi'])
+    // The durable call crosses as the kernel's `__di_call` — filterable.
+    expect(r.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_call'])
+    expect(r.run.bridgeCalls.filter((c) => !KERNEL_BRIDGE_GLOBALS.some((n) => n === c.name))).toEqual([])
+
+    // A replay answered from the cache still round-trips the bridge.
+    const replay = await runner.execute({ code, cache: r.cache, globals }).result
+    expect(replay.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_call'])
+  }, 15_000)
+
+  test('checkpoints show up as `__di_lookup` / `__di_commit`', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      export default await boundary('b', async () => 1)`
+    const r = await runner.execute({ code, cache: {} }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_lookup', '__di_commit'])
+  }, 15_000)
+
+  test('failed: RunFailure verbatim — `run.error` is `error`, numbers up to the failure', async () => {
+    const r = await runner.execute({ code: `while (true) {}`, cache: {}, limits: { cpuTimeMs: 50 } }).result
+    expect(r.outcome).toBe('failed')
+    if (r.outcome !== 'failed')
+      return
+    expect(r.run.status).toBe('failed')
+    expect(r.run.error).toBe(r.error)
+    expect(r.run.cpuTimeMs).toBeGreaterThan(0)
+    expect(typeof r.run.wallTimeMs).toBe('number')
+    expect(typeof r.run.durationMs).toBe('number')
+  }, 15_000)
+
+  test('failed before admission (ERR_QUEUE_FULL): no `queueWaitMs`', async () => {
+    const di = durableIsolates({ sandbox: { maxConcurrentRuns: 1, maxQueuedRuns: 0 } })
+    try {
+      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      let release!: (v: string) => void
+      let entered!: () => void
+      const running = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      const globals: PerExecuteGlobals = {
+        hold: () => {
+          entered()
+          return new Promise<string>((resolve) => {
+            release = resolve
+          })
+        },
+      }
+      const first = r.execute({ code: `import { step } from 'tools'; export default await step('h', 'hold')`, cache: {}, globals })
+      await running
+
+      const refused = await r.execute({ code: `export default 1`, cache: {} }).result
+      expect(refused.outcome).toBe('failed')
+      if (refused.outcome !== 'failed')
+        return
+      expect(refused.run.error.code).toBe('ERR_QUEUE_FULL')
+      expect(refused.run.queueWaitMs).toBeUndefined()
+
+      release('done')
+      await first.result
+    } finally {
+      await di.dispose()
+    }
+  }, 30_000)
+
+  test('suspended: iso4\'s aborted arm with the numbers up to the pause', async () => {
+    const globals: PerExecuteGlobals = {
+      load: () => 'x',
+      approve: () => {
+        throw new SuspendIsolate({ need: 'approval' })
+      },
+    }
+    const code = `import { call } from 'tools'
+      await call('load')
+      export default await call('approve')`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('suspended')
+    if (r.outcome !== 'suspended')
+      return
+    expect(r.run.status).toBe('aborted')
+    expect(r.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_call', '__di_call'])
+    expect(r.run.bridgeCalls[0]?.ok).toBe(true)
+    expect(r.run.bridgeCalls[1]?.ok).toBe(false) // the suspending call never answered
+    expect(r.run.durationMs).toBeGreaterThan(0)
+    expect(r.run.cpuTimeMs).toBeLessThanOrEqual(r.run.wallTimeMs)
+  }, 15_000)
+
+  test('external suspend(): the aborted arm too', async () => {
+    let started!: () => void
+    const startedOnce = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const globals: PerExecuteGlobals = {
+      slow: async () => {
+        started()
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        return 'io'
+      },
+    }
+    const handle = runner.execute({ code: `import { call } from 'tools'; export default await call('slow')`, cache: {}, globals })
+    await startedOnce
+    const r = await handle.suspend()
+    expect(r.outcome).toBe('suspended')
+    expect(r.run.status).toBe('aborted')
+    expect(r.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_call'])
+  }, 15_000)
 })
