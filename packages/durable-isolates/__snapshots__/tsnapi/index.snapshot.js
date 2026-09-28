@@ -10,4 +10,5 @@ export class SuspendIsolate extends Error {
 
 // #region Variables
 export var durableIsolates /* const */
+export var KERNEL_BRIDGE_GLOBALS /* const */
 // #endregion

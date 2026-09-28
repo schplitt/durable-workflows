@@ -18,7 +18,7 @@
  * router. Determinism is a documented contract (deterministic keys, no
  * time/randomness in branches), not an enforced one: a key miss simply runs.
  */
-import type { ResourceLimits, RunError, Sandbox, SandboxOptions } from '@iso4/sandbox'
+import type { ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Host — owns the one iso4 sandbox (the Rust bind)
@@ -167,7 +167,10 @@ export interface ExecuteOptions {
    * ESM source — the SAME source on every replay. Keys are formed
    * deterministically in the shim; determinism is the documented contract
    * (deterministic keys and branches). A changed path just misses the cache and
-   * runs — the kernel does not police it.
+   * runs — the kernel does not police it. Durable calls and checkpoints
+   * belong on the awaited path: work registered with iso4's `waitUntil` runs
+   * after `execute` has returned, so anything it records lands in a `cache`
+   * the caller may already have persisted — not supported.
    */
   code: string
   /**
@@ -212,8 +215,9 @@ export interface ExecuteHandle {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Discriminated on `outcome`. The grown cache always comes back as `cache`;
- * the payload beyond that is outcome-specific.
+ * Discriminated on `outcome`. The grown cache always comes back as `cache` and
+ * iso4's own result for the turn as `run`; the payload beyond that is
+ * outcome-specific.
  */
 export type ExecuteResult
   = | CompletedResult
@@ -226,14 +230,35 @@ interface ExecuteResultBase {
    * it back as the next `execute`'s `cache`.
    */
   cache: BoundaryCache
+  /**
+   * iso4's result for this turn, passed through verbatim (never reshaped):
+   * `durationMs`, `wallTimeMs`, `cpuTimeMs`, `queueWaitMs`, `heapUsedBytes`,
+   * `bridgeCalls`, `stdout`/`stderr`, …. Its arm follows `outcome` —
+   * `completed` → `RunSuccess`, `failed` → `RunFailure`, `suspended` → iso4's
+   * aborted arm (a suspension IS an abort to iso4). Which fields each arm
+   * carries is iso4's contract: `queueWaitMs` is absent when no queueing
+   * happened (and on `ERR_QUEUE_FULL`), the aborted arm has neither
+   * `queueWaitMs` nor `heapUsedBytes`, and an abort that falls back to socket
+   * teardown (a tight synchronous loop) reports zero timings and no
+   * `bridgeCalls`. The clocks stop when the isolate settles — the kernel's
+   * drain of in-flight dispatches afterwards is not included.
+   *
+   * `bridgeCalls` lists every bridge call the sandbox attempted, including the
+   * kernel's own: every durable call (cache hit or dispatch) crosses as
+   * `__di_call`, checkpoints as `__di_lookup` / `__di_commit` — see
+   * `KERNEL_BRIDGE_GLOBALS` to filter them. Entries carry no arguments, so a
+   * `__di_call` entry does not say which operation it was.
+   */
+  run: RunResult
 }
 
 export interface CompletedResult extends ExecuteResultBase {
   outcome: 'completed'
   /**
-   * The module's `export default` value.
+   * The module's `export default` value (`run.exports.default`).
    */
   result: unknown
+  run: RunSuccess
 }
 
 export interface SuspendedResult extends ExecuteResultBase {
@@ -246,6 +271,10 @@ export interface SuspendedResult extends ExecuteResultBase {
    * consulting host state, proceeds, suspends again, or throws.
    */
   pending: PendingOperation[]
+  /**
+   * iso4's aborted arm — the kernel suspends a run by aborting it.
+   */
+  run: Extract<RunResult, { status: 'aborted' }>
 }
 
 export interface FailedResult extends ExecuteResultBase {
@@ -256,9 +285,10 @@ export interface FailedResult extends ExecuteResultBase {
    * (`ERR_USER_CODE`, `ERR_HOST_BRIDGE`), limit breaches (`ERR_CPU_TIMEOUT`,
    * `ERR_MEMORY_LIMIT`, …) and capacity refusals (`ERR_QUEUE_FULL`,
    * `ERR_CAPACITY_MEMORY`, which iso4 resolves as failed runs rather than
-   * rejecting) all land here.
+   * rejecting) all land here. The same object as `run.error`.
    */
   error: RunError
+  run: RunFailure
 }
 
 /**

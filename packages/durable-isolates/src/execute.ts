@@ -187,10 +187,10 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     // Suspension is detected by the ABORT — never by catching an in-sandbox
     // throw — so sandbox `try/catch` around a suspending call cannot swallow it.
     if (result.status === 'aborted')
-      return { outcome: 'suspended', pending, cache }
+      return { outcome: 'suspended', pending, cache, run: result }
     if (result.status === 'completed')
-      return { outcome: 'completed', result: result.exports.default, cache }
-    return { outcome: 'failed', error: result.error, cache }
+      return { outcome: 'completed', result: result.exports.default, cache, run: result }
+    return { outcome: 'failed', error: result.error, cache, run: result }
   })()
 
   const suspend = (): Promise<ExecuteResult> => {

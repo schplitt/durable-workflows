@@ -5,4 +5,5 @@
  */
 export type * from './types'
 export { durableIsolates } from './durable-isolates'
+export { KERNEL_BRIDGE_GLOBALS } from './shim'
 export { SuspendIsolate } from './suspend-isolate'

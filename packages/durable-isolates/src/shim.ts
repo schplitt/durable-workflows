@@ -31,6 +31,13 @@ export const DURABLE_LOOKUP_GLOBAL = '__di_lookup'
 export const DURABLE_COMMIT_GLOBAL = '__di_commit'
 
 /**
+ * The kernel's bridge-global names as they appear in iso4's `bridgeCalls` —
+ * for telling the kernel's own entries apart from other globals'.
+ */
+export const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof DURABLE_LOOKUP_GLOBAL, typeof DURABLE_COMMIT_GLOBAL]
+  = [DURABLE_CALL_GLOBAL, DURABLE_LOOKUP_GLOBAL, DURABLE_COMMIT_GLOBAL]
+
+/**
  * Source of the `durable-isolates:internal` module.
  *
  * `durableCall(key, name, ...args)` — the host-backed durable primitive. The

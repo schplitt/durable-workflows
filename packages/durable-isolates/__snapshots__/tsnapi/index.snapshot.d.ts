@@ -9,6 +9,7 @@ export interface CompletedBoundary extends BoundaryRecordBase {
 export interface CompletedResult extends ExecuteResultBase {
   outcome: "completed";
   result: unknown;
+  run: RunSuccess;
 }
 export interface DurableIsolates {
   prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
@@ -40,6 +41,7 @@ export interface FailedBoundary extends BoundaryRecordBase {
 export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
   error: RunError;
+  run: RunFailure;
 }
 export interface ModuleDefinition {
   shim: string;
@@ -57,6 +59,9 @@ export interface PrepareOptions {
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";
   pending: PendingOperation[];
+  run: Extract<RunResult, {
+    status: "aborted";
+  }>;
 }
 export interface WaitingBoundary extends BoundaryRecordBase {
   status: "waiting";
@@ -83,6 +88,7 @@ export declare class SuspendIsolate extends Error {
 
 // #region Variables
 export declare const durableIsolates: CreateDurableIsolates;
+export declare const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof DURABLE_LOOKUP_GLOBAL, typeof DURABLE_COMMIT_GLOBAL];
 // #endregion
 
 // #region Referenced (internal)
@@ -91,5 +97,6 @@ interface BoundaryRecordBase {
 }
 interface ExecuteResultBase {
   cache: BoundaryCache;
+  run: RunResult;
 }
 // #endregion
