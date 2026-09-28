@@ -10,8 +10,8 @@ import { executeRun } from './execute'
 
 /**
  * Bind one iso4 sandbox (the Rust core). The sandbox is created
- * lazily on the first `prepare` and reused for every prefix; `dispose()` tears
- * it — and all its prefixes — down. See {@link CreateDurableIsolates}.
+ * lazily on the first `prepare` (or `getSandbox`) and reused for every prefix;
+ * `dispose()` tears it — and all its prefixes — down. See {@link CreateDurableIsolates}.
  * @param options the sandbox options for the one iso4 bind
  */
 export const durableIsolates: CreateDurableIsolates = (options = {}) => {
@@ -23,6 +23,8 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
   }
 
   const host: DurableIsolates = {
+    getSandbox,
+
     prepare: async (prepareOptions): Promise<DurableIsolatesRunner> => {
       const { modules, limits: prepareLimits } = prepareOptions
       const defaults = resolveDefaultGlobals(modules)
@@ -35,6 +37,7 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
       })
 
       const runner: DurableIsolatesRunner = {
+        prefixId: prefix.id,
         execute: (executeOptions) => executeRun({
           prefix,
           defaults,

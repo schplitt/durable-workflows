@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, PerExecuteGlobals } from '../src'
 import { durableIsolates, SuspendIsolate } from '../src'
+import type { RunError } from '../src/types/iso4'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -789,4 +790,116 @@ describe('mount guards', () => {
       return
     expect(r.result).toEqual([])
   }, 15_000)
+})
+
+describe('sandbox access (getSandbox)', () => {
+  test('lazy: nothing is created until prepare/getSandbox; dispose before then is a no-op', async () => {
+    const di = durableIsolates()
+    await expect(di.dispose()).resolves.toBeUndefined()
+  })
+
+  test('getSandbox() creates the sandbox before any run and is the one prepare uses', async () => {
+    const di = durableIsolates()
+    try {
+      const sandbox = await di.getSandbox()
+      expect(await di.getSandbox()).toBe(sandbox)
+      const stats = await sandbox.stats() // scrapeable before the first prepare/run
+      expect(stats.activeRuns).toBe(0)
+
+      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      expect(await di.getSandbox()).toBe(sandbox)
+      // `stats().prefixes` lists a prefix once it has an instance — warm one.
+      expect((await r.execute({ code: `export default 1`, cache: {} }).result).outcome).toBe('completed')
+      expect(Object.keys((await sandbox.stats()).prefixes)).toContain(r.prefixId)
+    } finally {
+      await di.dispose()
+    }
+  }, 30_000)
+
+  test('dispose() tears the sandbox down; the next getSandbox() creates a fresh one', async () => {
+    const di = durableIsolates()
+    const first = await di.getSandbox()
+    await di.prepare({ modules: { tools: { shim: SHIM } } })
+    await di.dispose()
+    expect(first.alive).toBe(false)
+
+    const second = await di.getSandbox()
+    try {
+      expect(second).not.toBe(first)
+      expect(second.alive).toBe(true)
+    } finally {
+      await di.dispose()
+    }
+  }, 30_000)
+})
+
+describe('iso4 error codes pass through verbatim', () => {
+  const codeOf = (r: { outcome: string, error?: unknown }): string | undefined =>
+    r.outcome === 'failed' ? (r.error as RunError).code : undefined
+
+  test('ERR_CPU_TIMEOUT', async () => {
+    const r = await runner.execute({ code: `while (true) {}`, cache: {}, limits: { cpuTimeMs: 50 } }).result
+    expect(codeOf(r)).toBe('ERR_CPU_TIMEOUT')
+  }, 15_000)
+
+  test('ERR_WALL_TIMEOUT — and the durable call in flight is still drained into the cache', async () => {
+    const globals: PerExecuteGlobals = { slow: () => new Promise((resolve) => {
+      setTimeout(resolve, 300, 'late')
+    }) }
+    const code = `import { step } from 'tools'; export default await step('s', 'slow')`
+    const r = await runner.execute({ code, cache: {}, globals, limits: { wallTimeMs: 100 } }).result
+    expect(codeOf(r)).toBe('ERR_WALL_TIMEOUT')
+    expect(r.cache.s).toMatchObject({ status: 'completed', value: 'late' })
+  }, 15_000)
+
+  test('ERR_BRIDGE_CALL_LIMIT_EXCEEDED', async () => {
+    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const code = `import { call } from 'tools'; for (let i = 0; i < 5; i++) await call('ping'); export default 1`
+    const r = await runner.execute({ code, cache: {}, globals, limits: { maxBridgeCalls: 2 } }).result
+    expect(codeOf(r)).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+  }, 15_000)
+
+  test('ERR_MEMORY_LIMIT', async () => {
+    const di = durableIsolates({ sandbox: { memoryMb: { hard: 16 } } })
+    try {
+      const r = await (await di.prepare({ modules: {} })).execute({
+        code: `const a = []; while (true) a.push(new Array(1e6).fill(1))`,
+        cache: {},
+      }).result
+      expect(codeOf(r)).toBe('ERR_MEMORY_LIMIT')
+    } finally {
+      await di.dispose()
+    }
+  }, 30_000)
+
+  test('ERR_QUEUE_FULL — a capacity refusal is a failed outcome, not a rejection', async () => {
+    const di = durableIsolates({ sandbox: { maxConcurrentRuns: 1, maxQueuedRuns: 0 } })
+    try {
+      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      let release!: (v: string) => void
+      let entered!: () => void
+      const running = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      const globals: PerExecuteGlobals = {
+        hold: () => {
+          entered()
+          return new Promise<string>((resolve) => {
+            release = resolve
+          })
+        },
+      }
+      const code = `import { step } from 'tools'; export default await step('h', 'hold')`
+      const first = r.execute({ code, cache: {}, globals })
+      await running // the one slot is now held
+
+      const refused = await r.execute({ code: `export default 1`, cache: {} }).result
+      expect(codeOf(refused)).toBe('ERR_QUEUE_FULL')
+
+      release('done')
+      expect((await first.result).outcome).toBe('completed')
+    } finally {
+      await di.dispose()
+    }
+  }, 30_000)
 })

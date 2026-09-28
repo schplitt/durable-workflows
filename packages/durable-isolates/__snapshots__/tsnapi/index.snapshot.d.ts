@@ -12,12 +12,14 @@ export interface CompletedResult extends ExecuteResultBase {
 }
 export interface DurableIsolates {
   prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
+  getSandbox: () => Promise<Sandbox>;
   dispose: () => Promise<void>;
 }
 export interface DurableIsolatesOptions {
   sandbox?: SandboxOptions;
 }
 export interface DurableIsolatesRunner {
+  readonly prefixId: string;
   execute: (_: ExecuteOptions) => ExecuteHandle;
   dispose: () => Promise<void>;
 }

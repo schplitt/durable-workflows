@@ -18,7 +18,7 @@
  * router. Determinism is a documented contract (deterministic keys, no
  * time/randomness in branches), not an enforced one: a key miss simply runs.
  */
-import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
+import type { ResourceLimits, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Host — owns the one iso4 sandbox (the Rust bind)
@@ -28,17 +28,17 @@ import type { ResourceLimits, SandboxOptions } from '@iso4/sandbox'
  * Bind ONE iso4 sandbox — a single connection to the Rust core whose run
  * admission (the runtime's own derived concurrency, unless `maxConcurrentRuns`
  * pins it) and memory budget govern every run across every prefix prepared on
- * it. Created lazily on the first `prepare`, reused thereafter; `dispose()`
- * tears it (and all its prefixes) down.
+ * it. Created lazily on the first `prepare` (or `getSandbox`), reused
+ * thereafter; `dispose()` tears it (and all its prefixes) down.
  */
 export type CreateDurableIsolates = (options?: DurableIsolatesOptions) => DurableIsolates
 
 export interface DurableIsolatesOptions {
   /**
    * iso4 sandbox options — the one Rust bind: `maxConcurrentRuns`,
-   * `memoryBudgetMb`, `hostReserveMb`, per-isolate `memoryMb`. Resource LIMITS
-   * are not set here: they are per-run execution caps, configured on `prepare`
-   * (default) and `execute` (override).
+   * `maxQueuedRuns`, `memoryBudgetMb`, `hostReserveMb`, per-isolate
+   * `memoryMb`. Resource LIMITS are not set here: they are per-run execution
+   * caps, configured on `prepare` (default) and `execute` (override).
    */
   sandbox?: SandboxOptions
 }
@@ -51,7 +51,17 @@ export interface DurableIsolates {
    */
   prepare: (options: PrepareOptions) => Promise<DurableIsolatesRunner>
   /**
-   * Tear down the sandbox and every prefix prepared on it.
+   * The iso4 sandbox every prefix is prepared on — for its own API
+   * (`stats()` for capacity/usage metrics, …). Always the same instance
+   * `prepare` uses. CREATES the sandbox if it does not exist yet, so metrics
+   * can be scraped before the first run; after `dispose()` the next call
+   * creates a fresh one. The sandbox stays owned by durable-isolates: tear it
+   * down through `DurableIsolates.dispose()`, not `sandbox.dispose()`.
+   */
+  getSandbox: () => Promise<Sandbox>
+  /**
+   * Tear down the sandbox and every prefix prepared on it. Not terminal: a
+   * later `prepare`/`getSandbox` creates a fresh sandbox.
    */
   dispose: () => Promise<void>
 }
@@ -130,6 +140,11 @@ export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface DurableIsolatesRunner {
+  /**
+   * The iso4 prefix id this runner executes on — the key of its entry in
+   * `sandbox.stats().prefixes`, for correlating per-prefix instance counts.
+   */
+  readonly prefixId: string
   /**
    * One replay turn — a (nearly) pure function over the cache. Re-runs `code`
    * from the top in a fresh isolate: a boundary answers from `cache` when its
@@ -236,9 +251,14 @@ export interface SuspendedResult extends ExecuteResultBase {
 export interface FailedResult extends ExecuteResultBase {
   outcome: 'failed'
   /**
-   * The failure — a user error (iso4 `RunError`: `code`/`name`/`message`/
-   * `stack`/`fields`) or a resource-limit breach. Typed `unknown`: the kernel
-   * does not model a shape; the caller inspects it at its own risk.
+   * The failure — iso4's `RunError`, passed through VERBATIM (never wrapped):
+   * `code` (`ERR_USER_CODE`, `ERR_HOST_BRIDGE`, `ERR_CPU_TIMEOUT`,
+   * `ERR_WALL_TIMEOUT`, `ERR_MEMORY_LIMIT`, `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`,
+   * `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL`, …), `name`, `message`, `stack`,
+   * `fields`. Capacity refusals (`ERR_QUEUE_FULL`, `ERR_CAPACITY_MEMORY`) land
+   * here too — iso4 resolves them as failed runs rather than rejecting. Typed
+   * `unknown`: the kernel does not model a shape; narrow it to `RunError`
+   * (from `durable-isolates/types/iso4`) to read `code`.
    */
   error: unknown
 }

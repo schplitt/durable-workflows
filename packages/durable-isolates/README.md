@@ -52,6 +52,23 @@ if (r.outcome === 'completed')
 cache = r.cache // persist, then hand back next time
 ```
 
+## Sandbox metrics and errors
+
+`durableIsolates({ sandbox })` takes iso4 `SandboxOptions` and owns the one sandbox: it is created lazily and torn down by `dispose()`. To reach the iso4 API directly (for example `stats()` for load metrics), use `getSandbox()`. It returns the same sandbox `prepare` uses, creating it first if needed, so you can scrape metrics before the first run. Leave teardown to `di.dispose()`.
+
+<!-- eslint-skip -->
+
+```ts
+const di = durableIsolates({ sandbox: { maxQueuedRuns: 100 } })
+const sandbox = await di.getSandbox()
+setInterval(async () => {
+  const { activeRuns, queueDepth, slotLimit, usageBytes, underPressure, prefixes } = await sandbox.stats()
+  // runner.prefixId is the key into `prefixes`
+}, 5_000)
+```
+
+A failed run resolves with `{ outcome: 'failed', error }`, where `error` is iso4's `RunError` passed through unchanged. Its `code` (`ERR_CPU_TIMEOUT`, `ERR_WALL_TIMEOUT`, `ERR_MEMORY_LIMIT`, `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`, `ERR_QUEUE_FULL`, `ERR_CAPACITY_MEMORY`, …) is intact. Capacity refusals come back this way too, not as a rejected promise.
+
 ## License
 
 MIT
