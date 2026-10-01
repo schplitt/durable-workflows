@@ -4,6 +4,8 @@
 // #region Interfaces
 export interface CompletedBoundary extends BoundaryRecordBase {
   status: "completed";
+  name?: string;
+  args?: unknown[];
   value: unknown;
 }
 export interface CompletedResult extends ExecuteResultBase {
@@ -36,6 +38,8 @@ export interface ExecuteOptions {
 }
 export interface FailedBoundary extends BoundaryRecordBase {
   status: "failed";
+  name?: string;
+  args?: unknown[];
   error: unknown;
 }
 export interface FailedResult extends ExecuteResultBase {
@@ -66,6 +70,7 @@ export interface SuspendedResult extends ExecuteResultBase {
 export interface WaitingBoundary extends BoundaryRecordBase {
   status: "waiting";
   name: string;
+  args: unknown[];
 }
 // #endregion
 

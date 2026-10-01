@@ -136,6 +136,96 @@ describe('durable calls (key from the sandbox)', () => {
   }, 15_000)
 })
 
+describe('boundary records carry the call (name + args)', () => {
+  test('completed: the record holds the dispatched name and the forwarded args', async () => {
+    const globals: PerExecuteGlobals = { echo: (a, b) => ({ a, b }) }
+    const code = `import { call } from 'tools'; export default await call('echo', 'p', { n: 1, tags: ['x'] })`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache['echo#0']).toEqual({
+      seq: 0,
+      status: 'completed',
+      name: 'echo',
+      args: ['p', { n: 1, tags: ['x'] }],
+      value: { a: 'p', b: { n: 1, tags: ['x'] } },
+    })
+  }, 15_000)
+
+  test('failed: a throwing global records name and args next to the error', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw new TypeError('nope')
+      },
+    }
+    const code = `import { call } from 'tools'
+      try { await call('boom', 7) } catch {}
+      export default 'survived'`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache['boom#0']).toEqual({
+      seq: 0,
+      status: 'failed',
+      name: 'boom',
+      args: [7],
+      error: { name: 'TypeError', message: 'nope' },
+    })
+  }, 15_000)
+
+  test('failed (no global): the missing name and the args are still recorded', async () => {
+    const code = `import { call } from 'tools'
+      try { await call('missing', 'a', 1) } catch {}
+      export default 'survived'`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache['missing#0']).toEqual({
+      seq: 0,
+      status: 'failed',
+      name: 'missing',
+      args: ['a', 1],
+      error: { name: 'Error', message: 'durable-isolates: no global for "missing"' },
+    })
+  }, 15_000)
+
+  test('waiting: the record holds the args the resume re-dispatch forwards again', async () => {
+    const seen: unknown[][] = []
+    let approved = false
+    const globals: PerExecuteGlobals = {
+      gate: (...args) => {
+        seen.push(args)
+        if (!approved)
+          throw new SuspendIsolate({ need: 'approval' })
+        return 'opened'
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('gate', { subject: 's-1' })`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('suspended')
+    expect(r1.cache['gate#0']).toEqual({ seq: 0, status: 'waiting', name: 'gate', args: [{ subject: 's-1' }] })
+
+    approved = true
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('completed')
+    expect(r2.cache['gate#0']).toEqual({ seq: 0, status: 'completed', name: 'gate', args: [{ subject: 's-1' }], value: 'opened' })
+    expect(seen).toEqual([[{ subject: 's-1' }], [{ subject: 's-1' }]]) // same args both dispatches
+  }, 15_000)
+
+  test('commit records (boundary / durableCommit) carry neither name nor args', async () => {
+    const code = `import { boundary, durableCommit } from 'durable-isolates:internal'
+      const a = await boundary('scope', async () => 'in-sandbox')
+      await durableCommit('manual', { ok: true })
+      export default a`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache.scope).toEqual({ seq: 0, status: 'completed', value: 'in-sandbox' })
+    expect(r.cache.manual).toEqual({ seq: 1, status: 'completed', value: { ok: true } })
+  }, 15_000)
+})
+
 describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
   test('explicit gate: the global returns the stored answer on re-dispatch', async () => {
     let loads = 0
@@ -521,7 +611,7 @@ describe('external suspension (handle.suspend())', () => {
     if (r1.outcome !== 'suspended')
       return
     expect(r1.pending).toEqual([]) // nothing waits on the outside — we stopped it
-    expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', value: 'expensive-io' }) // drained write kept
+    expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', name: 'slow', args: [{}], value: 'expensive-io' }) // drained write kept
 
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')

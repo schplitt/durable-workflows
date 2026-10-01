@@ -319,6 +319,12 @@ export type BoundaryCache = Record<string, BoundaryRecord>
  * NEVER matching. Retry and eviction are the caller's cache surgery: delete a
  * failed entry to re-execute that boundary; delete by `seq` suffix to evict a
  * boundary and everything recorded after it.
+ *
+ * A record written by a global DISPATCH (`durableCall`) also carries the call
+ * itself — `name` and `args` — so the history says what was asked at each key,
+ * not only what came back. A record written by an in-sandbox COMMIT
+ * (`durableCommit` / `boundary()`) has neither: the kernel never saw a call,
+ * only a value.
  */
 export type BoundaryRecord
   = | CompletedBoundary
@@ -334,11 +340,33 @@ interface BoundaryRecordBase {
 
 export interface CompletedBoundary extends BoundaryRecordBase {
   status: 'completed'
+  /**
+   * The operation `name` that was dispatched. Present on dispatch records,
+   * absent on commit records.
+   */
+  name?: string
+  /**
+   * The args the shim forwarded to the global. Present on dispatch records,
+   * absent on commit records.
+   */
+  args?: unknown[]
   value: unknown
 }
 
 export interface FailedBoundary extends BoundaryRecordBase {
   status: 'failed'
+  /**
+   * The operation `name` that was dispatched — also on a "no global for
+   * `name`" failure. The kernel always writes it; optional in the type because
+   * the cache is caller-persisted data that may predate this field.
+   */
+  name?: string
+  /**
+   * The args the shim forwarded to the global. The kernel always writes it;
+   * optional in the type because the cache is caller-persisted data that may
+   * predate this field.
+   */
+  args?: unknown[]
   /**
    * The value the global threw, recorded verbatim. Re-thrown into the sandbox
    * on replay via the durable envelope; iso4's bridge serialization carries it
@@ -359,4 +387,9 @@ export interface WaitingBoundary extends BoundaryRecordBase {
    * The operation that suspended.
    */
   name: string
+  /**
+   * The args the shim forwarded to the global that suspended — the same args
+   * the re-dispatch on resume forwards again.
+   */
+  args: unknown[]
 }
