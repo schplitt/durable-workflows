@@ -1,5 +1,11 @@
 # durable-isolates
 
+## 0.2.1
+
+### Patch Changes
+
+- f39c05b: Update `@iso4/sandbox` to 0.6.1.
+
 ## 0.2.0
 
 ### Minor Changes
