@@ -14,7 +14,7 @@ export interface DurableIsolatesInternal {
 // #region Types
 export type Boundary = <T>(_: string, _: () => T | Promise<T>) => Promise<T>;
 export type DurableCall = (_: string, _: string, ..._: unknown[]) => Promise<unknown>;
-export type DurableCommit = (_: string, _: unknown) => Promise<void>;
+export type DurableCommit = (_: string, _: unknown) => Promise<unknown>;
 export type DurableLookup = (_: string) => Promise<{
   hit: true;
   value: unknown;

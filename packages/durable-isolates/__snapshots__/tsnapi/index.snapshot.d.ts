@@ -51,6 +51,13 @@ export interface ModuleDefinition {
   shim: string;
   globals?: GlobalMap;
 }
+export interface NonJsonCallRejection extends NonJsonRejectionBase {
+  source: "args" | "result" | "error";
+  name: string;
+}
+export interface NonJsonCommitRejection extends NonJsonRejectionBase {
+  source: "commit";
+}
 export interface PendingOperation {
   id: string;
   name: string;
@@ -59,6 +66,11 @@ export interface PendingOperation {
 export interface PrepareOptions {
   modules: Readonly<Record<string, ModuleDefinition>>;
   limits?: Partial<ResourceLimits>;
+}
+export interface RejectedResult extends ExecuteResultBase {
+  outcome: "rejected";
+  rejection: Rejection;
+  run: RunResult;
 }
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";
@@ -78,17 +90,28 @@ export interface WaitingBoundary extends BoundaryRecordBase {
 export type BoundaryCache = Record<string, BoundaryRecord>;
 export type BoundaryRecord = CompletedBoundary | FailedBoundary | WaitingBoundary;
 export type CreateDurableIsolates = (_?: DurableIsolatesOptions) => DurableIsolates;
-export type ExecuteResult = CompletedResult | SuspendedResult | FailedResult;
+export type ExecuteResult = CompletedResult | SuspendedResult | FailedResult | RejectedResult;
 export type GlobalMap = Readonly<Record<string, HostGlobal>>;
 export type HostGlobal = (..._: unknown[]) => unknown;
+export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;
 export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
+export type Rejection = NonJsonRejection;
 // #endregion
 
 // #region Classes
+export declare class NonJsonValueError extends Error {
+  readonly path: string;
+  readonly found: string;
+  constructor(_: string, _: string);
+}
 export declare class SuspendIsolate extends Error {
   readonly payload: unknown;
   constructor(_?: unknown);
 }
+// #endregion
+
+// #region Functions
+export declare function toJson(_: unknown): unknown;
 // #endregion
 
 // #region Variables
@@ -103,5 +126,10 @@ interface BoundaryRecordBase {
 interface ExecuteResultBase {
   cache: BoundaryCache;
   run: RunResult;
+}
+interface NonJsonRejectionBase extends RejectionBase {
+  reason: "non-json";
+  path: string;
+  found: string;
 }
 // #endregion

@@ -47,7 +47,9 @@ export const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof
  * On suspension the host aborts the run, so the returned promise never settles.
  *
  * `durableLookup(key)` — non-memoized read of the live cache: `{hit, value?}`.
- * `durableCommit(key, value)` — record a completed boundary from the sandbox.
+ * `durableCommit(key, value)` — record a completed boundary from the sandbox;
+ * resolves with the value AS RECORDED (JSON-normalized by the host), which is
+ * what `boundary()` returns, so the first run sees what every replay sees.
  * `boundary(key, fn)` — checkpoint sugar: hit → cached value without running
  * `fn`; miss → run `fn`, commit, return. Nestable: `key` joins the ambient
  * scope while `fn` runs, so inner keys concatenate with `/`. The scope is
@@ -82,6 +84,9 @@ export async function durableLookup(key) {
 
 export async function durableCommit(key, value) {
   await globalThis.${DURABLE_COMMIT_GLOBAL}(String(key), value);
+  // The host has admitted the value as JSON; normalize our own copy the same
+  // way (undefined dropped / null, -0 → 0) so this run sees what replays read.
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
 export function nextKey(name) {
@@ -96,9 +101,7 @@ export async function boundary(key, fn) {
   const r = await durableLookup(full);
   if (r && r.hit) return r.value;
   return await __di_als.run([...parent, String(key)], async () => {
-    const value = await fn();
-    await durableCommit(full, value);
-    return value;
+    return await durableCommit(full, await fn());
   });
 }
 `
