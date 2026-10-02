@@ -63,6 +63,22 @@ export function toJson(value: unknown): unknown {
   }
 }
 
+/**
+ * Deterministic JSON text of a JSON-clean value (one that passed {@link toJson}):
+ * object keys sorted recursively, so two values that differ only in key order
+ * compare equal. Used to compare a replayed call's args with the recorded ones.
+ * @param value a JSON-normalized value
+ */
+export function stableStringify(value: unknown): string {
+  if (Array.isArray(value))
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value) // a JSON-clean primitive: never undefined here
+}
+
 // The path is only ever needed for the error, so the walk keeps a cheap trail
 // of segments and renders it on failure.
 function pathOf(trail: readonly (string | number)[]): string {
@@ -92,7 +108,13 @@ function walk(value: unknown, trail: (string | number)[], ancestors: Set<object>
   if (Array.isArray(value)) {
     // Holes would copy as holes (not `null`), and a sparse `length` is unbounded
     // while the serialized form is tiny — refuse before touching the indices.
-    if (Object.keys(value).length !== value.length)
+    // Extra named properties (JSON would drop them) are refused too, under
+    // their own label.
+    const keys = Object.keys(value)
+    const indexKeysOnly = keys.every((k) => /^(?:0|[1-9]\d*)$/.test(k) && Number(k) < 2 ** 32 - 1)
+    if (!indexKeysOnly)
+      throw new NonJsonValueError(pathOf(trail), 'array with named properties')
+    if (keys.length !== value.length)
       throw new NonJsonValueError(pathOf(trail), 'sparse array')
     ancestors.add(value)
     const out: unknown[] = []

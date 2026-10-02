@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
@@ -787,7 +788,7 @@ describe('error plane', () => {
     expect(err.fields?.status).toBeUndefined() // own fields are not recorded, so none reach the run-level error
   }, 15_000)
 
-  test('a changed program just misses and runs — determinism is a contract, not a check', async () => {
+  test('a changed program at an UNRECORDED key just misses and runs — keys are not policed', async () => {
     let bs = 0
     const globals: PerExecuteGlobals = { a: () => 1, b: () => {
       bs += 1
@@ -799,12 +800,15 @@ describe('error plane', () => {
     if (r1.outcome !== 'completed')
       return
 
+    // 'b#0' is a fresh key: nothing to compare against, so it runs. The
+    // abandoned 'a#0' record lingers harmlessly (a recorded key is only checked
+    // when the program asks for it).
     const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('b', {})`, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
     expect(r2.result).toBe(2)
-    expect(bs).toBe(1) // the abandoned 'a#0' record lingers harmlessly
+    expect(bs).toBe(1)
     expect(Object.keys(r2.cache).sort()).toEqual(['a#0', 'b#0'])
   }, 15_000)
 })
@@ -938,6 +942,8 @@ describe('toJson (the JSON check + normalization)', () => {
     ['a sparse array', { list: [1, , 3] }, '$.list', 'sparse array'], // eslint-disable-line no-sparse-arrays -- the point of the case
     ['a huge sparse array (never iterated)', Object.assign([], { length: 2 ** 32 - 1 }), '$', 'sparse array'],
     ['an object with toJSON', { toJSON: () => 1 }, '$.toJSON', 'function'],
+    ['an array with named properties', Object.assign([1], { x: 2 }), '$', 'array with named properties'],
+    ['an array keyed at 2^32-1 (not an index)', Object.assign([1], { 4294967295: 2 }), '$', 'array with named properties'],
   ])('rejects %s with the path and what was found', (_label, value, path, found) => {
     expect(() => toJson(value)).toThrow(new NonJsonValueError(path, found))
   })
@@ -1173,6 +1179,26 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(Date.now() - started).toBeLessThan(2_000)
   }, 15_000)
 
+  test('calls queued behind a rejecting call do not run their globals (iso4 >= 0.6.2 drops them)', async () => {
+    let charges = 0
+    const globals: PerExecuteGlobals = {
+      bad: () => new Map(),
+      charge: () => {
+        charges += 1
+        return 'ok'
+      },
+    }
+    const code = `import { step } from 'tools'
+      const first = step('a', 'bad', {}) // the host rejects the run while handling this frame
+      const rest = [1, 2, 3].map((i) => step('k' + i, 'charge', {})) // sent in the same synchronous stretch
+      export default await Promise.all([first, ...rest])`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    expect(charges).toBe(0) // nothing ran after the rejection
+    expect(r.cache).toEqual({})
+  }, 15_000)
+
   test('an Error with a non-string message is recorded as text', async () => {
     const globals: PerExecuteGlobals = {
       boom: () => {
@@ -1265,6 +1291,284 @@ describe('prototype-named keys are plain cache entries', () => {
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     expect(seen).toEqual(['c']) // replay answered all three from the cache
+  }, 15_000)
+})
+
+describe('replay divergence (recorded key, different call)', () => {
+  // Two programs that differ only in the order their parallel calls are
+  // issued — what a completion-order-dependent program looks like across runs.
+  const inOrder = `import { call } from 'tools'
+    export default await Promise.all([call('echo', 'first'), call('echo', 'second')])`
+  const reordered = `import { call } from 'tools'
+    export default await Promise.all([call('echo', 'second'), call('echo', 'first')])`
+
+  test('reordered parallel calls diverge: echo#0 was recorded for other args', async () => {
+    let echoes = 0
+    const globals: PerExecuteGlobals = {
+      echo: (v) => {
+        echoes += 1
+        return v
+      },
+    }
+    const r1 = await runner.execute({ code: inOrder, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: reordered, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toEqual({
+      reason: 'divergence',
+      mismatch: 'args',
+      key: 'echo#0',
+      recorded: { name: 'echo', args: ['first'] },
+      attempted: { name: 'echo', args: ['second'] },
+      message: expect.stringContaining('replay divergence: at a recorded boundary the program asked for the same operation with different arguments'),
+    })
+    expect(r2.rejection.message).toContain('wrap nondeterministic inputs')
+    expect(r2.rejection.message).not.toContain('echo') // no program-written text in the message
+    expect(echoes).toBe(2) // nothing was dispatched on the diverging run
+    expect(r2.cache).toEqual(r1.cache) // the history is left as it was
+    expect(r2.run.status).toBe('aborted')
+  }, 15_000)
+
+  test('same key, different operation name', async () => {
+    const globals: PerExecuteGlobals = { a: () => 1, b: () => 2 }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'b', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ reason: 'divergence', mismatch: 'name', key: 'k', recorded: { name: 'a' }, attempted: { name: 'b' } })
+    expect(r2.rejection.message).toContain('asked for a different operation')
+  }, 15_000)
+
+  test('a waiting boundary is NOT re-dispatched when the resume asks with other args', async () => {
+    let approves = 0
+    const globals: PerExecuteGlobals = {
+      approve: () => {
+        approves += 1
+        throw new SuspendIsolate({})
+      },
+    }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'a' })`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('suspended')
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'b' })`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ mismatch: 'args', key: 'gate', recorded: { args: [{ subject: 'a' }] }, attempted: { args: [{ subject: 'b' }] } })
+    expect(approves).toBe(1) // the global was not consulted
+    expect(r2.cache.gate).toMatchObject({ status: 'waiting' }) // still waiting, untouched
+  }, 15_000)
+
+  test('a failed record is NOT re-thrown when the program asks with other args', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw new Error('nope')
+      },
+    }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 1) } catch {}; export default 'ok'`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 2) } catch {}; export default 'ok'`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.run.status).toBe('aborted') // the try/catch around the call did not help: the program never got to complete
+    expect(r2.rejection).toMatchObject({ mismatch: 'args', recorded: { args: [1] }, attempted: { args: [2] } })
+  }, 15_000)
+
+  test('a durable call at a checkpoint key diverges: the record holds no call', async () => {
+    const globals: PerExecuteGlobals = { load: () => 'from-global' }
+    const r1 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('k', () => 'from-body')`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toEqual({
+      reason: 'divergence',
+      mismatch: 'no-call',
+      key: 'k',
+      recorded: {},
+      attempted: { name: 'load', args: [{}] },
+      message: expect.stringContaining('the record holds no call to compare'),
+    })
+  }, 15_000)
+
+  test('reordered object keys in args are NOT a divergence; reordered array items are', async () => {
+    const globals: PerExecuteGlobals = { save: () => 'saved' }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [1, 2] } })`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const sameKeysReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { b: { x: [1, 2] }, a: 1 })`, cache: r1.cache, globals }).result
+    expect(sameKeysReordered.outcome).toBe('completed')
+
+    const arrayReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [2, 1] } })`, cache: r1.cache, globals }).result
+    expect(arrayReordered.outcome).toBe('rejected')
+  }, 15_000)
+
+  test('a sandbox try/catch cannot swallow a divergence; a parallel branch in flight is drained', async () => {
+    let slowRuns = 0
+    const globals: PerExecuteGlobals = {
+      a: () => 'a',
+      slow: async () => {
+        slowRuns += 1
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        return 'slow-result'
+      },
+    }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const code = `import { step } from 'tools'
+      const slow = step('slow', 'slow', {})
+      let out = 'not reached'
+      try { await step('k', 'a', 2) } catch (e) { out = 'caught: ' + e.message }
+      await slow
+      export default out`
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ reason: 'divergence', key: 'k' })
+    expect(r2.run.status).toBe('aborted') // the catch block never ran — a catchable throw would have let the program complete
+    expect(r2.cache.slow).toMatchObject({ status: 'completed', value: 'slow-result' }) // drained write kept
+    expect(slowRuns).toBe(1)
+  }, 15_000)
+
+  test('a global that edits its options in place does not rewrite the recorded args', async () => {
+    let sends = 0
+    const globals: PerExecuteGlobals = {
+      send: (opts) => {
+        sends += 1
+        ;(opts as { retries?: number }).retries ??= 3 // defaulting in place — common and harmless
+        return 'sent'
+      },
+    }
+    const code = `import { step } from 'tools'; export default await step('k', 'send', { to: 'a' })`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    expect(r1.cache.k).toMatchObject({ args: [{ to: 'a' }] }) // the record holds what the program passed
+
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('completed') // no false divergence
+    expect(sends).toBe(1)
+  }, 15_000)
+
+  test('a waiting global that edits its options can still be resumed', async () => {
+    let ready = false
+    const globals: PerExecuteGlobals = {
+      sleep: (o) => {
+        ;(o as { until?: number }).until ??= 123
+        if (!ready)
+          throw new SuspendIsolate({})
+        return 'woke'
+      },
+    }
+    const code = `import { step } from 'tools'; export default await step('nap', 'sleep', { ms: 5 })`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('suspended')
+    expect(r1.cache.nap).toEqual({ seq: 0, status: 'waiting', name: 'sleep', args: [{ ms: 5 }] })
+
+    ready = true
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toBe('woke')
+  }, 15_000)
+})
+
+describe('error reduction edge cases', () => {
+  test('an Error whose message getter throws is recorded with a fixed text; the run settles', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        const e = new Error('x')
+        Object.defineProperty(e, 'message', { get() {
+          throw new Error('getter boom')
+        } })
+        throw e
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = e.message }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toBe('unreadable error')
+    expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'unreadable error' } })
+  }, 15_000)
+
+  test('an Error from another realm is recorded as a failure, not rejected as non-JSON', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw runInNewContext('new TypeError("far away")')
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual(['TypeError', 'far away'])
+  }, 15_000)
+
+  test('a DOMException (fetch timeout / abort) is a catchable failed step, not a rejected run', async () => {
+    const globals: PerExecuteGlobals = {
+      slowFetch: () => {
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('slowFetch', {}) } catch (e) { out = [e.name, e.message] }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual(['TimeoutError', 'The operation was aborted due to timeout'])
+    expect(r.cache['slowFetch#0']).toMatchObject({ status: 'failed', error: { name: 'TimeoutError' } })
+  }, 15_000)
+
+  test('a thrown value with a throwing Symbol.toStringTag getter is still handled (no getter is read)', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
+        throw { code: 'DENY', get [Symbol.toStringTag]() {
+          throw new Error('tag boom')
+        } }
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = e.code }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toBe('DENY')
   }, 15_000)
 })
 

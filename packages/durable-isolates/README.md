@@ -21,6 +21,7 @@ pnpm add durable-isolates
 - **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
 - **JSON in, JSON out.** Every value crossing a boundary is checked and normalized to plain JSON, so a replay reads back exactly what the first run saw. Anything else ends the run with a message that says where and what.
+- **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
 
 ## Quick start
 
@@ -80,7 +81,7 @@ Retry and eviction are plain edits to this object: delete a `failed` record to r
 
 Everything that crosses a durable boundary must be plain JSON: `null`, booleans, finite numbers, strings, arrays and plain objects. That covers the arguments of a durable call, what a global returns or throws, and what a `boundary()` body returns or `durableCommit` stores. The cache is saved and read back as JSON, so a value JSON cannot carry would look one way on the first run and another way on replay. The kernel refuses such a value instead of storing an approximation.
 
-Rejected: `Date`, `Map`, `Set`, `RegExp`, bytes (`Uint8Array`, `ArrayBuffer`), `bigint`, `NaN` and `Infinity`, functions, symbols, class instances (including `Error` objects as values), sparse arrays (holes) and cyclic structures. Objects with a `toJSON` method are not special-cased: the method is a function and is rejected as such. Convert values before the boundary: a date to an ISO string, bytes to text or base64, a `Map` to an object. There is no depth limit; a value too deep to walk is rejected rather than crashing.
+Rejected: `Date`, `Map`, `Set`, `RegExp`, bytes (`Uint8Array`, `ArrayBuffer`), `bigint`, `NaN` and `Infinity`, functions, symbols, class instances (including `Error` objects as values), sparse arrays (holes), arrays with extra named properties, and cyclic structures. Objects with a `toJSON` method are not special-cased: the method is a function and is rejected as such. Convert values before the boundary: a date to an ISO string, bytes to text or base64, a `Map` to an object. There is no depth limit; a value too deep to walk is rejected rather than crashing.
 
 `undefined` follows JSON's own rules, and the kernel applies them already on the first run so every run sees the same value: a key with `undefined` is dropped from an object, `undefined` in an array becomes `null`, a bare `undefined` return stays `undefined`, and `-0` becomes `0`. Thrown `Error`s are stored as their `name` and `message` only.
 
@@ -113,6 +114,28 @@ import { NonJsonValueError, toJson } from 'durable-isolates'
 
 const input = toJson(untrusted) // throws NonJsonValueError('$.items[2].at', 'Date')
 ```
+
+## Replays must ask the same calls
+
+A durable call at a key that is already in the cache is answered from the record. Before that, the kernel checks that the program is asking for the same call the record holds: the same `name`, with the same `args`. Arguments are compared as stable JSON, so object key order does not matter, but array order does. If they differ, the run ends with `outcome: 'rejected'` and `rejection.reason === 'divergence'`. Nothing is answered, re-thrown or re-dispatched, and the history is left as it was.
+
+<!-- eslint-skip -->
+
+```ts
+if (r.outcome === 'rejected' && r.rejection.reason === 'divergence') {
+  r.rejection.mismatch // 'name' | 'args' | 'no-call'
+  r.rejection.key // 'echo#0'
+  r.rejection.recorded // { name: 'echo', args: ['first'] }
+  r.rejection.attempted // { name: 'echo', args: ['second'] }
+  r.rejection.message // '… wrap nondeterministic inputs such as time, random values or external state in boundary() …'
+}
+```
+
+This is how a nondeterministic program shows up: two parallel calls whose order depends on which finished first, a call whose arguments include `Date.now()` or a random id, a branch taken on data that changed between runs. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'no-call'` means the key holds a checkpoint (`boundary()` / `durableCommit`) or a record written by an older kernel, so there is no call to compare against.
+
+What is not checked: keys. A call at a key that is not in the cache simply runs, even if the program changed. Checkpoint keys are not compared either, since a checkpoint records a value, not a call.
+
+To recover a diverged instance, change the program or the inputs so the calls line up again and run the same `cache`, or evict records (delete by `seq` from the diverged key onwards) and let that part run again.
 
 ## Sandbox metrics and errors
 
