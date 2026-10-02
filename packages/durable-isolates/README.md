@@ -55,7 +55,7 @@ cache = r.cache // persist, then hand back next time
 
 ## The cache
 
-The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. The kernel matches by key only, never by position. Each record has a `status` and a `seq` (history order, for eviction and timelines).
+The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. The kernel matches by key only, never by position. Each record has a `status` and a `seq` (history order, for eviction and timelines).
 
 A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
 

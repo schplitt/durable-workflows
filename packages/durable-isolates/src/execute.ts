@@ -94,7 +94,13 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       registry.set(name, global)
   }
 
-  const cache: BoundaryCache = { ...params.cache }
+  // Null-prototype so EVERY key is a plain entry: on an ordinary object a key
+  // named `__proto__` would hit the prototype setter (never persisted, and the
+  // committed object would then answer every other key by inheritance), and
+  // `constructor` / `toString` would read inherited functions. `Object.assign`
+  // onto a null-prototype target defines own properties, so an own `__proto__`
+  // entry in the caller's cache is carried over as data.
+  const cache: BoundaryCache = Object.assign(Object.create(null) as BoundaryCache, params.cache)
   const pending: PendingOperation[] = []
   const inFlight = new Set<Promise<unknown>>()
   const controller = new AbortController()
@@ -251,18 +257,23 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     // the result is built — the IO is kept even though the isolate is gone.
     await Promise.allSettled([...inFlight])
 
+    // Hand back an ordinary object (spread defines own properties, so a
+    // `__proto__` entry stays data) — callers and stores never see the
+    // null-prototype working copy.
+    const grown: BoundaryCache = { ...cache }
+
     // A rejection wins over everything else this turn: the run is dead however
     // the isolate ended (normally aborted by us; completed only if the program
     // never awaited the violating call).
     if (rejection !== undefined)
-      return { outcome: 'rejected', rejection, cache, run: result }
+      return { outcome: 'rejected', rejection, cache: grown, run: result }
     // Suspension is detected by the ABORT — never by catching an in-sandbox
     // throw — so sandbox `try/catch` around a suspending call cannot swallow it.
     if (result.status === 'aborted')
-      return { outcome: 'suspended', pending, cache, run: result }
+      return { outcome: 'suspended', pending, cache: grown, run: result }
     if (result.status === 'completed')
-      return { outcome: 'completed', result: result.exports.default, cache, run: result }
-    return { outcome: 'failed', error: result.error, cache, run: result }
+      return { outcome: 'completed', result: result.exports.default, cache: grown, run: result }
+    return { outcome: 'failed', error: result.error, cache: grown, run: result }
   })()
 
   const suspend = (): Promise<ExecuteResult> => {

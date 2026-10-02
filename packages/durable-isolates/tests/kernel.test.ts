@@ -1189,6 +1189,85 @@ describe('JSON-only boundaries (rejected outcome)', () => {
   }, 15_000)
 })
 
+describe('prototype-named keys are plain cache entries', () => {
+  test('a boundary keyed "__proto__" is recorded, survives a JSON round trip, and runs once', async () => {
+    let charges = 0
+    const globals: PerExecuteGlobals = {
+      charge: () => {
+        charges += 1
+        return 'charged'
+      },
+    }
+    const code = `import { step } from 'tools'; export default await step('__proto__', 'charge', 42)`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(Object.getPrototypeOf(r1.cache)).toBe(Object.prototype) // an ordinary object comes back
+    expect(Object.keys(r1.cache)).toEqual(['__proto__'])
+    expect(JSON.stringify(r1.cache)).toContain('"__proto__":{"seq":0')
+
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toBe('charged')
+    expect(charges).toBe(1) // answered from the cache — the side effect did not repeat
+  }, 15_000)
+
+  test('a "__proto__" commit cannot forge answers for other keys', async () => {
+    let loads = 0
+    const globals: PerExecuteGlobals = {
+      load: () => {
+        loads += 1
+        return 'real'
+      },
+    }
+    const code = `import { durableCommit } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      await durableCommit('__proto__', { forged: { seq: 0, status: 'completed', value: 'forged' } })
+      export default await step('forged', 'load', {})`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toBe('real')
+    expect(loads).toBe(1)
+    expect(Object.keys(r.cache).sort()).toEqual(['__proto__', 'forged'])
+  }, 15_000)
+
+  test('"constructor" and "toString" keys are ordinary misses, then ordinary entries', async () => {
+    const seen: string[] = []
+    const globals: PerExecuteGlobals = {
+      echo: (v) => {
+        seen.push(String(v))
+        return v
+      },
+    }
+    const code = `import { step } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      const a = await step('constructor', 'echo', 'c')
+      const b = await boundary('toString', () => 'in-sandbox')
+      const c = await boundary('hasOwnProperty', () => 'h')
+      export default [a, b, c]`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toEqual(['c', 'in-sandbox', 'h'])
+    expect(r1.cache.constructor).toMatchObject({ seq: 0, status: 'completed', value: 'c' })
+    expect(r1.cache.toString).toMatchObject({ seq: 1, status: 'completed', value: 'in-sandbox' })
+
+    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('completed')
+    expect(seen).toEqual(['c']) // replay answered all three from the cache
+  }, 15_000)
+})
+
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(
