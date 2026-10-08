@@ -2,7 +2,7 @@ import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
-import { durableIsolates, KERNEL_BRIDGE_GLOBALS, NonJsonValueError, SuspendIsolate, toJson } from '../src'
+import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -100,11 +100,11 @@ describe('durable calls (key from the sandbox)', () => {
     expect(seen).toEqual([['p', 1], ['q', 2]])
   }, 15_000)
 
-  test('parallel leaf calls: keys form in source order, both settle', async () => {
+  test('parallel leaf calls: keys form in source order even when the second completes first', async () => {
     const globals: PerExecuteGlobals = {
       echo: async (v) => {
         await new Promise((resolve) => {
-          setTimeout(resolve, 20)
+          setTimeout(resolve, v === 'first' ? 40 : 5) // the second call finishes first
         })
         return v
       },
@@ -634,7 +634,7 @@ describe('external suspension (handle.suspend())', () => {
     expect(r2).toBe(r1)
   }, 15_000)
 
-  test('a run suspended on approval is inert — suspend() has nothing to drain', async () => {
+  test('a run suspended on approval is inert — suspend() has nothing to drain and resolves the same result', async () => {
     const globals: PerExecuteGlobals = {
       gate: () => {
         throw new SuspendIsolate({})
@@ -642,12 +642,14 @@ describe('external suspension (handle.suspend())', () => {
     }
     const code = `import { call } from 'tools'; export default await call('gate', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const handle = runner.execute({ code, cache: {}, globals })
+    const r1 = await handle.result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
     expect(r1.pending).toHaveLength(1)
     expect(r1.cache['gate#0']?.status).toBe('waiting')
+    expect(await handle.suspend()).toBe(r1) // nothing in flight; the settled result comes back
   }, 15_000)
 })
 
@@ -660,18 +662,18 @@ describe('error plane', () => {
         throw new Error('kaboom')
       },
     }
-    const code = `import { call } from 'tools'; export default await call('boom', {})`
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
+      export default out`
 
     const r1 = await runner.execute({ code, cache: {}, globals }).result
-    expect(r1.outcome).toBe('failed')
-    if (r1.outcome !== 'failed')
-      return
-    expect(r1.error.message).toContain('kaboom')
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['Error', 'kaboom'])
     expect(booms).toBe(1)
 
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
-    expect(r2.outcome).toBe('failed')
-    expect(booms).toBe(1) // re-thrown from the cache
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['Error', 'kaboom']) // the SAME error, re-thrown from the cache
+    expect(booms).toBe(1)
   }, 15_000)
 
   test('retry is cache surgery: delete the failed entry to re-execute that boundary', async () => {
@@ -768,6 +770,7 @@ describe('error plane', () => {
     if (r.outcome !== 'completed')
       return
     expect(r.result).toEqual({ code: 'DENY', reason: 'nope' })
+    expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { code: 'DENY', reason: 'nope' } })
   }, 15_000)
 
   test('an uncaught host throw surfaces as a structured run-level failure', async () => {
@@ -881,7 +884,7 @@ describe('e2e: @iso4/fetch byte bodies', () => {
         httpsOnly: true,
         routes: [{ path: '/**' }],
         middleware: async () => {
-          const bytes = new TextEncoder().encode('hello')
+          const bytes = new TextEncoder().encode('hi')
           return { status: 200, headers: { 'content-type': 'text/plain' }, body: decode ? new TextDecoder().decode(bytes) : bytes }
         },
       },
@@ -890,102 +893,163 @@ describe('e2e: @iso4/fetch byte bodies', () => {
   const code = `import { call } from 'tools'
     export default await call('fetch', 'https://example.test/file').then((r) => r.body)`
 
-  test('a raw byte body is rejected — the kernel does not store binary', async () => {
+  test('a raw byte body is stored the way JSON writes a Uint8Array — an index object', async () => {
     const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(false) }).result
-    expect(r.outcome).toBe('rejected')
-    if (r.outcome !== 'rejected')
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
       return
-    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'result', name: 'fetch', path: '$.body', found: 'Uint8Array' })
+    expect(r.result).toEqual({ 0: 104, 1: 105 }) // not bytes any more: decode in the middleware instead
   }, 20_000)
 
-  test('converting the body to text in the middleware is the fix', async () => {
+  test('converting the body to text in the middleware keeps it usable', async () => {
     const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(true) }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
-    expect(r.result).toBe('hello')
+    expect(r.result).toBe('hi')
   }, 20_000)
 })
 
-describe('toJson (the JSON check + normalization)', () => {
-  test('accepts JSON and returns a normalized copy; undefined follows JSON rules', () => {
-    const value = { a: 1, b: 'two', c: [true, null, undefined], d: { e: undefined, f: -0.5 }, g: Object.create(null) }
-    expect(toJson(value)).toEqual({ a: 1, b: 'two', c: [true, null, null], d: { f: -0.5 }, g: {} })
-    expect(toJson(undefined)).toBeUndefined()
-    expect(toJson(null)).toBeNull()
-    expect(toJson('s')).toBe('s')
-  })
+describe('values cross as JSON (converted like JSON.stringify, same on every run)', () => {
+  test('a host result is read back from JSON: Date → ISO string, Map → {}, NaN → null, class → fields, function dropped', async () => {
+    class Money {
+      cents: number
+      constructor(cents: number) {
+        this.cents = cents
+      }
 
-  test('shared references are fine; cycles are not', () => {
-    const shared = { x: 1 }
-    expect(toJson({ a: shared, b: shared })).toEqual({ a: { x: 1 }, b: { x: 1 } })
-    const cyclic: Record<string, unknown> = { name: 'loop' }
-    cyclic.self = cyclic
-    expect(() => toJson(cyclic)).toThrow(new NonJsonValueError('$.self', 'circular reference'))
-  })
-
-  test.each([
-    ['a Date', { at: new Date(0) }, '$.at', 'Date'],
-    ['a Map', new Map(), '$', 'Map'],
-    ['a Set in an array', [new Set()], '$[0]', 'Set'],
-    ['a RegExp', { re: /x/ }, '$.re', 'RegExp'],
-    ['bytes', { body: new Uint8Array(2) }, '$.body', 'Uint8Array'],
-    ['a bigint', [1, 2n], '$[1]', 'bigint'],
-    ['NaN', { n: Number.NaN }, '$.n', 'NaN'],
-    ['Infinity', [Number.POSITIVE_INFINITY], '$[0]', 'Infinity'],
-    ['-Infinity', Number.NEGATIVE_INFINITY, '$', '-Infinity'],
-    ['a function', { fn: () => 1 }, '$.fn', 'function'],
-    ['a symbol', [Symbol('s')], '$[0]', 'symbol'],
-    ['an Error', new TypeError('x'), '$', 'TypeError'],
-    ['a class instance, deep', { items: [0, 1, { at: new (class Money {})() }] }, '$.items[2].at', 'Money'],
-    ['a non-identifier key', { 'odd key': new Date(0) }, '$["odd key"]', 'Date'],
-    ['a sparse array', { list: [1, , 3] }, '$.list', 'sparse array'], // eslint-disable-line no-sparse-arrays -- the point of the case
-    ['a huge sparse array (never iterated)', Object.assign([], { length: 2 ** 32 - 1 }), '$', 'sparse array'],
-    ['an object with toJSON', { toJSON: () => 1 }, '$.toJSON', 'function'],
-    ['an array with named properties', Object.assign([1], { x: 2 }), '$', 'array with named properties'],
-    ['an array keyed at 2^32-1 (not an index)', Object.assign([1], { 4294967295: 2 }), '$', 'array with named properties'],
-  ])('rejects %s with the path and what was found', (_label, value, path, found) => {
-    expect(() => toJson(value)).toThrow(new NonJsonValueError(path, found))
-  })
-
-  test('-0 becomes 0, as JSON does', () => {
-    expect(Object.is(toJson(-0), 0)).toBe(true)
-    expect(Object.is((toJson([-0]) as number[])[0], 0)).toBe(true)
-  })
-
-  test('an own __proto__ key stays an own key and never re-points the copy', () => {
-    const out = toJson(JSON.parse('{"__proto__":{"isAdmin":true},"a":1}')) as Record<string, unknown>
-    expect(Object.keys(out)).toEqual(['__proto__', 'a'])
-    expect(Object.getPrototypeOf(out)).toBe(Object.prototype)
-    expect((out as { isAdmin?: unknown }).isAdmin).toBeUndefined()
-    expect(JSON.stringify(out)).toBe('{"__proto__":{"isAdmin":true},"a":1}')
-  })
-
-  test('a throwing getter and a value too deep to walk are reported, not thrown through', () => {
-    const trap = { items: [{ get at() {
-      throw new Error('getter boom')
-    } }] }
-    expect(() => toJson(trap)).toThrow(new NonJsonValueError('$.items[0].at', 'unreadable value'))
-
-    let deep: unknown = 'leaf'
-    for (let i = 0; i < 100_000; i++)
-      deep = { d: deep }
-    let caught: unknown
-    try {
-      toJson(deep)
-    } catch (e) {
-      caught = e
+      toJSON() {
+        return { amount: this.cents / 100 }
+      }
     }
-    expect(caught).toBeInstanceOf(NonJsonValueError)
-    expect((caught as NonJsonValueError).found).toBe('nesting too deep to walk')
-    expect((caught as NonJsonValueError).path.startsWith('$.d.d.d')).toBe(true)
-  })
+    const globals: PerExecuteGlobals = {
+      load: () => ({ at: new Date(0), m: new Map([['k', 1]]), n: Number.NaN, money: new Money(500), fn: () => 1, bytes: new Uint8Array([1]) }),
+    }
+    const code = `import { call } from 'tools'; export default await call('load', {})`
+    const expected = { at: '1970-01-01T00:00:00.000Z', m: {}, n: null, money: { amount: 5 }, bytes: { 0: 1 } }
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toEqual(expected) // the first run already sees the JSON shape
+    expect(r1.cache['load#0']).toMatchObject({ value: expected })
+
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual(expected) // and so does every replay
+  }, 15_000)
+
+  test('sandbox args are written as JSON on the real object: toJSON honoured, class flattened, getter read once', async () => {
+    const seen: unknown[] = []
+    const globals: PerExecuteGlobals = {
+      save: (...args) => {
+        seen.push(args)
+        return 'saved'
+      },
+    }
+    const code = `import { call } from 'tools'
+      class Req { constructor() { this.id = 1 } toJSON() { return { id: 'req-1' } } }
+      let reads = 0
+      const opts = { get n() { return ++reads }, when: new Date(0), cb() {}, list: [undefined, Symbol('s')] }
+      const out = await call('save', new Req(), opts)
+      export default { out, reads }`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual({ out: 'saved', reads: 1 })
+    const args = [{ id: 'req-1' }, { n: 1, when: '1970-01-01T00:00:00.000Z', list: [null, null] }]
+    expect(seen).toEqual([args]) // the global gets the JSON reading
+    expect(r.cache['save#0']).toMatchObject({ args }) // and so does the record
+  }, 15_000)
+
+  test('a boundary() body value is read back from JSON before the program sees it', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      class Money { constructor(c) { this.cents = c } toJSON() { return { amount: this.cents / 100 } } }
+      let reads = 0
+      const v = await boundary('m', () => ({ money: new Money(500), get a() { return ++reads }, gone: undefined, list: [undefined, -0] }))
+      export default { v, reads }`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    const expected = { money: { amount: 5 }, a: 1, list: [null, 0] }
+    expect(r.result).toEqual({ v: expected, reads: 1 })
+    expect(r.cache.m).toMatchObject({ value: expected })
+    expect(Object.is((r.cache.m as { value: { list: number[] } }).value.list[1], 0)).toBe(true) // -0 → 0
+  }, 15_000)
+
+  test('a bare undefined is an absent value, on the first run and after a store round trip', async () => {
+    const globals: PerExecuteGlobals = { nothing: () => undefined }
+    const code = `import { call } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      export default { a: await call('nothing', {}), b: await boundary('b', () => undefined) }`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toEqual({ a: undefined, b: undefined })
+    expect(r1.cache.b).toEqual({ seq: 1, status: 'completed' })
+
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual({ a: undefined, b: undefined })
+  }, 15_000)
+
+  test('an own __proto__ key in a sandbox value reaches the global as data, not as a prototype', async () => {
+    let inside: unknown
+    const globals: PerExecuteGlobals = {
+      inspect: (o) => {
+        inside = { keys: Object.keys(o as object), isAdmin: (o as { isAdmin?: unknown }).isAdmin }
+        return 'ok'
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('inspect', JSON.parse('{"__proto__":{"isAdmin":true},"a":1}'))`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(inside).toEqual({ keys: ['__proto__', 'a'], isAdmin: undefined })
+  }, 15_000)
+
+  test('lossy host results are recorded as JSON reads them, identically on replay: Error → {}, Response → {}, -0 → 0', async () => {
+    const globals: PerExecuteGlobals = {
+      load: () => ({ err: new Error('boom'), res: new Response('hi'), zero: -0, proto: JSON.parse('{"__proto__":{"x":1},"y":2}') }),
+    }
+    const code = `import { call } from 'tools'; export default await call('load', {})`
+    const expected = { err: {}, res: {}, zero: 0, proto: { ['__proto__']: { x: 1 }, y: 2 } }
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toEqual(expected)
+    expect(Object.keys((r1.result as { proto: object }).proto)).toEqual(['__proto__', 'y'])
+    expect(Object.is((r1.result as { zero: number }).zero, 0)).toBe(true)
+
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual(expected)
+    expect(Object.keys((r2.result as { proto: object }).proto)).toEqual(['__proto__', 'y'])
+  }, 15_000)
 })
 
-describe('JSON-only boundaries (rejected outcome)', () => {
-  test('a global returning a non-JSON value rejects the run; nothing is recorded at the key', async () => {
-    const globals: PerExecuteGlobals = { now: () => ({ items: [0, 1, { at: new Date(0) }] }) }
-    const code = `import { call } from 'tools'; export default await call('now', {})`
+describe('what JSON refuses rejects the run (bigint, cycles)', () => {
+  test('a global returning a bigint rejects the run; nothing is recorded at the key', async () => {
+    const globals: PerExecuteGlobals = { count: () => ({ items: [0, 1, { total: 10n }] }) }
+    const code = `import { call } from 'tools'; export default await call('count', {})`
 
     const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('rejected')
@@ -994,18 +1058,17 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(r.rejection).toEqual({
       reason: 'non-json',
       source: 'result',
-      key: 'now#0',
-      name: 'now',
-      path: '$.items[2].at',
-      found: 'Date',
-      message: expect.stringContaining('non-JSON value in what a global returned: Date at $.items[2].at'),
+      key: 'count#0',
+      name: 'count',
+      detail: expect.stringContaining('BigInt'),
+      message: expect.stringContaining('a value in what a global returned cannot be written as JSON'),
     })
-    expect(r.rejection.message).toContain('Only JSON values')
+    expect(r.rejection.message).toContain('no bigint, no circular structure')
     expect(r.cache).toEqual({}) // not recorded — fix the global and run the same cache again
     expect(r.run.status).toBe('aborted')
   }, 15_000)
 
-  test('a non-JSON argument from the sandbox rejects the run before any lookup', async () => {
+  test('a cyclic argument from the sandbox rejects the run before any lookup; the global never runs', async () => {
     let calls = 0
     const globals: PerExecuteGlobals = {
       save: () => {
@@ -1013,23 +1076,27 @@ describe('JSON-only boundaries (rejected outcome)', () => {
         return 'ok'
       },
     }
-    const code = `import { call } from 'tools'; export default await call('save', { when: new Date(0) })`
+    const code = `import { call } from 'tools'
+      const o = { name: 'loop' }; o.self = o
+      export default await call('save', o)`
 
     const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
-    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'args', key: 'save#0', name: 'save', path: '$[0].when', found: 'Date' })
-    expect(r.rejection.message).toContain('non-JSON value in an argument of a durable call: Date at $[0].when')
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'args', key: 'save#0', name: 'save', detail: expect.stringContaining('circular') })
+    expect(r.rejection.message).toContain('a value in an argument of a durable call cannot be written as JSON')
     expect(r.rejection.message).not.toContain('save') // no program-written text in the message
-    expect(calls).toBe(0) // the global never ran
+    expect(r.rejection.message).not.toContain('self')
+    expect(calls).toBe(0)
     expect(r.cache).toEqual({})
   }, 15_000)
 
-  test('a global throwing a non-Error, non-JSON value rejects the run', async () => {
+  test('a global throwing a non-Error value JSON refuses rejects the run', async () => {
     const globals: PerExecuteGlobals = {
       boom: () => {
-        throw new Map([['code', 'DENY']])
+        // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
+        throw { code: 1n }
       },
     }
     const code = `import { call } from 'tools'; export default await call('boom', {})`
@@ -1038,11 +1105,11 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
-    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'error', key: 'boom#0', name: 'boom', path: '$', found: 'Map' })
-    expect(r.rejection.message).toContain('non-JSON value in what a global threw: Map at $')
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'error', key: 'boom#0', name: 'boom' })
+    expect(r.rejection.message).toContain('in what a global threw')
   }, 15_000)
 
-  test('a boundary() body returning a non-JSON value rejects the run at the commit', async () => {
+  test('a boundary() body returning a bigint rejects the run at the commit', async () => {
     const code = `import { boundary } from 'durable-isolates:internal'
       export default await boundary('total', async () => ({ amount: 10n }))`
 
@@ -1054,52 +1121,25 @@ describe('JSON-only boundaries (rejected outcome)', () => {
       reason: 'non-json',
       source: 'commit',
       key: 'total',
-      path: '$.amount',
-      found: 'bigint',
-      message: expect.stringContaining('non-JSON value in a committed value: bigint at $.amount'),
+      detail: expect.stringContaining('BigInt'),
+      message: expect.stringContaining('a value in a committed value cannot be written as JSON'),
     })
     expect(r.cache).toEqual({})
   }, 15_000)
 
-  test('values are JSON-normalized on the FIRST run: undefined → dropped / null, same as replay', async () => {
-    const globals: PerExecuteGlobals = { load: () => [1, undefined, { a: undefined, b: 2 }] }
-    const code = `import { call } from 'tools'
-      import { boundary } from 'durable-isolates:internal'
-      const fromGlobal = await call('load', {})
-      const fromBody = await boundary('body', () => ({ list: [undefined, 'x'], gone: undefined }))
-      export default { fromGlobal, fromBody, nothing: await boundary('nothing', () => undefined) }`
-
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
-    expect(r1.outcome).toBe('completed')
-    if (r1.outcome !== 'completed')
-      return
-    const expected = { fromGlobal: [1, null, { b: 2 }], fromBody: { list: [null, 'x'] }, nothing: undefined }
-    expect(r1.result).toEqual(expected) // first run already sees the JSON shape
-    expect(r1.cache['load#0']).toMatchObject({ value: [1, null, { b: 2 }] })
-    expect(r1.cache.body).toMatchObject({ value: { list: [null, 'x'] } })
-    expect(r1.cache.nothing).toEqual({ seq: 2, status: 'completed' }) // a bare undefined is an absent value
-
-    // A store round trip changes nothing: the replay reads back the same values.
-    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
-    expect(r2.outcome).toBe('completed')
-    if (r2.outcome !== 'completed')
-      return
-    expect(r2.result).toEqual(expected)
-  }, 15_000)
-
   test('a sandbox try/catch around the violating call cannot swallow the rejection', async () => {
-    const globals: PerExecuteGlobals = { now: () => new Date(0) }
+    const globals: PerExecuteGlobals = { big: () => 1n }
     const code = `import { call } from 'tools'
       let out = 'not reached'
-      try { await call('now', {}) } catch (e) { out = 'caught: ' + e.message }
+      try { await call('big', {}) } catch (e) { out = 'caught: ' + e.message }
       export default out`
 
     const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
-    expect(r.rejection).toMatchObject({ source: 'result', key: 'now#0', found: 'Date' })
+    expect(r.run.status).toBe('aborted') // the catch block never ran
+    expect(r.rejection).toMatchObject({ source: 'result', key: 'big#0' })
   }, 15_000)
 
   test('a parallel branch in flight at rejection is drained and kept; the first violation wins', async () => {
@@ -1112,8 +1152,18 @@ describe('JSON-only boundaries (rejected outcome)', () => {
         })
         return 'io-result'
       },
-      bad: () => new Map(),
-      alsoBad: () => new Set(),
+      bad: async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10)
+        })
+        return 1n
+      },
+      alsoBad: async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 30) // in flight when `bad` rejects the run — its own violation is dropped
+        })
+        return 2n
+      },
     }
     const code = `import { call } from 'tools'
       export default await Promise.all([call('slow', {}), call('bad', {}), call('alsoBad', {})])`
@@ -1122,7 +1172,7 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(r1.outcome).toBe('rejected')
     if (r1.outcome !== 'rejected')
       return
-    expect(r1.rejection).toMatchObject({ key: 'bad#0', found: 'Map' })
+    expect(r1.rejection).toMatchObject({ key: 'bad#0' })
     expect(r1.cache['slow#0']).toMatchObject({ status: 'completed', value: 'io-result' }) // drained write kept
     expect(r1.cache['bad#0']).toBeUndefined()
     expect(r1.cache['alsoBad#0']).toBeUndefined()
@@ -1143,16 +1193,16 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     const r1 = await runner.execute({ code: first, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const changed = `import { step } from 'tools'; export default await step('k', 'p', new Date(0))`
+    const changed = `import { step } from 'tools'; export default await step('k', 'p', 1n)`
     const r2 = await runner.execute({ code: changed, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
-    expect(r2.rejection).toMatchObject({ source: 'args', key: 'k', path: '$[0]', found: 'Date' })
+    expect(r2.rejection).toMatchObject({ source: 'args', key: 'k' })
   }, 15_000)
 
   test('a program that never awaits the violating call is still rejected', async () => {
-    const globals: PerExecuteGlobals = { bad: () => new Map() }
+    const globals: PerExecuteGlobals = { bad: () => 1n }
     const code = `import { call } from 'tools'
       call('bad', {}) // fire and forget
       export default 'done'`
@@ -1161,28 +1211,13 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
-    expect(r.rejection).toMatchObject({ source: 'result', key: 'bad#0', found: 'Map' })
-  }, 15_000)
-
-  test('a sparse array from the sandbox is rejected without being iterated', async () => {
-    const globals: PerExecuteGlobals = { echo: (v) => v }
-    const code = `import { call } from 'tools'
-      const a = []; a.length = 2 ** 32 - 1
-      export default await call('echo', a)`
-
-    const started = Date.now()
-    const r = await runner.execute({ code, cache: {}, globals }).result
-    expect(r.outcome).toBe('rejected')
-    if (r.outcome !== 'rejected')
-      return
-    expect(r.rejection).toMatchObject({ source: 'args', path: '$[0]', found: 'sparse array' })
-    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(r.rejection).toMatchObject({ source: 'result', key: 'bad#0' })
   }, 15_000)
 
   test('calls queued behind a rejecting call do not run their globals (iso4 >= 0.6.2 drops them)', async () => {
     let charges = 0
     const globals: PerExecuteGlobals = {
-      bad: () => new Map(),
+      bad: () => 1n,
       charge: () => {
         charges += 1
         return 'ok'
@@ -1199,6 +1234,17 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     expect(r.cache).toEqual({})
   }, 15_000)
 
+  test('a program calling the commit bridge directly with non-text is rejected (the trust boundary holds)', async () => {
+    const code = `globalThis.__di_commit('k', 123); export default 'done'`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'commit', key: 'k', detail: 'not JSON text' })
+    expect(r.cache).toEqual({})
+  }, 15_000)
+
   test('an Error with a non-string message is recorded as text', async () => {
     const globals: PerExecuteGlobals = {
       boom: () => {
@@ -1212,6 +1258,106 @@ describe('JSON-only boundaries (rejected outcome)', () => {
     const r = await runner.execute({ code, cache: {}, globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { name: 'Error', message: '[object Object]' } })
+  }, 15_000)
+
+  test('a host toJSON or getter that throws rejects the run with its message as detail', async () => {
+    const globals: PerExecuteGlobals = { load: () => ({ toJSON() {
+      throw new Error('nope')
+    } }) }
+    const r = await runner.execute({ code: `import { call } from 'tools'; export default await call('load', {})`, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'result', detail: 'nope' })
+  }, 15_000)
+
+  test('a sandbox toJSON that throws rejects the run too; the message says nothing about the value', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      export default await boundary('k', () => ({ toJSON() { throw new Error('secret-ish text') } }))`
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'commit', key: 'k', detail: 'secret-ish text' })
+    expect(r.rejection.message).not.toContain('secret-ish')
+  }, 15_000)
+
+  test('a serializer complaint that cannot be read falls back to a fixed detail; a long one is cut', async () => {
+    const globals: PerExecuteGlobals = {
+      weird: () => ({ toJSON() {
+        throw Object.create(null) // String() of this throws
+      } }),
+      loud: () => ({ toJSON() {
+        throw new Error('x'.repeat(5000))
+      } }),
+    }
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('weird', {})`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('rejected')
+    if (r1.outcome !== 'rejected')
+      return
+    expect(r1.rejection).toMatchObject({ source: 'result', detail: 'unserializable value' })
+
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('loud', {})`, cache: {}, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect((r2.rejection as { detail: string }).detail.length).toBe(1024)
+  }, 15_000)
+
+  test('a program calling the call bridge directly with non-array args is rejected', async () => {
+    const globals: PerExecuteGlobals = { e: () => 'ran' }
+    const code = `globalThis.__di_call('k', 'e', '{"a":1}'); export default 'done'`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'args', key: 'k', detail: 'args are not a JSON array' })
+    expect(r.cache).toEqual({})
+  }, 15_000)
+
+  test('the shim uses captured JSON intrinsics: a program patching JSON.stringify cannot change what crosses', async () => {
+    const seen: unknown[] = []
+    const globals: PerExecuteGlobals = {
+      save: (...args) => {
+        seen.push(args)
+        return 'ok'
+      },
+    }
+    // iso4 keeps globalThis between runs on a warm instance, so the patch is
+    // undone before the program ends — otherwise it would poison later runs.
+    const code = `import { call } from 'tools'
+      const [origStringify, origParse] = [JSON.stringify, JSON.parse]
+      JSON.stringify = () => '[{"evil":1}]'
+      JSON.parse = () => 'evil'
+      let out
+      try {
+        out = await call('save', { real: true })
+      } finally {
+        JSON.stringify = origStringify
+        JSON.parse = origParse
+      }
+      export default out`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(seen).toEqual([[{ real: true }]])
+  }, 15_000)
+
+  test('a thrown symbol has no JSON reading and is recorded with a fixed shape', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw Symbol('s')
+      },
+    }
+    const code = `import { call } from 'tools'
+      let out
+      try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
+      export default out`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toEqual(['Error', 'non-JSON throw'])
+    expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'non-JSON throw' } })
   }, 15_000)
 })
 
@@ -1572,6 +1718,386 @@ describe('error reduction edge cases', () => {
   }, 15_000)
 })
 
+describe('pinned edge cases', () => {
+  test('a suspension the program never awaited is still reported: outcome suspended, pending filled', async () => {
+    const globals: PerExecuteGlobals = {
+      gate: () => {
+        throw new SuspendIsolate({ need: 'approval' })
+      },
+    }
+    const code = `import { step } from 'tools'
+      step('g', 'gate', {}) // fire and forget
+      export default 'done'`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('suspended')
+    if (r.outcome !== 'suspended')
+      return
+    expect(r.pending).toEqual([{ id: 'g', name: 'gate', payload: { need: 'approval' } }])
+    expect(r.cache.g).toMatchObject({ status: 'waiting' })
+    expect(r.run.status).toBe('completed') // iso4's own arm is passed through
+  }, 15_000)
+
+  test('two parallel suspensions give two pending entries', async () => {
+    const globals: PerExecuteGlobals = {
+      gate: async (who) => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10)
+        })
+        throw new SuspendIsolate({ who })
+      },
+    }
+    const code = `import { step } from 'tools'
+      export default await Promise.all([step('g1', 'gate', 'a'), step('g2', 'gate', 'b')])`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('suspended')
+    if (r.outcome !== 'suspended')
+      return
+    expect(r.pending.map((p) => p.id).sort()).toEqual(['g1', 'g2'])
+    expect(r.cache.g1).toMatchObject({ status: 'waiting', seq: 0 })
+    expect(r.cache.g2).toMatchObject({ status: 'waiting', seq: 1 })
+  }, 15_000)
+
+  test('args survive a store round trip without a false divergence: Date, undefined, -0, NaN', async () => {
+    let saves = 0
+    const globals: PerExecuteGlobals = {
+      save: () => {
+        saves += 1
+        return 'saved'
+      },
+    }
+    const code = `import { step } from 'tools'
+      export default await step('k', 'save', { d: new Date(0), u: undefined, z: -0, l: [undefined], n: NaN })`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    expect(r1.cache.k).toMatchObject({ args: [{ d: '1970-01-01T00:00:00.000Z', z: 0, l: [null], n: null }] })
+
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    expect(saves).toBe(1)
+  }, 15_000)
+
+  test('an own __proto__ key inside recorded args takes part in the compare', async () => {
+    const globals: PerExecuteGlobals = { save: () => 'saved' }
+    const same = `import { step } from 'tools'; export default await step('k', 'save', JSON.parse('{"__proto__":{"x":1},"a":1}'))`
+    const changed = `import { step } from 'tools'; export default await step('k', 'save', JSON.parse('{"__proto__":{"x":2},"a":1}'))`
+
+    const r1 = await runner.execute({ code: same, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    expect((await runner.execute({ code: same, cache: roundTripped, globals }).result).outcome).toBe('completed')
+
+    const r3 = await runner.execute({ code: changed, cache: roundTripped, globals }).result
+    expect(r3.outcome).toBe('rejected')
+    if (r3.outcome !== 'rejected')
+      return
+    expect(r3.rejection).toMatchObject({ reason: 'divergence', mismatch: 'args' })
+  }, 15_000)
+
+  test('seq continues after the highest seq in the input cache; a rejected dispatch leaves no gap', async () => {
+    const globals: PerExecuteGlobals = { a: () => 'a', b: () => 1n }
+    const seeded: BoundaryCache = { old: { seq: 5, status: 'completed', value: 'x' } }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('n', 'a', {})`, cache: seeded, globals }).result
+    expect(r1.outcome).toBe('completed')
+    expect(r1.cache.n).toMatchObject({ seq: 6 })
+
+    const code = `import { step } from 'tools'
+      const a = await step('a', 'a', {})
+      export default await step('b', 'b', {})`
+    const r2 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    expect(r2.cache).toEqual({ a: { seq: 0, status: 'completed', name: 'a', args: [{}], value: 'a' } })
+    const r3 = await runner.execute({ code, cache: r2.cache, globals: { ...globals, b: () => 'b' } }).result
+    expect(r3.outcome).toBe('completed')
+    expect(r3.cache.b).toMatchObject({ seq: 1 }) // the rejected dispatch consumed nothing
+  }, 15_000)
+
+  test('a nested boundary commits its outer record after the inner calls', async () => {
+    const globals: PerExecuteGlobals = { probe: () => 1 }
+    const code = `import { boundary, durableCall, nextKey } from 'durable-isolates:internal'
+      export default await boundary('outer', async () => (await durableCall(nextKey('probe'), 'probe', {})) + 1)`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache['outer/probe#0']).toMatchObject({ seq: 0 })
+    expect(r.cache.outer).toMatchObject({ seq: 1, value: 2 })
+  }, 15_000)
+
+  test('default limits: a replay-heavy run makes far more than iso4\'s 10 bridge calls', async () => {
+    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const code = `import { call } from 'tools'
+      const out = []
+      for (let i = 0; i < 30; i++) out.push(await call('ping', i))
+      export default out.length`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toBe(30)
+  }, 15_000)
+
+  test('prepare limits apply to every run; execute limits override them', async () => {
+    const tight = await host.prepare({ modules: { tools: { shim: SHIM } }, limits: { maxBridgeCalls: 3 } })
+    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const code = `import { call } from 'tools'
+      for (let i = 0; i < 5; i++) await call('ping', i)
+      export default 'ok'`
+
+    const r1 = await tight.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('failed')
+    if (r1.outcome !== 'failed')
+      return
+    expect(r1.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+
+    const r2 = await tight.execute({ code, cache: {}, globals, limits: { maxBridgeCalls: 100 } }).result
+    expect(r2.outcome).toBe('completed')
+    await tight.dispose()
+  }, 20_000)
+
+  test('malformed or non-text payloads on either bridge are rejected (program calling the bridge directly)', async () => {
+    const globals: PerExecuteGlobals = { e: () => 'ran' }
+    for (const [code, source, detail] of [
+      [`globalThis.__di_call('k', 'e', '[1'); export default 1`, 'args', 'malformed JSON text'],
+      [`globalThis.__di_commit('k', '{x'); export default 1`, 'commit', 'malformed JSON text'],
+      [`globalThis.__di_call('k', 'e', 5); export default 1`, 'args', 'not JSON text'],
+    ] as const) {
+      const r = await runner.execute({ code, cache: {}, globals }).result
+      expect(r.outcome).toBe('rejected')
+      if (r.outcome !== 'rejected')
+        return
+      expect(r.rejection).toMatchObject({ reason: 'non-json', source, key: 'k', detail })
+      expect(r.cache).toEqual({})
+    }
+  }, 20_000)
+
+  test('sandbox-side serializer complaints: a plain throw is its text, an unreadable one a fixed text, a long one is cut', async () => {
+    const run = (thrown: string) => runner.execute({
+      code: `import { boundary } from 'durable-isolates:internal'
+        export default await boundary('k', () => ({ toJSON() { throw ${thrown} } }))`,
+      cache: {},
+      globals: {},
+    }).result
+
+    const plain = await run(`'plain'`)
+    expect(plain.outcome === 'rejected' && plain.rejection).toMatchObject({ source: 'commit', detail: 'plain' })
+    const unreadable = await run(`Object.create(null)`)
+    expect(unreadable.outcome === 'rejected' && unreadable.rejection).toMatchObject({ detail: 'unserializable value' })
+    const loud = await run(`new Error('x'.repeat(5000))`)
+    expect(loud.outcome === 'rejected' && (loud.rejection as { detail: string }).detail.length).toBe(1024)
+  }, 20_000)
+
+  test('nothing is recorded or changed at the violating key, for every rejection kind', async () => {
+    const globals: PerExecuteGlobals = {
+      a: () => 'a',
+      boom: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
+        throw { code: 1n }
+      },
+    }
+    // error source
+    const r0 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'boom', {})`, cache: {}, globals }).result
+    expect(r0.outcome).toBe('rejected')
+    expect(r0.cache).toEqual({})
+
+    // name divergence, no-call divergence, args violation at a recorded key: history untouched
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    for (const code of [
+      `import { step } from 'tools'; export default await step('k', 'boom', 1)`,
+      `import { step } from 'tools'; export default await step('k', 'a', 1n)`,
+    ]) {
+      const r = await runner.execute({ code, cache: r1.cache, globals }).result
+      expect(r.outcome).toBe('rejected')
+      expect(r.cache).toEqual(r1.cache)
+    }
+    const checkpoint = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('c', () => 'v')`, cache: {}, globals }).result
+    expect(checkpoint.outcome).toBe('completed')
+    const noCall = await runner.execute({ code: `import { step } from 'tools'; export default await step('c', 'a', {})`, cache: checkpoint.cache, globals }).result
+    expect(noCall.outcome).toBe('rejected')
+    expect(noCall.cache).toEqual(checkpoint.cache)
+  }, 30_000)
+
+  test('a record from an older kernel (name without args) is a no-call divergence', async () => {
+    const globals: PerExecuteGlobals = { ok: () => 'new' }
+    const old: BoundaryCache = { k: { seq: 0, status: 'completed', name: 'ok', value: 'old' } }
+    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'ok', {})`, cache: old, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ reason: 'divergence', mismatch: 'no-call', recorded: {} })
+  }, 15_000)
+
+  test('the input cache is never mutated and `recorded` is a copy of the history', async () => {
+    const globals: PerExecuteGlobals = { a: () => 'a' }
+    const input: BoundaryCache = {}
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 1 })`, cache: input, globals }).result
+    expect(input).toEqual({})
+    expect(r1.cache).not.toBe(input)
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 2 })`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected' || r2.rejection.reason !== 'divergence')
+      return
+    const recordedArgs = r2.rejection.recorded.args as { v: number }[]
+    recordedArgs[0]!.v = 99 // editing the rejection…
+    expect(r2.cache.k).toMatchObject({ args: [{ v: 1 }] }) // …does not touch the history
+  }, 15_000)
+
+  test('a drained fire-and-forget call lands in the cache even when the program completed first', async () => {
+    const globals: PerExecuteGlobals = {
+      slow: async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        return 'late'
+      },
+    }
+    const r = await runner.execute({ code: `import { step } from 'tools'; step('s', 'slow', {}); export default 'done'`, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache.s).toMatchObject({ status: 'completed', value: 'late' })
+  }, 15_000)
+
+  test('a boundary() body that throws commits nothing; the error is catchable; the next run re-runs the body', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      let out
+      try { await boundary('k', () => { throw new Error('body boom') }) } catch (e) { out = e.message }
+      export default out`
+    const r1 = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    expect(r1.result).toBe('body boom')
+    expect(r1.cache).toEqual({})
+    const r2 = await runner.execute({ code, cache: r1.cache, globals: {} }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('body boom')
+  }, 15_000)
+
+  test('thrown null, undefined and a function: null stays null, the others get the fixed shape', async () => {
+    const globals: PerExecuteGlobals = {
+      nul: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising non-Error throws on purpose
+        throw null
+      },
+      undef: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising non-Error throws on purpose
+        throw undefined
+      },
+      fn: () => {
+        // eslint-disable-next-line no-throw-literal -- exercising non-Error throws on purpose
+        throw () => 1
+      },
+    }
+    const code = `import { step } from 'tools'
+      const out = {}
+      for (const n of ['nul', 'undef', 'fn']) { try { await step(n, n, {}) } catch (e) { out[n] = e && e.message !== undefined ? e.message : e } }
+      export default out`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache.nul).toMatchObject({ status: 'failed', error: null })
+    expect(r.cache.undef).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'non-JSON throw' } })
+    expect(r.cache.fn).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'non-JSON throw' } })
+  }, 15_000)
+
+  test('the SuspendIsolate payload is handed out as is, never through JSON', async () => {
+    const payload = { big: 1n, when: new Date(0) }
+    const globals: PerExecuteGlobals = {
+      gate: () => {
+        throw new SuspendIsolate(payload)
+      },
+    }
+    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('g', 'gate', {})`, cache: {}, globals }).result
+    expect(r.outcome === 'suspended' && r.pending[0]?.payload).toBe(payload)
+  }, 15_000)
+
+  test('every rejection message is a fixed template', async () => {
+    const globals: PerExecuteGlobals = { big: () => 1n, a: () => 'a' }
+    const nonJson = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'big', {})`, cache: {}, globals }).result
+    expect(nonJson.outcome === 'rejected' && nonJson.rejection.message).toBe(
+      'durable-isolates: a value in what a global returned cannot be written as JSON. Only values JSON can write may cross a durable boundary: no bigint, no circular structure, no toJSON or getter that throws; convert the value before it reaches one.',
+    )
+    const first = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
+    const diverged = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 2)`, cache: first.cache, globals }).result
+    expect(diverged.outcome === 'rejected' && diverged.rejection.message).toBe(
+      'durable-isolates: replay divergence: at a recorded boundary the program asked for the same operation with different arguments. Durable calls must be deterministic across runs: keep them in the same order (parallel calls must not depend on completion order) and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.',
+    )
+  }, 20_000)
+
+  test('mount: a global defined by two modules is refused; a disposed runner refuses to execute', async () => {
+    await expect(host.prepare({ modules: { a: { shim: SHIM, globals: { x: () => 1 } }, b: { shim: SHIM, globals: { x: () => 2 } } } })).rejects.toThrow(/duplicate global "x"/)
+
+    const disposable = await host.prepare({ modules: { tools: { shim: SHIM } } })
+    await disposable.dispose()
+    const r = await disposable.execute({ code: `export default 1`, cache: {} }).result
+    expect(r.outcome).toBe('failed')
+    if (r.outcome !== 'failed')
+      return
+    expect(r.error.code).toBe('ERR_PREFIX_DISPOSED')
+  }, 20_000)
+})
+
+describe('deep values (iso4 >= 0.6.3 has no host → sandbox nesting cap)', () => {
+  // A 200-level nest: far beyond the old 32-level bridge cap, well inside what
+  // JSON.stringify/parse handle.
+  const deep = (levels: number): unknown => {
+    let v: unknown = 'leaf'
+    for (let i = 0; i < levels; i++) v = { d: v }
+    return v
+  }
+  const leafOf = (v: unknown): unknown => {
+    let cur = v
+    for (let i = 0; i < 200; i++) cur = (cur as { d: unknown }).d
+    return cur
+  }
+
+  test('a deep host result is delivered on the first run and on replay', async () => {
+    let loads = 0
+    const globals: PerExecuteGlobals = {
+      load: () => {
+        loads += 1
+        return deep(200)
+      },
+    }
+    const code = `import { call } from 'tools'
+      let v = await call('load', {}); let n = 0
+      while (v && typeof v === 'object') { v = v.d; n++ }
+      export default [n, v]`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual([200, 'leaf'])
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual([200, 'leaf'])
+    expect(loads).toBe(1)
+  }, 15_000)
+
+  test('a deep committed value and deep args work on the first run and on replay', async () => {
+    const seen: unknown[] = []
+    const globals: PerExecuteGlobals = {
+      save: (v) => {
+        seen.push(leafOf(v))
+        return 'saved'
+      },
+    }
+    const code = `import { boundary } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      const make = () => { let v = 'leaf'; for (let i = 0; i < 200; i++) v = { d: v }; return v }
+      const committed = await boundary('deep', () => make())
+      let v = committed, n = 0
+      while (v && typeof v === 'object') { v = v.d; n++ }
+      export default [n, v, await step('k', 'save', make())]`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual([200, 'leaf', 'saved'])
+    expect(leafOf((r1.cache.deep as { value: unknown }).value)).toBe('leaf')
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual([200, 'leaf', 'saved'])
+    expect(seen).toEqual(['leaf']) // the global ran once; the deep args compared equal on replay
+  }, 15_000)
+})
+
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(
@@ -1590,7 +2116,7 @@ describe('mount guards', () => {
 })
 
 describe('sandbox access (getSandbox)', () => {
-  test('lazy: nothing is created until prepare/getSandbox; dispose before then is a no-op', async () => {
+  test('dispose() before any prepare/getSandbox is a no-op', async () => {
     const di = durableIsolates()
     await expect(di.dispose()).resolves.toBeUndefined()
   })

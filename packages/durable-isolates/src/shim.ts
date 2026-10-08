@@ -48,8 +48,13 @@ export const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof
  *
  * `durableLookup(key)` — non-memoized read of the live cache: `{hit, value?}`.
  * `durableCommit(key, value)` — record a completed boundary from the sandbox;
- * resolves with the value AS RECORDED (JSON-normalized by the host), which is
+ * resolves with the value AS RECORDED (as it reads back from JSON), which is
  * what `boundary()` returns, so the first run sees what every replay sees.
+ *
+ * Args and committed values leave the sandbox as JSON TEXT, written here with
+ * `JSON.stringify` on the program's real object; the host parses it. A value
+ * JSON refuses (a bigint, a cycle) crosses as the serializer's message and the
+ * host rejects the run.
  * `boundary(key, fn)` — checkpoint sugar: hit → cached value without running
  * `fn`; miss → run `fn`, commit, return. Nestable: `key` joins the ambient
  * scope while `fn` runs, so inner keys concatenate with `/`. The scope is
@@ -74,8 +79,31 @@ const __di_als = new AsyncLocalStorage();
 const __di_counters = Object.create(null);
 const __di_scope = () => __di_als.getStore() ?? [];
 
+// Values leave the sandbox as JSON text, written here on the program's real
+// object (the bridge's own serialization would strip prototypes and ignore
+// toJSON). What JSON refuses (a bigint, a cycle, a toJSON/getter that throws)
+// crosses as the serializer's complaint instead, and the host rejects the run.
+// The intrinsics are captured at module load so program code cannot swap them.
+const __di_stringify = JSON.stringify;
+const __di_parse = JSON.parse;
+const __di_String = String;
+const __di_text = (value) => {
+  try {
+    return { text: __di_stringify(value) };
+  } catch (e) {
+    let detail;
+    try {
+      detail = __di_String(e !== null && e !== undefined && e.message !== undefined ? e.message : e);
+    } catch {
+      detail = 'unserializable value';
+    }
+    return { invalid: detail };
+  }
+};
+
 export async function durableCall(key, name, ...args) {
-  return await globalThis.${DURABLE_CALL_GLOBAL}(String(key), String(name), args);
+  const t = __di_text(args);
+  return await globalThis.${DURABLE_CALL_GLOBAL}(String(key), String(name), t.text, t.invalid);
 }
 
 export async function durableLookup(key) {
@@ -83,10 +111,10 @@ export async function durableLookup(key) {
 }
 
 export async function durableCommit(key, value) {
-  await globalThis.${DURABLE_COMMIT_GLOBAL}(String(key), value);
-  // The host has admitted the value as JSON; normalize our own copy the same
-  // way (undefined dropped / null, -0 → 0) so this run sees what replays read.
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  const t = __di_text(value);
+  await globalThis.${DURABLE_COMMIT_GLOBAL}(String(key), t.text, t.invalid);
+  // Our own copy of the same text: what this run sees is what the cache holds.
+  return t.text === undefined ? undefined : __di_parse(t.text);
 }
 
 export function nextKey(name) {

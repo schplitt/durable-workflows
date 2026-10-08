@@ -2,4 +2,4 @@
 "durable-isolates": patch
 ---
 
-Update `@iso4/sandbox` to 0.6.3. iso4 no longer caps host → sandbox values at 32 nesting levels, so a deep cached value is delivered on replay exactly as the first run saw it; a value too deep for the runtime to read now fails the run with `ERR_TYPE_NOT_SERIALIZABLE`.
+chore(durable-isolates): bump `@iso4/sandbox` to 0.6.3, which lifts the 32-level nesting cap on host → sandbox values. Deep cached values are now delivered on replay exactly as the first run saw them.
