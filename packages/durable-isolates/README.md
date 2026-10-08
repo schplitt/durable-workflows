@@ -56,7 +56,7 @@ cache = r.cache // persist, then hand back next time
 
 ## The cache
 
-The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. The kernel matches by key only, never by position. Each record has a `status` and a `seq` (history order, for eviction and timelines).
+The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. Each record has a `status`, a `seq` (write order, for eviction and timelines), and a position: `scope` (the `boundary()` the operation was issued in, `''` at the top level) plus `order` (its number within that scope, counted in source order). The position is what the replay check below compares.
 
 A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
 
@@ -72,7 +72,7 @@ A record written by a host call (`durableCall`) also stores the call itself: the
 ```ts
 const r = await runner.execute({ code, cache: {}, globals: { load } }).result
 r.cache['load#0']
-// { seq: 0, status: 'completed', name: 'load', args: ['r-1'], value: { … } }
+// { seq: 0, status: 'completed', name: 'load', args: ['r-1'], scope: '', order: 0, value: { … } }
 ```
 
 Retry and eviction are plain edits to this object: delete a `failed` record to run that boundary again, or delete every record from a `seq` onwards to evict a boundary and everything after it.
@@ -117,25 +117,29 @@ Values from the program (call arguments, committed values) are stringified insid
 
 ## Replays must ask the same calls
 
-A durable call at a key that is already in the cache is answered from the record. Before that, the kernel checks that the program is asking for the same call the record holds: the same `name`, with the same `args`. Arguments are compared as stable JSON, so object key order does not matter, but array order does. If they differ, the run ends with `outcome: 'rejected'` and `rejection.reason === 'divergence'`. Nothing is answered, re-thrown or re-dispatched, and the history is left as it was.
+Every durable call and every `boundary()` takes a position when the program issues it: a counter per scope, in source order for everything issued in one synchronous stretch, so `Promise.all([a(), b()])` numbers `a` then `b` whichever finishes first. A `boundary()` body counts in its own scope, so when the boundary is later answered from the cache its whole body is skipped without disturbing the numbering outside it. The position is stored on the record as `scope` and `order`.
+
+One rule follows from this: a parallel branch that makes more than one durable call in sequence must be its own `boundary()`. Inside `Promise.all`, a second call in a branch is issued when the first one finishes, and that timing differs between the first run and a replay. With the branch wrapped, its calls are numbered inside the branch's own scope and the timing does not matter. This is the same rule codemode states for its runs, and it applies to the keys as much as to the positions.
+
+On replay the kernel checks, before answering anything: the operation at a recorded key must sit at the recorded position, a new key must not take a position another key already holds, and a durable call at a recorded key must ask the same `name` with the same `args`. Arguments are compared as stable JSON, so object key order does not matter, but array order does. If any of that differs, the run ends with `outcome: 'rejected'` and `rejection.reason === 'divergence'`. Nothing is answered, re-thrown or re-dispatched, and the history is left as it was.
 
 <!-- eslint-skip -->
 
 ```ts
 if (r.outcome === 'rejected' && r.rejection.reason === 'divergence') {
-  r.rejection.mismatch // 'name' | 'args' | 'no-call'
+  r.rejection.mismatch // 'order' | 'name' | 'args' | 'no-call'
   r.rejection.key // 'echo#0'
-  r.rejection.recorded // { name: 'echo', args: ['first'] }
-  r.rejection.attempted // { name: 'echo', args: ['second'] }
+  r.rejection.recorded // { key: 'echo#0', scope: '', order: 0, name: 'echo', args: ['first'] }
+  r.rejection.attempted // { scope: '', order: 0, name: 'echo', args: ['second'] }
   r.rejection.message // '… wrap nondeterministic inputs such as time, random values or external state in boundary() …'
 }
 ```
 
-This is how a nondeterministic program shows up: two parallel calls whose order depends on which finished first, a call whose arguments include `Date.now()` or a random id, a branch taken on data that changed between runs. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'no-call'` means the key holds a checkpoint (`boundary()` / `durableCommit`) or a record written by an older kernel, so there is no call to compare against.
+This is how a nondeterministic program shows up: two calls swapped, a branch taken on data that changed between runs (the other branch's call lands on a position the history already holds), a call whose arguments include `Date.now()` or a random id, a new call inserted before recorded ones. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'no-call'` means the key holds a checkpoint (`boundary()` / `durableCommit`) or a record written by an older kernel, so there is no call to compare against.
 
-What is not checked: keys. A call at a key that is not in the cache simply runs, even if the program changed. Checkpoint keys are not compared either, since a checkpoint records a value, not a call.
+What is not checked: the value a checkpoint recorded, and a call at a new key whose position is free (it simply runs, even if the program changed).
 
-To recover a diverged instance, change the program or the inputs so the calls line up again and run the same `cache`, or evict records (delete by `seq` from the diverged key onwards) and let that part run again.
+To recover a diverged instance, change the program or the inputs so the calls line up again and run the same `cache`, or evict the diverged scope (every record whose `scope` is the rejection's scope or nested under it) and let that part run again. `seq` alone is not enough here: a parent `boundary()` is written after its body, and two swapped calls both have to go.
 
 ## Sandbox metrics and errors
 

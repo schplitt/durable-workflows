@@ -15,14 +15,22 @@ export interface CompletedResult extends ExecuteResultBase {
 }
 export interface DivergenceRejection extends RejectionBase {
   reason: "divergence";
-  mismatch: "name" | "args" | "no-call";
+  mismatch: "order" | "name" | "args" | "no-call";
   recorded: {
+    key: string;
     name?: string;
     args?: unknown[];
+    scope?: string;
+    order?: number;
   };
   attempted: {
+    scope: string;
+    order: number;
     name: string;
     args: unknown[];
+  } | {
+    scope: string;
+    order: number;
   };
 }
 export interface DurableIsolates {
@@ -79,6 +87,12 @@ export interface PrepareOptions {
   modules: Readonly<Record<string, ModuleDefinition>>;
   limits?: Partial<ResourceLimits>;
 }
+export interface ProtocolRejection extends RejectionBase {
+  reason: "protocol";
+  source: "args" | "commit";
+  name?: string;
+  detail: string;
+}
 export interface RejectedResult extends ExecuteResultBase {
   outcome: "rejected";
   rejection: Rejection;
@@ -105,7 +119,7 @@ export type GlobalMap = Readonly<Record<string, HostGlobal>>;
 export type HostGlobal = (..._: unknown[]) => unknown;
 export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;
 export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
-export type Rejection = NonJsonRejection | DivergenceRejection;
+export type Rejection = NonJsonRejection | DivergenceRejection | ProtocolRejection;
 // #endregion
 
 // #region Classes
@@ -123,6 +137,8 @@ export declare const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL
 // #region Referenced (internal)
 interface BoundaryRecordBase {
   seq: number;
+  scope?: string;
+  order?: number;
 }
 interface ExecuteResultBase {
   cache: BoundaryCache;

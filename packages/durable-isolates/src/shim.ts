@@ -62,6 +62,14 @@ export const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof
  * and stays isolated per branch under `Promise.all` — nested boundaries may run
  * sequentially OR in parallel and still key deterministically. Bodies containing
  * further durable work re-run on every replay until committed.
+ * Every durable call and every `boundary()` also takes an ISSUE POSITION — a
+ * counter per ambient scope, incremented synchronously at issue (source order
+ * for operations issued in one synchronous stretch; a boundary body counts in
+ * its own scope, so a cache hit on the boundary skips the whole subtree
+ * consistently) — recorded as `scope` + `order` and compared on replay, so a
+ * program whose operations no longer come in the recorded order diverges even
+ * when each key still matches. Raw `durableLookup`/`durableCommit` take no
+ * position (the position argument is internal to `boundary()`).
  * `nextKey(name)` — ambient auto-key former for shims: current scope + name +
  * a per-scope-per-name counter. The scope comes from the async-context store;
  * the counter is plain module state keyed by the full scoped path (distinct per
@@ -101,18 +109,36 @@ const __di_text = (value) => {
   }
 };
 
+// Issue position: a counter PER SCOPE (the ambient boundary path) over every
+// durable call and checkpoint issued in that scope, taken synchronously at
+// issue — so it follows source order even under Promise.all. A boundary body
+// counts in its own scope, so a replay that answers the boundary from the
+// cache (and never runs the body) leaves the parent's count untouched, and
+// parallel bodies never interleave each other's numbering. Recorded as
+// \`scope\` + \`order\` and compared on replay: an operation at a different
+// position than recorded is a divergence.
+const __di_issued = Object.create(null);
+const __di_position = () => {
+  const scope = __di_scope().join('/');
+  const n = __di_issued[scope] = (__di_issued[scope] || 0) + 1;
+  return { scope, order: n - 1 };
+};
+
 export async function durableCall(key, name, ...args) {
+  const p = __di_position();
   const t = __di_text(args);
-  return await globalThis.${DURABLE_CALL_GLOBAL}(String(key), String(name), t.text, t.invalid);
+  return await globalThis.${DURABLE_CALL_GLOBAL}(String(key), String(name), t.text, t.invalid, p.order, p.scope);
 }
 
-export async function durableLookup(key) {
-  return await globalThis.${DURABLE_LOOKUP_GLOBAL}(String(key));
+export async function durableLookup(key, position) {
+  return await globalThis.${DURABLE_LOOKUP_GLOBAL}(String(key), position && position.order, position && position.scope);
 }
 
-export async function durableCommit(key, value) {
+// A raw commit (no position) is outside the position check, like a raw lookup;
+// only boundary() passes a position, for both halves of its checkpoint.
+export async function durableCommit(key, value, position) {
   const t = __di_text(value);
-  await globalThis.${DURABLE_COMMIT_GLOBAL}(String(key), t.text, t.invalid);
+  await globalThis.${DURABLE_COMMIT_GLOBAL}(String(key), t.text, t.invalid, position && position.order, position && position.scope);
   // Our own copy of the same text: what this run sees is what the cache holds.
   return t.text === undefined ? undefined : __di_parse(t.text);
 }
@@ -126,10 +152,11 @@ export function nextKey(name) {
 export async function boundary(key, fn) {
   const parent = __di_scope();
   const full = [...parent, String(key)].join('/');
-  const r = await durableLookup(full);
+  const position = __di_position(); // the checkpoint's position in the PARENT scope: taken once, at issue
+  const r = await durableLookup(full, position);
   if (r && r.hit) return r.value;
   return await __di_als.run([...parent, String(key)], async () => {
-    return await durableCommit(full, await fn());
+    return await durableCommit(full, await fn(), position);
   });
 }
 `
