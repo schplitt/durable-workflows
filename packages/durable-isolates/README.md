@@ -1,8 +1,10 @@
 # durable-isolates
 
-The replay kernel behind [`durable-workflows`](../durable-workflows), built on [`iso4`](https://github.com/schplitt/iso4).
+Run JavaScript in a sandbox and make chosen calls durable.
 
-Run a program in a sandbox and make chosen operations durable. Their results live in a cache you persist, so a run can pause, survive a restart, and continue later. Resume is always the same move: run it again with the cache you saved.
+A durable call runs once. Its result goes into a cache you keep. Run the same program again with that cache and the call is answered from it instead of running again. That is the whole trick: a program can pause, your server can restart, and continuing is just running the program again with the cache.
+
+Built on [iso4](https://github.com/schplitt/iso4). The engine behind [durable-workflows](../durable-workflows).
 
 > Node >= 24, ESM only.
 
@@ -12,20 +14,9 @@ Run a program in a sandbox and make chosen operations durable. Their results liv
 pnpm add durable-isolates
 ```
 
-`@iso4/sandbox` is included as a regular dependency. `@iso4/fetch` is optional, for a durable HTTP capability.
-
-## Features
-
-- **Durable by key.** A completed operation is answered from the cache and never runs twice. A fresh one runs for real.
-- **Pause and continue.** A host global can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
-- **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
-- **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
-- **Plain and durable, side by side.** `imports` and `globals` are iso4's, untouched: plain host functions and data. `durableGlobals` are the functions a shim reaches through `durableCall`, and only those are recorded and replayed. `durableImports` are durable modules the kernel writes the shim for.
-- **JSON in, JSON out.** Every value crossing a boundary is written and read back as JSON already on the first run, so a replay sees exactly what the first run saw. What JSON cannot write, a bigint, a cycle or a serializer that throws, ends the run with a clear message.
-- **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
-- **Keys are single-use and globals must be mounted.** A key reused within a run, a commit onto a recorded key, or a call whose global is missing ends the run too, with a message naming the rule.
-
 ## Quick start
+
+Give the sandbox a module that marks calls as durable, give the host the functions behind them, and run.
 
 <!-- eslint-skip -->
 
@@ -33,17 +24,15 @@ pnpm add durable-isolates
 import { durableIsolates } from 'durable-isolates'
 
 const di = durableIsolates()
+
 const runner = await di.prepare({
-  imports: {
-    reports: `
-      import { durableCall, nextKey } from 'durable-isolates:internal'
-      export const load = id => durableCall(nextKey('load'), 'load', id)
-    `,
+  durableImports: {
+    reports: { load: id => db.reports.get(id) },
   },
-  durableGlobals: { load: (id) => db.reports.get(id) },
 })
 
 let cache = {}
+
 const r = await runner.execute({
   code: `import { load } from 'reports'; export default await load('r-1')`,
   cache,
@@ -51,63 +40,118 @@ const r = await runner.execute({
 
 if (r.outcome === 'completed')
   console.log(r.result)
-cache = r.cache // persist, then hand back next time
+
+cache = r.cache // save this
 ```
 
-## Plain calls: iso4 imports and globals
+Run it again with the saved cache and `load('r-1')` is answered from the cache. `db.reports.get` is not called a second time.
 
-`prepare` takes iso4's `imports` and `globals` exactly as iso4 defines them, and passes them through. A string import is a sandbox module, which is where a shim lives. An object import is an iso4 host module: plain host functions and data, nested up to 64 levels, that sandbox code imports by name. A global is a plain host function on `globalThis` (or, as in iso4, a string expression or a data constant). None of this is durable, and the kernel never touches it: a plain function runs on every replay, nothing is recorded, and values cross with iso4's own V8 serialization, so a `Date` stays a `Date`. Keep a plain result with `boundary()` when it should survive a replay.
+## Pausing
+
+A durable function can pause the run by throwing `SuspendIsolate`. The run stops, the call is recorded as waiting, and you get the result back with `outcome: 'suspended'`.
 
 <!-- eslint-skip -->
 
 ```ts
+import { SuspendIsolate } from 'durable-isolates'
+
 const runner = await di.prepare({
-  imports: {
-    reports: shimSource,                                    // sandbox module
-    'acme/util': { version: '1.2', clock: { now: () => Date.now() } }, // plain host module
+  durableImports: {
+    approvals: {
+      ask: async (id) => {
+        const answer = await db.approvals.get(id)
+        if (!answer)
+          throw new SuspendIsolate({ id }) // pause, the payload is for you
+        return answer
+      },
+    },
   },
-  globals: { log: (...a) => console.log(...a) },            // plain global
-  durableGlobals: { load },                                 // durable, reached through durableCall
 })
-runner.execute({ code, cache, imports: { 'acme/util': { clock: { now: fixedNow } } }, globals: { log }, durableGlobals: { load: authed } })
+
+const r = await runner.execute({ code, cache }).result
+if (r.outcome === 'suspended')
+  r.pending // [{ id: 'approvals.ask#0', name: 'approvals.ask', payload: { id } }]
 ```
 
-Per-run overrides follow the same split: `imports` and `globals` are iso4's rebind of the plain functions for this run, `durableGlobals` rebinds the registry. A per-run override that names something iso4 cannot rebind, an unknown global or path, a string module, a data leaf, fails the run with iso4's own error. Two things are the kernel's on the plain side: the specifier `durable-isolates:internal` and the three bridge global names (`KERNEL_BRIDGE_GLOBALS`) are reserved, and a name cannot be both a plain global and a durable global, so one name never means two things. Suspension is a durable call's feature: a `SuspendIsolate` thrown from a plain function is just an error named `SuspendIsolate` in the program, and a failed run carrying that name means the call should have been durable.
+To continue, run the same code with `r.cache` again. The program replays up to the waiting call, which asks `ask` again. Nothing is injected from outside: the function looks at your systems and either answers or pauses again.
 
-## Durable modules without a shim: `durableImports`
+## Durable modules
 
-Most durable modules are just "these host functions, recorded": no custom keys, no sandbox logic. For those, hand the functions to `durableImports` and the kernel writes the sandbox module itself.
+`durableImports` is the simple way in. Give it host functions under a module name, and the sandbox can import them. Every call is durable.
 
 <!-- eslint-skip -->
 
 ```ts
 const runner = await di.prepare({
   durableImports: {
-    acme: { load, save, inventory: { count } },   // host functions, nested objects allowed
+    acme: {
+      load: id => db.get(id),
+      users: { find: email => db.users.find(email) }, // nested works too
+    },
   },
 })
-// program: import { load, inventory } from 'acme'; await load('r-1'); await inventory.count()
-runner.execute({ code, cache, durableImports: { acme: { load: authed } } })   // per-run rebind, same shape
+
+// in the sandbox:
+// import { load, users } from 'acme'
+// await load('r-1'); await users.find('a@b.c')
 ```
 
-The generated module for `acme` is, in full:
+Each function gets a key the sandbox counts per call: `acme.load#0`, `acme.load#1`, `acme.users.find#0`. Functions only, and export names must be valid identifiers.
 
-```js
-import * as __di from 'durable-isolates:internal'
+Per run, you can swap a function, for a credential bound to this request for example:
 
-const __di_op = (name) => (...args) => __di.durableCall(__di.nextKey(name), name, ...args)
-export const load = __di_op('acme.load')
-export const save = __di_op('acme.save')
-export const inventory = { count: __di_op('acme.inventory.count') }
+<!-- eslint-skip -->
+
+```ts
+runner.execute({ code, cache, durableImports: { acme: { load: loadAs(user) } } })
 ```
 
-So a call records as `acme.load#0` (scope-prefixed inside a `boundary()`), with `name: 'acme.load'`, and gets everything a hand-written shim gets: JSON transport, the position, divergence detection, suspension through `SuspendIsolate`. The dotted name is also the name under `durableGlobals`, so `durableGlobals: { 'acme.load': authed }` and `durableImports: { acme: { load: authed } }` are the same override.
+## Writing your own module
 
-`prepare` refuses, naming the path: a data value as a leaf (nothing to record), a top-level name that is not a usable export identifier (nested names may be any string), a specifier that is also in `imports`, a dotted name that is also in `durableGlobals` or produced by two modules, and the reserved specifier. `execute` throws before the run starts if a per-run `durableGlobals` or `durableImports` value is neither a function nor `undefined`; when both name the same operation, `durableGlobals` wins.
+If you want control over keys, write the sandbox side yourself with `durable-isolates:internal` and put the host side in `durableGlobals`.
 
-## One-off runs
+<!-- eslint-skip -->
 
-`prepare` builds a prefix that iso4 keeps warm for many runs, which is what a workflow replayed turn after turn wants. A single run that arrives on its own, one request and one program, does not want a prefix it would dispose right after. `di.run` takes everything `prepare` and `execute` take, together, and runs the turn in a fresh iso4 isolate:
+```ts
+const runner = await di.prepare({
+  imports: {
+    reports: `
+      import { durableCall, nextKey, boundary } from 'durable-isolates:internal'
+
+      // an auto-counted key: load#0, load#1, …
+      export const load = id => durableCall(nextKey('load'), 'load', id)
+
+      // a key you choose
+      export const step = (id, fn) => boundary(id, fn)
+    `,
+  },
+  durableGlobals: { load: id => db.reports.get(id) },
+})
+```
+
+`durableCall(key, name, ...args)` runs the host function `name` once and caches it under `key`. `boundary(key, fn)` runs `fn` in the sandbox once and caches what it returns. Keys inside a boundary are scoped to it (`step/load#0`), so branches under `Promise.all` do not collide.
+
+## Plain imports and globals
+
+`imports` and `globals` are iso4's own and go through untouched. They are not durable: they run on every replay and nothing is recorded. Use them for logging, config, helpers.
+
+<!-- eslint-skip -->
+
+```ts
+const runner = await di.prepare({
+  imports: { 'acme/util': { version: '1.2' } }, // plain host module
+  globals: { log: (...a) => console.log(...a) }, // plain global
+  durableGlobals: { load },
+})
+```
+
+If a plain call returns something you need to survive a replay, wrap it in `boundary()`.
+
+## One run, one isolate
+
+`prepare` builds a prefix that iso4 keeps warm. Runs on it are fast (about 0.1 ms of overhead) but share an instance, so one run can leave state on `globalThis` for the next. That is fine for the turns of one workflow. It is not fine for code from different tenants, or code a model wrote.
+
+For those, use `run`. It takes what `prepare` and `execute` take together and gives the program its own isolate. Costs an isolate boot, about a millisecond.
 
 <!-- eslint-skip -->
 
@@ -115,166 +159,133 @@ So a call records as `acme.load#0` (scope-prefixed inside a `boundary()`), with 
 const r = await di.run({
   code,
   cache,
-  imports: { tools: shim },
-  globals: { log },
-  durableGlobals: { load },
   durableImports: { acme },
-  limits: { memoryMb: 128 },   // iso4's one-off limits; memoryMb is per fresh isolate
+  limits: { memoryMb: 128 },
 }).result
 ```
 
-Same handle, same outcomes, same cache, same rules. Two things differ: there is no per-run override, since there is no prepared default to override, and nothing carries over between runs, since each gets its own isolate. Nothing is cached between one-offs either: the functions you pass are the ones the run uses, so rotating a credential is just passing the new function.
-
 ## The cache
 
-The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. Each record has a `status`, a `seq` (write order, for eviction and timelines), and a position: `scope` (the `boundary()` the operation was issued in, `''` at the top level) plus `order` (its number within that scope, counted in source order). The position is what the replay check below compares.
-
-A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
-
-| `status`    | Written By                                 | Fields                              |
-| ----------- | ------------------------------------------ | ----------------------------------- |
-| `completed` | a global returning                         | `name`, `args`, `value`             |
-| `failed`    | a global throwing                          | `name`, `args`, `error`             |
-| `waiting`   | a durable global throwing `SuspendIsolate` | `name`, `args`                      |
-| `completed` | `boundary()` / `durableCommit`             | `value` only (no `name`, no `args`) |
+The cache is a plain JSON object you store wherever you like. One record per key:
 
 <!-- eslint-skip -->
 
 ```ts
-const r = await runner.execute({ code, cache: {}, durableGlobals: { load } }).result
-r.cache['load#0']
-// { seq: 0, status: 'completed', name: 'load', args: ['r-1'], scope: '', order: 0, value: { … } }
+r.cache['acme.load#0']
+// { seq: 0, status: 'completed', name: 'acme.load', args: ['r-1'], scope: '', order: 0, value: {…} }
 ```
 
-Retry and eviction are plain edits to this object: delete a `failed` record to run that boundary again, or delete every record from a `seq` onwards to evict a boundary and everything after it.
+| `status`    | Meaning                                    |
+| ----------- | ------------------------------------------ |
+| `completed` | done, `value` is the answer                |
+| `failed`    | threw, `error` has `name` and `message`    |
+| `waiting`   | paused by `SuspendIsolate`, will run again |
 
-## Values cross as JSON
+Retry and undo are edits to this object. Delete a `failed` record to run that call again. Delete every record from a `seq` on to roll back to that point.
 
-Everything that crosses a durable boundary is written with `JSON.stringify` and read back with `JSON.parse` before anyone sees it, already on the first run. That covers the arguments of a durable call, what a global returns or throws, and what a `boundary()` body returns or `durableCommit` stores. The cache is saved and read back as JSON anyway, so doing the same on the first run means every run sees the same value.
+A cache from version 0.2 cannot be continued. Its records have no position, so the first replay stops with a divergence. Finish or restart those instances.
 
-What that means in practice, exactly as JSON does it:
+## Values are JSON
 
-| You Pass                   | Everyone Sees                            |
-| -------------------------- | ---------------------------------------- |
-| `new Date(0)`              | `'1970-01-01T00:00:00.000Z'`             |
-| `new Map(…)`, `new Set(…)` | `{}`                                     |
-| `NaN`, `Infinity`          | `null`                                   |
-| a class instance           | its fields, or what its `toJSON` returns |
-| `new Uint8Array([1, 2])`   | `{ "0": 1, "1": 2 }`                     |
-| `{ a: undefined }`         | `{}`                                     |
-| `[undefined, -0]`          | `[null, 0]`                              |
-| a function, a symbol       | dropped in objects, `null` in arrays     |
+Everything that crosses a durable call is run through `JSON.stringify` and `JSON.parse`, on the first run too. So every run sees the same value, and what you see is what JSON gives you: a `Date` becomes a string, a `Map` becomes `{}`, `undefined` disappears, a thrown error keeps its `name` and `message`. Convert anything else yourself before returning it.
 
-The kernel does not guard against a lossy reading: a `Response` returned from a global is recorded as `{}`, forever. Convert values yourself where the JSON reading is not what you want: a response to its parsed body, bytes to text or base64, a `Map` to an object. Thrown `Error`s are stored as their `name` and `message` only.
+What JSON cannot write at all (a `bigint`, a cycle, a `toJSON` that throws) stops the run. See below.
 
-What JSON cannot write at all, a `bigint`, a circular structure, or a `toJSON` or getter that throws while serializing, ends the run with `outcome: 'rejected'`. The isolate is aborted and the violating call never settles, so a `try/catch` in the program cannot swallow it. Nothing is recorded at the violating key, every other in-flight call is still drained into `cache`, and `rejection` says what happened:
+## When a run stops
 
-<!-- eslint-skip -->
+A run can end four ways:
 
-```ts
-const r = await runner.execute({ code, cache, durableGlobals: { count: () => ({ total: 10n }) } }).result
-if (r.outcome === 'rejected') {
-  r.rejection.reason // 'non-json'
-  r.rejection.source // 'result' — or 'args', 'error', 'commit'
-  r.rejection.key // 'count#0'
-  r.rejection.detail // 'Do not know how to serialize a BigInt'
-  r.rejection.message // 'durable-isolates: a value in what a global returned cannot be written as JSON. Only values JSON can write may cross a durable boundary: …'
-}
-```
+| `outcome`   | What Happened                                                  |
+| ----------- | -------------------------------------------------------------- |
+| `completed` | the program finished, `result` is its default export           |
+| `suspended` | a durable call paused, `pending` lists it                      |
+| `failed`    | the program threw or hit a limit, `error` is iso4's            |
+| `rejected`  | the program broke a rule of the kernel, `rejection` says which |
 
-The message never contains text the program wrote. The key, the global's name and the serializer's `detail`, which may quote a property name, are in the structured fields. Fix the global or the program and run the same `cache` again.
+A rejection is not catchable in the sandbox. Nothing is written at the offending key, so you can fix the cause and run the same cache again.
 
-Values from the program (call arguments, committed values) are stringified inside the sandbox, on the real object, so `toJSON` methods and getters behave as they would under `JSON.stringify`, and a getter is read exactly once.
+| `rejection.reason` | Cause                                                          |
+| ------------------ | -------------------------------------------------------------- |
+| `divergence`       | the replay asked something different from what the cache holds |
+| `non-json`         | a value crossed that JSON cannot write                         |
+| `duplicate-key`    | a key was used twice                                           |
+| `unknown-global`   | a durable call has no host function behind its name            |
+| `protocol`         | the program reached a kernel bridge directly                   |
 
-## Replays must ask the same calls
+**Divergence** is the one to know. On a replay, the kernel checks that the program issues the same durable calls, in the same order, with the same arguments as recorded. Anything else is a divergence, with `mismatch` telling you what differed (`order`, `name`, `args`, `kind`) and `recorded` versus `attempted` showing both sides. The fix is always in the program: keep durable calls in the same order, wrap time, random values and other changing inputs in `boundary()` so they are recorded once, and give a parallel branch that makes more than one durable call its own `boundary()`.
 
-Every durable call and every `boundary()` takes a position when the program issues it: a counter per scope, in source order for everything issued in one synchronous stretch, so `Promise.all([a(), b()])` numbers `a` then `b` whichever finishes first. A `boundary()` body counts in its own scope, so when the boundary is later answered from the cache its whole body is skipped without disturbing the numbering outside it. The position is stored on the record as `scope` and `order`.
+## Metrics
 
-One rule follows from this: a parallel branch that makes more than one durable call in sequence must be its own `boundary()`. Inside `Promise.all`, a second call in a branch is issued when the first one finishes, and that timing differs between the first run and a replay. With the branch wrapped, its calls are numbered inside the branch's own scope and the timing does not matter. This is the same rule codemode states for its runs, and it applies to the keys as much as to the positions.
+Every result carries `run`, iso4's own result for the turn: `durationMs`, `cpuTimeMs`, `heapUsedBytes`, `bridgeCalls`, `stdout`, `stderr`. The kernel's own bridge calls show up there too; their names are in `KERNEL_BRIDGE_GLOBALS`.
 
-On replay the kernel checks, before answering anything: the operation at a recorded key must sit at the recorded position, a new key must not take a position another key already holds, and a durable call at a recorded key must ask the same `name` with the same `args`. Arguments are compared as stable JSON, so object key order does not matter, but array order does. If any of that differs, the run ends with `outcome: 'rejected'` and `rejection.reason === 'divergence'`. Nothing is answered, re-thrown or re-dispatched, and the history is left as it was.
+`di.getSandbox()` hands you the iso4 sandbox for `stats()` and friends. Tear down with `di.dispose()`.
 
-<!-- eslint-skip -->
+## API
 
-```ts
-if (r.outcome === 'rejected' && r.rejection.reason === 'divergence') {
-  r.rejection.mismatch // 'order' | 'name' | 'args' | 'kind'
-  r.rejection.key // 'echo#0'
-  r.rejection.recorded // { key: 'echo#0', scope: '', order: 0, name: 'echo', args: ['first'] }
-  r.rejection.attempted // { scope: '', order: 0, name: 'echo', args: ['second'] }
-  r.rejection.message // '… wrap nondeterministic inputs such as time, random values or external state in boundary() …'
-}
-```
+### `durableIsolates(options?)`
 
-This is how a nondeterministic program shows up: two calls swapped, a branch taken on data that changed between runs (the other branch's call lands on a position the history already holds), a call whose arguments include `Date.now()` or a random id, a new call inserted before recorded ones. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'kind'` means the key holds the other kind of operation: a durable call where a `boundary()` was recorded, or a `boundary()` where a call was.
+Creates the host. `options.sandbox` is passed to iso4's `createSandbox`. The sandbox is created on first use.
 
-What is not checked: the value a checkpoint recorded, and a call at a new key whose position is free (it simply runs, even if the program changed).
+| Method             | Returns                               |
+| ------------------ | ------------------------------------- |
+| `prepare(options)` | `Promise<Runner>` — a warm prefix     |
+| `run(options)`     | `Handle` — one run in its own isolate |
+| `getSandbox()`     | `Promise<Sandbox>` — the iso4 sandbox |
+| `dispose()`        | `Promise<void>`                       |
 
-To recover a diverged instance, change the program or the inputs so the calls line up again and run the same `cache`, or evict the diverged scope (every record whose `scope` is the rejection's scope or nested under it) and let that part run again. `seq` alone is not enough here: a parent `boundary()` is written after its body, and two swapped calls both have to go.
+### `prepare(options)`
 
-## Keys are used once, globals must be mounted
+| Option           | Type                            | Description                                                |
+| ---------------- | ------------------------------- | ---------------------------------------------------------- |
+| `durableImports` | `Record<string, DurableModule>` | host functions as durable sandbox modules                  |
+| `durableGlobals` | `Record<string, Function>`      | host functions reached by name through `durableCall`       |
+| `imports`        | iso4 `Imports`                  | plain sandbox modules (source) or host modules             |
+| `globals`        | iso4 `HostGlobals`              | plain globals                                              |
+| `limits`         | `Partial<ResourceLimits>`       | defaults for every run (`maxBridgeCalls` defaults to 1000) |
 
-Two more rules keep the history unambiguous. Both end the run with `outcome: 'rejected'`.
+### `runner.execute(options)`
 
-- **A key names one operation per run, and a record is written once.** A step id reused in a loop, two parallel steps with the same id, or a call reusing a step's key is `reason: 'duplicate-key'` with `detail: 'used twice in this run'`. The first use may have run; nothing is recorded for the second. A retry inside the same run therefore needs a new key: `step.do('fetch', …)` failing and being retried as `step.do('fetch', …)` again is a duplicate, `step.do('fetch-retry', …)` is not. A commit onto a key the history already holds, from any run, is the same reason with `detail: 'already recorded'`.
-- **A call that has to run needs its global.** A call at a new key, or a waiting record being resumed, routed to a name with no mounted global is `reason: 'unknown-global'`, carrying the `name`. A call answered from the cache needs no global. Nothing is recorded, and a waiting record at that key stays as it was, so mounting the global and running the same cache resumes. Typical causes: the mounted globals changed between a deploy and a resume, or a shim routes to a name nobody mounted.
+| Option               | Type                            | Description                                |
+| -------------------- | ------------------------------- | ------------------------------------------ |
+| `code`               | `string`                        | the program, an ES module                  |
+| `cache`              | `BoundaryCache`                 | the cache from the last run, `{}` to start |
+| `durableImports`     | `Record<string, DurableModule>` | swap durable functions for this run        |
+| `durableGlobals`     | `Record<string, Function>`      | same, by name                              |
+| `imports`, `globals` | iso4 rebinds                    | swap plain functions for this run          |
+| `limits`             | `Partial<ResourceLimits>`       | this run's limits                          |
 
-## All the ways a run is rejected
+`runner.dispose()` drops the prefix.
 
-`rejection.reason` is one of five values, and every message is written for whoever wrote the program, with no program text in it:
+### `di.run(options)`
 
-| `reason`         | Meaning                                                                        | Section                         |
-| ---------------- | ------------------------------------------------------------------------------ | ------------------------------- |
-| `non-json`       | a value JSON cannot write crossed a boundary                                   | Values cross as JSON            |
-| `divergence`     | the replay no longer lines up with the history                                 | Replays must ask the same calls |
-| `duplicate-key`  | a key was used twice, or a commit targeted a recorded key                      | Keys are used once              |
-| `unknown-global` | a call that had to run has no mounted global                                   | Keys are used once              |
-| `protocol`       | a program reached a bridge global directly with a payload the shim never sends | —                               |
+Everything `prepare` takes plus `code` and `cache`. No per-run overrides, since there is nothing prepared to override. `limits` are iso4's one-off limits and allow `memoryMb`.
 
-## Sandbox metrics and errors
+### `Handle`
 
-`durableIsolates({ sandbox })` takes iso4 `SandboxOptions` and owns the one sandbox: it is created lazily and torn down by `dispose()`. To reach the iso4 API directly (for example `stats()` for load metrics), use `getSandbox()`. It returns the same sandbox `prepare` uses, creating it first if needed, so you can scrape metrics before the first run. Leave teardown to `di.dispose()`.
+| Member      | Description                                                                                            |
+| ----------- | ------------------------------------------------------------------------------------------------------ |
+| `result`    | `Promise<ExecuteResult>`                                                                               |
+| `suspend()` | stop the run from outside (server shutdown), keep what durable calls finished, resolve with the result |
 
-<!-- eslint-skip -->
+### `ExecuteResult`
 
-```ts
-const di = durableIsolates({ sandbox: { maxQueuedRuns: 100 } })
-const sandbox = await di.getSandbox()
-setInterval(async () => {
-  const { activeRuns, queueDepth, slotLimit, usageBytes, underPressure, prefixes } = await sandbox.stats()
-  // runner.prefixId is the key into `prefixes`
-}, 5_000)
-```
+Always has `outcome`, `cache` and `run`. Then by outcome: `result`, `pending`, `error` or `rejection`.
 
-A failed run resolves with `{ outcome: 'failed', error }`, where `error` is iso4's `RunError` passed through unchanged. Its `code` (`ERR_CPU_TIMEOUT`, `ERR_WALL_TIMEOUT`, `ERR_MEMORY_LIMIT`, `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`, `ERR_QUEUE_FULL`, `ERR_CAPACITY_MEMORY`, …) is intact. Capacity refusals come back this way too, not as a rejected promise.
+### `durable-isolates:internal`
 
-## Per-run metrics
+The module a sandbox shim imports.
 
-Every result also carries `run`, which is iso4's own result for that turn, passed through unchanged. It has the per-run clocks (`durationMs`, `wallTimeMs`, `cpuTimeMs`, `queueWaitMs`), `heapUsedBytes`, `bridgeCalls` and `stdout`/`stderr`. Which iso4 arm you get depends on `outcome`:
+| Export                            | Description                                                |
+| --------------------------------- | ---------------------------------------------------------- |
+| `durableCall(key, name, ...args)` | run host function `name` once, cached under `key`          |
+| `boundary(key, fn)`               | run `fn` once, cache what it returns, scope keys inside it |
+| `nextKey(name)`                   | `name#0`, `name#1`, … within the current scope             |
+| `durableLookup(key)`              | read the cache: `{ hit, value }`                           |
+| `durableCommit(key, value)`       | write the cache                                            |
 
-| `outcome`   | `run`              | Notes                                                                                                                                                                                                                                  |
-| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `completed` | `RunSuccess`       | `queueWaitMs` only when the run queued for a slot                                                                                                                                                                                      |
-| `failed`    | `RunFailure`       | `run.error` is `error`; no `queueWaitMs` on `ERR_QUEUE_FULL` (refused before admission)                                                                                                                                                |
-| `suspended` | iso4's aborted arm | Numbers up to the pause; no `queueWaitMs` or `heapUsedBytes`; zero timings if aborted in a tight sync loop. If the program finished without awaiting the suspending call, the outcome is still `suspended` and `run` is iso4's own arm |
+### `SuspendIsolate`
 
-The clocks stop when the isolate settles. Letting in-flight dispatches finish afterwards (the drain) is not counted.
-
-`bridgeCalls` includes the kernel's own bridge calls. Every durable call (a cache hit or a dispatch) crosses as `__di_call`, and checkpoints cross as `__di_lookup` and `__di_commit`. Entries carry no arguments, so a `__di_call` entry does not say which operation it was. Use `KERNEL_BRIDGE_GLOBALS` to split them out:
-
-<!-- eslint-skip -->
-
-```ts
-import { KERNEL_BRIDGE_GLOBALS } from 'durable-isolates'
-
-const r = await runner.execute({ code, cache }).result
-const { wallTimeMs, cpuTimeMs, bridgeCalls } = r.run
-const kernel = bridgeCalls.filter(c => KERNEL_BRIDGE_GLOBALS.some(n => n === c.name))
-```
-
-## `waitUntil` is not durable
-
-iso4 lets sandbox code register background work with `waitUntil`, which keeps running after the run's result has been delivered. Durable calls and checkpoints are not supported inside that work. By the time it runs, `execute` has already returned, so anything it records would be written into a `cache` you may already have saved. Keep durable calls on the awaited path of the program.
+`throw new SuspendIsolate(payload)` from a durable function pauses the run. `payload` is handed back on `pending`.
 
 ## License
 
