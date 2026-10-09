@@ -22,6 +22,7 @@ pnpm add durable-isolates
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
 - **JSON in, JSON out.** Every value crossing a boundary is written and read back as JSON already on the first run, so a replay sees exactly what the first run saw. What JSON cannot write, a bigint, a cycle or a serializer that throws, ends the run with a clear message.
 - **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
+- **Keys are single-use and globals must be mounted.** A key reused within a run, a commit onto a recorded key, or a call whose global is missing ends the run too, with a message naming the rule.
 
 ## Quick start
 
@@ -60,12 +61,12 @@ The cache is a plain JSON object: one record per boundary, keyed by the key the 
 
 A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
 
-| `status`    | Written By                                 | Fields                              |
-| ----------- | ------------------------------------------ | ----------------------------------- |
-| `completed` | a global returning                         | `name`, `args`, `value`             |
-| `failed`    | a global throwing, or no global for `name` | `name`, `args`, `error`             |
-| `waiting`   | a global throwing `SuspendIsolate`         | `name`, `args`                      |
-| `completed` | `boundary()` / `durableCommit`             | `value` only (no `name`, no `args`) |
+| `status`    | Written By                         | Fields                              |
+| ----------- | ---------------------------------- | ----------------------------------- |
+| `completed` | a global returning                 | `name`, `args`, `value`             |
+| `failed`    | a global throwing                  | `name`, `args`, `error`             |
+| `waiting`   | a global throwing `SuspendIsolate` | `name`, `args`                      |
+| `completed` | `boundary()` / `durableCommit`     | `value` only (no `name`, no `args`) |
 
 <!-- eslint-skip -->
 
@@ -127,7 +128,7 @@ On replay the kernel checks, before answering anything: the operation at a recor
 
 ```ts
 if (r.outcome === 'rejected' && r.rejection.reason === 'divergence') {
-  r.rejection.mismatch // 'order' | 'name' | 'args' | 'no-call'
+  r.rejection.mismatch // 'order' | 'name' | 'args' | 'kind'
   r.rejection.key // 'echo#0'
   r.rejection.recorded // { key: 'echo#0', scope: '', order: 0, name: 'echo', args: ['first'] }
   r.rejection.attempted // { scope: '', order: 0, name: 'echo', args: ['second'] }
@@ -135,11 +136,30 @@ if (r.outcome === 'rejected' && r.rejection.reason === 'divergence') {
 }
 ```
 
-This is how a nondeterministic program shows up: two calls swapped, a branch taken on data that changed between runs (the other branch's call lands on a position the history already holds), a call whose arguments include `Date.now()` or a random id, a new call inserted before recorded ones. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'no-call'` means the key holds a checkpoint (`boundary()` / `durableCommit`) or a record written by an older kernel, so there is no call to compare against.
+This is how a nondeterministic program shows up: two calls swapped, a branch taken on data that changed between runs (the other branch's call lands on a position the history already holds), a call whose arguments include `Date.now()` or a random id, a new call inserted before recorded ones. The fix is in the program: keep durable calls in the same order on every run, and wrap nondeterministic inputs in `boundary()` so they are recorded once and replayed. `mismatch: 'kind'` means the key holds the other kind of operation: a durable call where a `boundary()` was recorded, or a `boundary()` where a call was.
 
 What is not checked: the value a checkpoint recorded, and a call at a new key whose position is free (it simply runs, even if the program changed).
 
 To recover a diverged instance, change the program or the inputs so the calls line up again and run the same `cache`, or evict the diverged scope (every record whose `scope` is the rejection's scope or nested under it) and let that part run again. `seq` alone is not enough here: a parent `boundary()` is written after its body, and two swapped calls both have to go.
+
+## Keys are used once, globals must be mounted
+
+Two more rules keep the history unambiguous. Both end the run with `outcome: 'rejected'`.
+
+- **A key names one operation per run, and a record is written once.** A step id reused in a loop, two parallel steps with the same id, or a call reusing a step's key is `reason: 'duplicate-key'` with `detail: 'used twice in this run'`. The first use may have run; nothing is recorded for the second. A retry inside the same run therefore needs a new key: `step.do('fetch', …)` failing and being retried as `step.do('fetch', …)` again is a duplicate, `step.do('fetch-retry', …)` is not. A commit onto a key the history already holds, from any run, is the same reason with `detail: 'already recorded'`.
+- **A call that has to run needs its global.** A call at a new key, or a waiting record being resumed, routed to a name with no mounted global is `reason: 'unknown-global'`, carrying the `name`. A call answered from the cache needs no global. Nothing is recorded, and a waiting record at that key stays as it was, so mounting the global and running the same cache resumes. Typical causes: the mounted globals changed between a deploy and a resume, or a shim routes to a name nobody mounted.
+
+## All the ways a run is rejected
+
+`rejection.reason` is one of five values, and every message is written for whoever wrote the program, with no program text in it:
+
+| `reason`         | Meaning                                                                        | Section                         |
+| ---------------- | ------------------------------------------------------------------------------ | ------------------------------- |
+| `non-json`       | a value JSON cannot write crossed a boundary                                   | Values cross as JSON            |
+| `divergence`     | the replay no longer lines up with the history                                 | Replays must ask the same calls |
+| `duplicate-key`  | a key was used twice, or a commit targeted a recorded key                      | Keys are used once              |
+| `unknown-global` | a call that had to run has no mounted global                                   | Keys are used once              |
+| `protocol`       | a program reached a bridge global directly with a payload the shim never sends | —                               |
 
 ## Sandbox metrics and errors
 

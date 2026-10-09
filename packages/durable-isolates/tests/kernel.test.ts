@@ -1,7 +1,7 @@
 import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
-import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
+import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, HostGlobal, PerExecuteGlobals } from '../src'
 import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
@@ -175,24 +175,6 @@ describe('boundary records carry the call (name + args)', () => {
       scope: '',
       order: 0,
       error: { name: 'TypeError', message: 'nope' },
-    })
-  }, 15_000)
-
-  test('failed (no global): the missing name and the args are still recorded', async () => {
-    const code = `import { call } from 'tools'
-      try { await call('missing', 'a', 1) } catch {}
-      export default 'survived'`
-
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
-    expect(r.outcome).toBe('completed')
-    expect(r.cache['missing#0']).toEqual({
-      seq: 0,
-      status: 'failed',
-      name: 'missing',
-      args: ['a', 1],
-      scope: '',
-      order: 0,
-      error: { name: 'Error', message: 'durable-isolates: no global for "missing"' },
     })
   }, 15_000)
 
@@ -1513,7 +1495,7 @@ describe('replay divergence (recorded key, different call)', () => {
     expect(r2.rejection).toMatchObject({ mismatch: 'args', recorded: { args: [1] }, attempted: { args: [2] } })
   }, 15_000)
 
-  test('a durable call at a checkpoint key diverges: the record holds no call', async () => {
+  test('a durable call at a checkpoint key diverges: the record holds the other kind of operation', async () => {
     const globals: PerExecuteGlobals = { load: () => 'from-global' }
     const r1 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('k', () => 'from-body')`, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
@@ -1524,11 +1506,11 @@ describe('replay divergence (recorded key, different call)', () => {
       return
     expect(r2.rejection).toEqual({
       reason: 'divergence',
-      mismatch: 'no-call',
+      mismatch: 'kind',
       key: 'k',
       recorded: { key: 'k', scope: '', order: 0 },
       attempted: { name: 'load', args: [{}], scope: '', order: 0 },
-      message: expect.stringContaining('the record holds no call to compare'),
+      message: expect.stringContaining('a different kind of operation than the record holds'),
     })
   }, 15_000)
 
@@ -1895,7 +1877,7 @@ describe('pinned edge cases', () => {
     expect(r0.outcome).toBe('rejected')
     expect(r0.cache).toEqual({})
 
-    // name divergence, no-call divergence, args violation at a recorded key: history untouched
+    // name divergence, kind divergence, args violation at a recorded key: history untouched
     const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
     expect(r1.outcome).toBe('completed')
     for (const code of [
@@ -2288,6 +2270,228 @@ describe('issue order (position) divergence', () => {
     expect(r2.outcome === 'completed' && r2.result).toEqual([5, 'L'])
     expect(loads).toBe(1)
   }, 15_000)
+})
+
+describe('history rules (keys are used once, globals must be mounted)', () => {
+  const globals: PerExecuteGlobals = { a: () => 'A', load: () => 'from-global' }
+  test('a call to a name with no mounted global rejects the run; nothing is recorded', async () => {
+    const code = `import { call } from 'tools'
+      try { await call('missing', 'a', 1) } catch {}
+      export default 'survived'`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toEqual({ reason: 'unknown-global', key: 'missing#0', name: 'missing', message: expect.stringContaining('no mounted global answers') })
+    expect(r.rejection.message).not.toContain('missing') // the name is a structured field only
+    expect(r.cache).toEqual({})
+    expect(r.run.status).toBe('aborted') // the try/catch did not help
+  }, 15_000)
+
+  test('a per-execute override of undefined counts as unmounted: the waiting gate survives', async () => {
+    const withApprove: PerExecuteGlobals = { ...globals, approve: () => {
+      throw new SuspendIsolate({})
+    } }
+    const code = `import { step } from 'tools'; export default await step('gate', 'approve', {})`
+    const r1 = await runner.execute({ code, cache: {}, globals: withApprove }).result
+    expect(r1.outcome).toBe('suspended')
+    // `{ approve: maybeFn }` with maybeFn undefined — a JS caller's spread
+    const r2 = await runner.execute({ code, cache: r1.cache, globals: { ...globals, approve: undefined as unknown as HostGlobal } }).result
+    expect(r2.outcome === 'rejected' && r2.rejection).toMatchObject({ reason: 'unknown-global', key: 'gate', name: 'approve' })
+    expect(r2.cache.gate).toMatchObject({ status: 'waiting' })
+  }, 15_000)
+
+  test('a retry in the same run must use a new key', async () => {
+    let attempts = 0
+    const g: PerExecuteGlobals = { ...globals, flaky: () => {
+      attempts += 1
+      if (attempts === 1)
+        throw new Error('transient')
+      return 'ok'
+    } }
+    const sameKey = `import { boundary } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      let out
+      try { out = await boundary('s', () => step('f', 'flaky', {})) } catch { out = await boundary('s', () => 'gave up') }
+      export default out`
+    const r1 = await runner.execute({ code: sameKey, cache: {}, globals: g }).result
+    expect(r1.outcome === 'rejected' && r1.rejection).toMatchObject({ reason: 'duplicate-key', key: 's', detail: 'used twice in this run' })
+
+    attempts = 0
+    const newKey = `import { boundary } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      let out
+      try { out = await boundary('s', () => step('f', 'flaky', {})) } catch { out = await boundary('s-retry', () => 'gave up') }
+      export default out`
+    const r2 = await runner.execute({ code: newKey, cache: {}, globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('gave up')
+  }, 20_000)
+
+  test('a positioned commit without its lookup is a protocol fault, so a forged commit cannot race a dispatch', async () => {
+    const g: PerExecuteGlobals = { ...globals, slow: async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50)
+      })
+      return 'real'
+    } }
+    const code = `import { durableCommit } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      const p = step('k', 'slow', 1)
+      await durableCommit('k', 'forged', { order: 9, scope: '' })
+      export default await p`
+    const r = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r.outcome === 'rejected' && r.rejection).toMatchObject({ reason: 'protocol', source: 'commit', key: 'k', detail: 'commit without lookup' })
+    expect(r.cache.k).toMatchObject({ value: 'real' }) // the in-flight dispatch was drained; the forgery never landed
+  }, 15_000)
+
+  test('a step id reused in a loop is rejected on its second use', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      const out = []
+      for (const i of [1, 2]) out.push(await boundary('fetch', () => i))
+      export default out`
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toEqual({ reason: 'duplicate-key', key: 'fetch', detail: 'used twice in this run', message: expect.stringContaining('used twice in this run') })
+    expect(r.rejection.message).not.toContain('fetch')
+  }, 15_000)
+
+  test('two parallel steps with one id, and a call reusing a step\'s key, are rejected too', async () => {
+    const parallel = `import { boundary } from 'durable-isolates:internal'
+      export default await Promise.all([boundary('k', () => 1), boundary('k', () => 2)])`
+    const r1 = await runner.execute({ code: parallel, cache: {}, globals }).result
+    expect(r1.outcome === 'rejected' && r1.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'used twice in this run' })
+
+    const mixed = `import { boundary } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      await boundary('k', () => 1)
+      export default await step('k', 'a', {})`
+    const r2 = await runner.execute({ code: mixed, cache: {}, globals }).result
+    expect(r2.outcome === 'rejected' && r2.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'used twice in this run' })
+
+    const calls = `import { step } from 'tools'; await step('k', 'a', 1); export default await step('k', 'a', 1)`
+    const r3 = await runner.execute({ code: calls, cache: {}, globals }).result
+    expect(r3.outcome === 'rejected' && r3.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k' })
+  }, 20_000)
+
+  test('a commit never overwrites a record: a raw commit onto a recorded key is rejected, a waiting gate cannot be forged over', async () => {
+    const seeded = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, globals }).result
+    expect(seeded.outcome).toBe('completed')
+    const over = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('k', 'forged'); export default 1`, cache: seeded.cache, globals }).result
+    expect(over.outcome === 'rejected' && over.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'already recorded' })
+    expect(over.cache).toEqual(seeded.cache)
+
+    const gated = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', {})`, cache: {}, globals: { approve: () => {
+      throw new SuspendIsolate({})
+    } } }).result
+    expect(gated.outcome).toBe('suspended')
+    const forged = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('gate', 'yes'); export default 1`, cache: gated.cache, globals }).result
+    expect(forged.outcome === 'rejected' && forged.rejection).toMatchObject({ reason: 'duplicate-key', key: 'gate', detail: 'already recorded' })
+    expect(forged.cache.gate).toMatchObject({ status: 'waiting' }) // the gate is still a gate
+
+    const twice = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('c', 1); await durableCommit('c', 2); export default 1`, cache: {}, globals }).result
+    expect(twice.outcome === 'rejected' && twice.rejection).toMatchObject({ reason: 'duplicate-key', key: 'c', detail: 'used twice in this run' })
+  }, 30_000)
+
+  test('a step landing on a call\'s record is a kind divergence (the mirror of a call on a checkpoint)', async () => {
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: {}, globals }).result
+    expect(r1.outcome === 'completed' && r1.result).toBe('from-global')
+    let bodyRan = false
+    const r2 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'
+      import { step } from 'tools'
+      export default await boundary('k', async () => { await step('m', 'mark', {}); return 'fresh' })`, cache: r1.cache, globals: { ...globals, mark: () => {
+      bodyRan = true
+      return 1
+    } } }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toEqual({
+      reason: 'divergence',
+      mismatch: 'kind',
+      key: 'k',
+      recorded: { key: 'k', scope: '', order: 0, name: 'load', args: [{}] },
+      attempted: { scope: '', order: 0 },
+      message: expect.stringContaining('a different kind of operation'),
+    })
+    expect(bodyRan).toBe(false)
+    expect(r2.cache).toEqual(r1.cache)
+  }, 15_000)
+
+  test('resuming without the waiting global rejects the run and leaves the waiting record intact', async () => {
+    let approved = false
+    const withApprove: PerExecuteGlobals = { ...globals, approve: () => {
+      if (!approved)
+        throw new SuspendIsolate({ ticket: 't-1' })
+      return 'ok'
+    } }
+    const code = `import { step } from 'tools'; await step('a', 'a', {}); export default await step('gate', 'approve', { amount: 1 })`
+    const r1 = await runner.execute({ code, cache: {}, globals: withApprove }).result
+    expect(r1.outcome).toBe('suspended')
+
+    // Deploy drift: the resume runs without `approve` mounted.
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals }).result
+    expect(r2.outcome === 'rejected' && r2.rejection).toEqual({ reason: 'unknown-global', key: 'gate', name: 'approve', message: expect.any(String) })
+    expect(r2.cache).toEqual(r1.cache) // still waiting, not turned into a failure
+
+    approved = true
+    const r3 = await runner.execute({ code, cache: r2.cache, globals: withApprove }).result
+    expect(r3.outcome === 'completed' && r3.result).toBe('ok') // the global is back; the resume works
+  }, 20_000)
+
+  test('the used-key set is per run: two concurrent runs reuse the same keys independently', async () => {
+    const globals: PerExecuteGlobals = {
+      echo: async (v) => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 20)
+        })
+        return v
+      },
+    }
+    const code = (tag: string) => `import { call } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      const a = await call('echo', '${tag}-1')
+      const b = await boundary('b', () => '${tag}-2')
+      export default [a, b, await call('echo', '${tag}-3')]`
+    const [x, y] = await Promise.all([
+      runner.execute({ code: code('x'), cache: {}, globals }).result,
+      runner.execute({ code: code('y'), cache: {}, globals }).result,
+    ])
+    expect(x.outcome === 'completed' && x.result).toEqual(['x-1', 'x-2', 'x-3'])
+    expect(y.outcome === 'completed' && y.result).toEqual(['y-1', 'y-2', 'y-3'])
+    expect(Object.keys(x.cache).sort()).toEqual(['b', 'echo#0', 'echo#1'])
+    expect(Object.keys(y.cache).sort()).toEqual(['b', 'echo#0', 'echo#1'])
+  }, 20_000)
+
+  test('a fresh host resumes from a persisted cache: reads are not re-dispatched', async () => {
+    let loads = 0
+    let approved = false
+    const g: PerExecuteGlobals = {
+      load: () => {
+        loads += 1
+        return 'data'
+      },
+      approve: () => {
+        if (!approved)
+          throw new SuspendIsolate({})
+        return 'ok'
+      },
+    }
+    const code = `import { step } from 'tools'; const d = await step('d', 'load', {}); export default [d, await step('g', 'approve', {})]`
+    const first = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(first.outcome).toBe('suspended')
+    const persisted = JSON.stringify(first.cache)
+
+    approved = true
+    const other = durableIsolates()
+    const otherRunner = await other.prepare({ modules: { tools: { shim: SHIM } } })
+    const resumed = await otherRunner.execute({ code, cache: JSON.parse(persisted), globals: g }).result
+    await other.dispose()
+    expect(resumed.outcome === 'completed' && resumed.result).toEqual(['data', 'ok'])
+    expect(loads).toBe(1)
+  }, 30_000)
 })
 
 describe('mount guards', () => {

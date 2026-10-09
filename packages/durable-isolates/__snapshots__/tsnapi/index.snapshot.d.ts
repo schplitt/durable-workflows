@@ -15,7 +15,7 @@ export interface CompletedResult extends ExecuteResultBase {
 }
 export interface DivergenceRejection extends RejectionBase {
   reason: "divergence";
-  mismatch: "order" | "name" | "args" | "no-call";
+  mismatch: "order" | "name" | "args" | "kind";
   recorded: {
     key: string;
     name?: string;
@@ -32,6 +32,10 @@ export interface DivergenceRejection extends RejectionBase {
     scope: string;
     order: number;
   };
+}
+export interface DuplicateKeyRejection extends RejectionBase {
+  reason: "duplicate-key";
+  detail: "used twice in this run" | "already recorded";
 }
 export interface DurableIsolates {
   prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
@@ -103,6 +107,10 @@ export interface SuspendedResult extends ExecuteResultBase {
   pending: PendingOperation[];
   run: RunResult;
 }
+export interface UnknownGlobalRejection extends RejectionBase {
+  reason: "unknown-global";
+  name: string;
+}
 export interface WaitingBoundary extends BoundaryRecordBase {
   status: "waiting";
   name: string;
@@ -119,7 +127,7 @@ export type GlobalMap = Readonly<Record<string, HostGlobal>>;
 export type HostGlobal = (..._: unknown[]) => unknown;
 export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;
 export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
-export type Rejection = NonJsonRejection | DivergenceRejection | ProtocolRejection;
+export type Rejection = NonJsonRejection | DivergenceRejection | DuplicateKeyRejection | UnknownGlobalRejection | ProtocolRejection;
 // #endregion
 
 // #region Classes
