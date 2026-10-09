@@ -20,6 +20,7 @@ pnpm add durable-isolates
 - **Pause and continue.** A host global can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
 - **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
+- **Plain and durable, side by side.** `imports` and `globals` are iso4's, untouched: plain host functions and data. `durableGlobals` are the functions a shim reaches through `durableCall`, and only those are recorded and replayed.
 - **JSON in, JSON out.** Every value crossing a boundary is written and read back as JSON already on the first run, so a replay sees exactly what the first run saw. What JSON cannot write, a bigint, a cycle or a serializer that throws, ends the run with a clear message.
 - **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
 - **Keys are single-use and globals must be mounted.** A key reused within a run, a commit onto a recorded key, or a call whose global is missing ends the run too, with a message naming the rule.
@@ -33,21 +34,19 @@ import { durableIsolates } from 'durable-isolates'
 
 const di = durableIsolates()
 const runner = await di.prepare({
-  modules: {
-    reports: {
-      shim: `
-        import { durableCall, nextKey } from 'durable-isolates:internal'
-        export const load = id => durableCall(nextKey('load'), 'load', id)
-      `,
-    },
+  imports: {
+    reports: `
+      import { durableCall, nextKey } from 'durable-isolates:internal'
+      export const load = id => durableCall(nextKey('load'), 'load', id)
+    `,
   },
+  durableGlobals: { load: (id) => db.reports.get(id) },
 })
 
 let cache = {}
 const r = await runner.execute({
   code: `import { load } from 'reports'; export default await load('r-1')`,
   cache,
-  globals: { load: (id) => db.reports.get(id) },
 }).result
 
 if (r.outcome === 'completed')
@@ -55,23 +54,43 @@ if (r.outcome === 'completed')
 cache = r.cache // persist, then hand back next time
 ```
 
+## Plain calls: iso4 imports and globals
+
+`prepare` takes iso4's `imports` and `globals` exactly as iso4 defines them, and passes them through. A string import is a sandbox module, which is where a shim lives. An object import is an iso4 host module: plain host functions and data, nested up to 64 levels, that sandbox code imports by name. A global is a plain host function on `globalThis` (or, as in iso4, a string expression or a data constant). None of this is durable, and the kernel never touches it: a plain function runs on every replay, nothing is recorded, and values cross with iso4's own V8 serialization, so a `Date` stays a `Date`. Keep a plain result with `boundary()` when it should survive a replay.
+
+<!-- eslint-skip -->
+
+```ts
+const runner = await di.prepare({
+  imports: {
+    reports: shimSource,                                    // sandbox module
+    'acme/util': { version: '1.2', clock: { now: () => Date.now() } }, // plain host module
+  },
+  globals: { log: (...a) => console.log(...a) },            // plain global
+  durableGlobals: { load },                                 // durable, reached through durableCall
+})
+runner.execute({ code, cache, imports: { 'acme/util': { clock: { now: fixedNow } } }, globals: { log }, durableGlobals: { load: authed } })
+```
+
+Per-run overrides follow the same split: `imports` and `globals` are iso4's rebind of the plain functions for this run, `durableGlobals` rebinds the registry. A per-run override that names something iso4 cannot rebind, an unknown global or path, a string module, a data leaf, fails the run with iso4's own error. Two things are the kernel's on the plain side: the specifier `durable-isolates:internal` and the three bridge global names (`KERNEL_BRIDGE_GLOBALS`) are reserved, and a name cannot be both a plain global and a durable global, so one name never means two things. Suspension is a durable call's feature: a `SuspendIsolate` thrown from a plain function is just an error named `SuspendIsolate` in the program, and a failed run carrying that name means the call should have been durable.
+
 ## The cache
 
 The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. Each record has a `status`, a `seq` (write order, for eviction and timelines), and a position: `scope` (the `boundary()` the operation was issued in, `''` at the top level) plus `order` (its number within that scope, counted in source order). The position is what the replay check below compares.
 
 A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
 
-| `status`    | Written By                         | Fields                              |
-| ----------- | ---------------------------------- | ----------------------------------- |
-| `completed` | a global returning                 | `name`, `args`, `value`             |
-| `failed`    | a global throwing                  | `name`, `args`, `error`             |
-| `waiting`   | a global throwing `SuspendIsolate` | `name`, `args`                      |
-| `completed` | `boundary()` / `durableCommit`     | `value` only (no `name`, no `args`) |
+| `status`    | Written By                                 | Fields                              |
+| ----------- | ------------------------------------------ | ----------------------------------- |
+| `completed` | a global returning                         | `name`, `args`, `value`             |
+| `failed`    | a global throwing                          | `name`, `args`, `error`             |
+| `waiting`   | a durable global throwing `SuspendIsolate` | `name`, `args`                      |
+| `completed` | `boundary()` / `durableCommit`             | `value` only (no `name`, no `args`) |
 
 <!-- eslint-skip -->
 
 ```ts
-const r = await runner.execute({ code, cache: {}, globals: { load } }).result
+const r = await runner.execute({ code, cache: {}, durableGlobals: { load } }).result
 r.cache['load#0']
 // { seq: 0, status: 'completed', name: 'load', args: ['r-1'], scope: '', order: 0, value: { … } }
 ```
@@ -102,7 +121,7 @@ What JSON cannot write at all, a `bigint`, a circular structure, or a `toJSON` o
 <!-- eslint-skip -->
 
 ```ts
-const r = await runner.execute({ code, cache, globals: { count: () => ({ total: 10n }) } }).result
+const r = await runner.execute({ code, cache, durableGlobals: { count: () => ({ total: 10n }) } }).result
 if (r.outcome === 'rejected') {
   r.rejection.reason // 'non-json'
   r.rejection.source // 'result' — or 'args', 'error', 'commit'

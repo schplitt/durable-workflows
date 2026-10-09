@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { SuspendIsolate } from 'durable-isolates'
-import type { PerExecuteGlobals } from 'durable-isolates'
+import type { DurableGlobals } from 'durable-isolates'
 import type { DurableWorkflowHost, WorkflowRunner } from '../src'
 import { durableWorkflowHost, INTERNAL_SPECIFIER, WORKFLOW_SPECIFIER } from '../src'
 
@@ -58,7 +58,7 @@ describe('input', () => {
 describe('step.do', () => {
   test('body runs once, then replays from the committed value', async () => {
     let probes = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       probe: () => {
         probes += 1
         return 5
@@ -138,7 +138,7 @@ describe('step.do', () => {
 
   test('an operation inside a step suspends the run, then resumes on re-dispatch', async () => {
     let answer: string | undefined
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       approve: () => {
         if (answer === undefined)
           throw new SuspendIsolate({ need: 'approval' })

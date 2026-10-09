@@ -21,8 +21,7 @@ import type {
   BoundaryCache,
   DurableIsolatesOptions,
   ExecuteHandle,
-  ModuleDefinition,
-  PerExecuteGlobals,
+  DurableGlobals,
 } from 'durable-isolates'
 import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import { durableIsolates } from 'durable-isolates'
@@ -46,7 +45,7 @@ export interface WorkflowPrepareOptions {
    * (e.g. `my:sleep`). The core modules and the definition are mounted
    * automatically; a plugin may not use a reserved specifier.
    */
-  plugins?: Readonly<Record<string, ModuleDefinition>>
+  plugins?: Readonly<Record<string, { shim: string }>>
   /**
    * Default iso4 resource limits for every `execute` on this runner;
    * `WorkflowExecuteOptions.limits` overrides per run. Forwarded to the kernel's
@@ -68,7 +67,7 @@ export interface WorkflowExecuteOptions {
   /**
    * Per-run host globals for the mounted plugins, keyed by operation name.
    */
-  globals?: PerExecuteGlobals
+  globals?: DurableGlobals
   /**
    * iso4 resource limits for this run, overriding the runner's `prepare` default.
    */
@@ -118,7 +117,7 @@ export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWo
         }
       }
       const runner = await host.prepare({
-        modules: { ...coreModules, [DEFINITION_SPECIFIER]: { shim: workflow }, ...plugins },
+        imports: { ...coreModules, [DEFINITION_SPECIFIER]: workflow, ...Object.fromEntries(Object.entries(plugins).map(([specifier, plugin]) => [specifier, plugin.shim])) },
         ...(limits === undefined ? {} : { limits }),
       })
       return {
@@ -127,7 +126,7 @@ export function durableWorkflowHost(options?: DurableIsolatesOptions): DurableWo
           return runner.execute({
             code,
             cache,
-            ...(globals === undefined ? {} : { globals }),
+            ...(globals === undefined ? {} : { durableGlobals: globals }),
             ...(runLimits === undefined ? {} : { limits: runLimits }),
           })
         },

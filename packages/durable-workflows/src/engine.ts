@@ -20,7 +20,7 @@
  * job. Resume is plain re-execution: a waiting operation re-dispatches and its
  * global consults host state.
  */
-import type { HostGlobal, ModuleDefinition } from 'durable-isolates'
+import type { DurableGlobal as KernelGlobal } from 'durable-isolates'
 import type { ResourceLimits } from 'durable-isolates/types/iso4'
 import type { WorkflowRunner } from './host'
 import type {
@@ -106,7 +106,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
 
   // Mount modules built ONCE for the engine's lifetime: each plugin's in-sandbox
   // shim, plus a tiny re-export module per `alias` remapping a core specifier.
-  const mountedModules: Record<string, ModuleDefinition> = {}
+  const mountedModules: Record<string, { shim: string }> = {}
   for (const [specifier, plugin] of Object.entries(plugins))
     mountedModules[specifier] = { shim: plugin.shim }
   for (const [aliasSpecifier, canonical] of Object.entries(alias)) {
@@ -177,7 +177,7 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
     const runner = await ensureRunner(workflow, version, def)
     const cache = (await store.getCache(instanceId)) ?? {}
 
-    const globals: Record<string, HostGlobal> = {}
+    const globals: Record<string, KernelGlobal> = {}
     for (const [name, global] of globalByName) {
       globals[name] = (...forwarded: unknown[]) => {
         const [stepId, ...payload] = forwarded

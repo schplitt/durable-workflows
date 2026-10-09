@@ -18,8 +18,6 @@
  * this source inside the sandbox and to the shipped ambient `.d.ts` for authors'
  * editors (the `cloudflare:workers` pattern).
  */
-import type { ModuleDefinition } from 'durable-isolates'
-
 /**
  * Virtual specifier of the shim-facing module. Plugin and core shims `import`
  * from this; workflow code may not.
@@ -105,7 +103,7 @@ export function defineWorkflow(definition) {
  * `durable-isolates:internal`). Exposing the bundle keeps the engine and tests
  * from drifting from these definitions.
  */
-export const coreModules: Readonly<Record<string, ModuleDefinition>> = {
-  [INTERNAL_SPECIFIER]: { shim: internalShim },
-  [WORKFLOW_SPECIFIER]: { shim: workflowShim },
+export const coreModules: Readonly<Record<string, string>> = {
+  [INTERNAL_SPECIFIER]: internalShim,
+  [WORKFLOW_SPECIFIER]: workflowShim,
 }

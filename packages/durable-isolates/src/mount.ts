@@ -1,6 +1,6 @@
-import type { HostGlobals, Imports } from '@iso4/sandbox'
-import type { HostGlobal, ModuleDefinition } from './types'
-import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER } from './shim'
+import type { HostGlobals, Imports, ImportValue } from '@iso4/sandbox'
+import type { PrepareOptions } from './types'
+import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER, KERNEL_BRIDGE_GLOBALS } from './shim'
 
 /**
  * Prepare-time placeholder — every run rebinds the bridge, so it's never hit.
@@ -10,65 +10,61 @@ function unbound(): never {
 }
 
 /**
- * Build the iso4 `prepare` imports from the mounted modules: each module's
- * shim under its specifier, plus the `durable-isolates:internal` module.
- * Throws if a mounted specifier collides with the reserved kernel module —
- * `durable-isolates:internal` is compiled into every prefix and must not be
- * shadowed by a caller-supplied shim.
- * @param modules the mounted module definitions
+ * Check a `prepare` call as a whole, before anything is built, and throw on
+ * the first rule it breaks:
+ * - the specifier `durable-isolates:internal` is the kernel shim, compiled into
+ *   every prefix, and cannot be mounted;
+ * - the three bridge global names (`KERNEL_BRIDGE_GLOBALS`) are the kernel's;
+ * - a name cannot be both a plain global and a durable global: the two never
+ *   collide at runtime (one is `globalThis.name`, the other is reached only
+ *   through `durableCall`), but one name meaning two things is a trap for
+ *   whoever reads the shim or writes a per-run override.
+ * The builders below assume these hold.
+ * @param options the caller's prepare options
  */
-export function toPrepareImports(modules: Readonly<Record<string, ModuleDefinition>>): Imports {
-  const imports: Record<string, string> = { [INTERNAL_SPECIFIER]: internalShim }
-  for (const [specifier, def] of Object.entries(modules)) {
-    if (specifier === INTERNAL_SPECIFIER) {
-      throw new Error(
-        `durable-isolates: "${INTERNAL_SPECIFIER}" is a reserved module specifier `
-        + '(the kernel shim, compiled into every prefix) and cannot be mounted',
-      )
-    }
-    imports[specifier] = def.shim
+const RESERVED_GLOBALS: ReadonlySet<string> = new Set(KERNEL_BRIDGE_GLOBALS)
+
+export function assertPrepareOptions(options: PrepareOptions): void {
+  if (Object.hasOwn(options.imports ?? {}, INTERNAL_SPECIFIER)) {
+    throw new Error(
+      `durable-isolates: "${INTERNAL_SPECIFIER}" is a reserved module specifier `
+      + '(the kernel shim, compiled into every prefix) and cannot be mounted',
+    )
   }
-  return imports
+  for (const name of Object.keys(options.globals ?? {})) {
+    if (RESERVED_GLOBALS.has(name))
+      throw new Error(`durable-isolates: "${name}" is a reserved global (a kernel bridge) and cannot be mounted`)
+    if (Object.hasOwn(options.durableGlobals ?? {}, name))
+      throw new Error(`durable-isolates: "${name}" is both a plain global and a durable global; give the two different names`)
+  }
 }
 
 /**
- * The three bridge globals declared at prepare (each rebound per run):
- * one per durable primitive — call, lookup, commit. Declared non-enumerable
- * so enumeration-driven sandbox code (`Object.keys(globalThis)`, spreads)
- * never sweeps them up — the shim reaches them by name.
+ * Build the iso4 `prepare` imports: the caller's `imports` as they are (iso4
+ * semantics — a source string is a sandbox module, a host-module object is
+ * plain host functions and data), plus the `durable-isolates:internal`
+ * module. Assumes {@link assertPrepareOptions} passed.
+ * @param imports the caller's iso4 imports
  */
-export function prepareGlobals(): HostGlobals {
+export function toPrepareImports(imports: Imports | undefined): Imports {
+  const out: Record<string, ImportValue> = { [INTERNAL_SPECIFIER]: internalShim, ...imports }
+  return out
+}
+
+/**
+ * Build the iso4 `prepare` globals: the caller's plain `globals` as they are,
+ * plus the three bridge globals (one per durable primitive — call, lookup,
+ * commit), each rebound per run. The bridges are non-enumerable so
+ * enumeration-driven sandbox code (`Object.keys(globalThis)`, spreads) never
+ * sweeps them up — the shim reaches them by name. Assumes
+ * {@link assertPrepareOptions} passed.
+ * @param globals the caller's iso4 globals
+ */
+export function toPrepareGlobals(globals: HostGlobals | undefined): HostGlobals {
   return {
+    ...globals,
     [DURABLE_CALL_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
     [DURABLE_LOOKUP_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
     [DURABLE_COMMIT_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
   }
-}
-
-/**
- * Flatten the modules' default globals into one `name → global` registry,
- * erroring on a cross-module name collision (routing is flat by operation name).
- * @param modules the mounted module definitions
- */
-export function resolveDefaultGlobals(
-  modules: Readonly<Record<string, ModuleDefinition>>,
-): Map<string, HostGlobal> {
-  const index = new Map<string, HostGlobal>()
-  const owner = new Map<string, string>()
-  for (const [specifier, def] of Object.entries(modules)) {
-    if (def.globals === undefined)
-      continue
-    for (const [name, global] of Object.entries(def.globals)) {
-      const clash = owner.get(name)
-      if (clash !== undefined) {
-        throw new Error(
-          `durable-isolates: duplicate global "${name}" mounted by both "${clash}" and "${specifier}" `
-          + '(routing is flat by operation name; names must be unique across modules)',
-        )
-      }
-      owner.set(name, specifier)
-      index.set(name, global)
-    }
-  }
-  return index
 }

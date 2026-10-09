@@ -1,15 +1,17 @@
-import type { HostGlobals, Prefix, RebindGlobals, ResourceLimits } from '@iso4/sandbox'
+import type { HostGlobals, Imports, Prefix, RebindGlobals, RebindImports, ResourceLimits } from '@iso4/sandbox'
 import type {
   BoundaryCache,
   BoundaryRecord,
   DivergenceRejection,
   DuplicateKeyRejection,
+  DurableGlobal,
+  DurableGlobals,
   ExecuteHandle,
   ExecuteResult,
-  HostGlobal,
   NonJsonCallRejection,
   PendingOperation,
-  PerExecuteGlobals,
+  PlainGlobalOverrides,
+  PlainImportOverrides,
   Rejection,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
@@ -73,12 +75,21 @@ type CallEnvelope
     | { ok: false, error: unknown }
 
 export interface ExecuteRunParams {
-  prefix: Prefix<HostGlobals, Record<string, never>>
-  defaults: Map<string, HostGlobal>
+  prefix: Prefix<HostGlobals, Imports>
+  /**
+   * This run's overrides for the plain side — iso4 imports (host-module
+   * function leaves) and globals — handed to iso4 as given.
+   */
+  importOverrides: PlainImportOverrides | undefined
+  globalOverrides: PlainGlobalOverrides | undefined
+  /**
+   * The durable registry declared at prepare, plus this run's overrides.
+   */
+  durableGlobals: Map<string, DurableGlobal>
+  durableOverrides: DurableGlobals | undefined
   prepareLimits: Partial<ResourceLimits> | undefined
   code: string
   cache: BoundaryCache
-  globals: PerExecuteGlobals | undefined
   executeLimits: Partial<ResourceLimits> | undefined
 }
 
@@ -108,14 +119,14 @@ export interface ExecuteRunParams {
  * still lands in the cache, while its resolution into a dead isolate is a
  * harmless no-op. `handle.suspend()` aborts the isolate and resolves after the
  * drain — the external-teardown path.
- * @param params the prefix, default globals, code, cache, per-run globals and limits
+ * @param params the prefix, the declared plain imports/globals and their per-run overrides, the durable registry and its overrides, code, cache and limits
  */
 export function executeRun(params: ExecuteRunParams): ExecuteHandle {
-  const { prefix, defaults, prepareLimits, code, globals, executeLimits } = params
+  const { prefix, importOverrides, globalOverrides, durableOverrides, prepareLimits, code, executeLimits } = params
 
-  const registry = new Map(defaults)
-  if (globals !== undefined) {
-    for (const [name, global] of Object.entries(globals))
+  const registry = new Map(params.durableGlobals)
+  if (durableOverrides !== undefined) {
+    for (const [name, global] of Object.entries(durableOverrides))
       registry.set(name, global)
   }
 
@@ -265,7 +276,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   // history says WHAT was asked at each key, not only what came back. Always
   // SETTLES (suspension and rejection resolve the sentinel) so the drain can
   // await every dispatch.
-  const dispatch = async (key: string, name: string, global: HostGlobal, args: unknown[], argsText: string, scope: string, order: number, seq: number): Promise<CallEnvelope | typeof ABORTED> => {
+  const dispatch = async (key: string, name: string, global: DurableGlobal, args: unknown[], argsText: string, scope: string, order: number, seq: number): Promise<CallEnvelope | typeof ABORTED> => {
     keyAtPosition.set(positionId(scope, order), key)
     // The global gets its OWN copy: `args` is what the record stores and what
     // every replay is compared against, so a global that defaults or edits an
@@ -389,6 +400,21 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     const key = String(bridgeArgs[0])
     const name = String(bridgeArgs[1])
 
+    // Replay fast path: a settled record at this key, for this name, at this
+    // position, whose recorded args the sandbox's text reproduces byte for
+    // byte. Such text is valid JSON of an array, so admission could not refuse
+    // it, and the position and args checks below would all pass — answer
+    // without parsing. Everything else takes the full path.
+    const recorded = cache[key]
+    if (recorded !== undefined && recorded.status !== 'waiting' && recorded.name === name
+      && recorded.order === bridgeArgs[4] && recorded.scope === bridgeArgs[5] && bridgeArgs[3] === undefined
+      && !usedKeys.has(key) && JSON.stringify(recorded.args) === bridgeArgs[2]) {
+      usedKeys.add(key)
+      if (recorded.status === 'completed')
+        return recorded.value
+      throw recorded.error
+    }
+
     // Args are admitted BEFORE the lookup: an argument JSON refuses is a
     // violation even at a key the cache would have answered.
     const admitted = admit({ text: bridgeArgs[2], invalid: bridgeArgs[3] }, { source: 'args', key, name })
@@ -452,13 +478,20 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...prepareLimits, ...executeLimits }
 
   const result = (async (): Promise<ExecuteResult> => {
+    // The plain side is iso4's: its per-run overrides go through as given (a
+    // wrong one fails the run with iso4's own error), and the kernel adds only
+    // its three bridges.
     const result = await prefix.execute({
       code,
       globals: {
+        ...globalOverrides,
         [DURABLE_CALL_GLOBAL]: callBridge,
         [DURABLE_LOOKUP_GLOBAL]: lookupBridge,
         [DURABLE_COMMIT_GLOBAL]: commitBridge,
       } as RebindGlobals<HostGlobals>,
+      // The kernel's imports are dynamic, so iso4's shape-inferred rebind type
+      // collapses here; the runtime contract (function leaves only) is iso4's.
+      imports: importOverrides as unknown as RebindImports<Imports>,
       limits,
       signal: controller.signal,
     })
