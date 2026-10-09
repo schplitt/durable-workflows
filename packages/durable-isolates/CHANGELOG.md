@@ -1,5 +1,24 @@
 # durable-isolates
 
+## 0.3.0
+
+### Minor Changes
+
+- 99e5c63: feat(durable-isolates): detect replay divergence. Every durable operation records its issue position (`order`), and on replay an operation at another position, or a durable call at a recorded key with another `name` or `args` (stable JSON), rejects the run with `reason: 'divergence'` and leaves the history untouched; caches written by earlier versions cannot be resumed.
+- 8acf5fc: feat(durable-isolates): `durableImports` — hand `prepare` a module of host functions (nested allowed) and the kernel generates the sandbox module whose exports are durable calls named `specifier.path`, with per-run overrides on `execute({ durableImports })`. Data leaves, non-identifier export names, a specifier also in `imports` and a name also in `durableGlobals` are refused at `prepare` with the offending path.
+- 1dd8a1f: feat(durable-isolates): reject key reuse, record overwrites and unknown globals. A key names one operation per run and is written once (`reason: 'duplicate-key'`), a step at a call's record or the reverse is a divergence (`mismatch: 'kind'`, replacing `'no-call'`), and a call whose global is not mounted rejects the run (`reason: 'unknown-global'`) instead of recording a failure.
+- badcc44: feat(durable-isolates): carry every boundary value as JSON, so the first run sees exactly what a replay reads back, and reject the run (`outcome: 'rejected'`, `reason: 'non-json'`) on what JSON cannot write. Breaking: thrown `Error`s are recorded as `name` + `message` only, and `durableCommit` resolves with the recorded value instead of `void`.
+- c5e86f3: feat(durable-isolates): `di.run(options)` runs one replay turn on iso4's one-off `sandbox.run` (a fresh isolate, no prefix), taking what `prepare` and `execute` take together. It is the call for untrusted or independent programs that must not share an isolate.
+- 4d78d5f: feat(durable-isolates)!: `prepare` takes iso4's `imports` and `globals` as they are (plain, untouched by the kernel) plus `durableGlobals`, the registry reached through `durableCall`, mirrored by per-run overrides on `execute`. Breaking: `modules: { x: { shim } }` becomes `imports: { x: shim }`, per-run `execute({ globals })` for durable functions becomes `execute({ durableGlobals })` (`globals` now rebinds plain iso4 globals), and `PerExecuteGlobals`/`HostGlobal`/`GlobalMap`/`ModuleDefinition` become `DurableGlobals`/`DurableGlobal` (the others are gone).
+- 55f7ea0: feat(durable-isolates): record call name and args on boundary records. Dispatch records (`completed`, `failed`, `waiting`) now carry `name` and `args`; commit records from `durableCommit`/`boundary()` carry neither.
+
+### Patch Changes
+
+- f39c05b: Update `@iso4/sandbox` to 0.6.1.
+- 41c2310: chore(durable-isolates): bump `@iso4/sandbox` to 0.6.2, which stops dispatching bridge calls queued before an abort. `BridgeCallEntry` loses `blocked` and gains `reason`.
+- 5506fc3: chore(durable-isolates): bump `@iso4/sandbox` to 0.6.3, which lifts the 32-level nesting cap on host → sandbox values. Deep cached values are now delivered on replay exactly as the first run saw them.
+- 18b058a: fix(durable-isolates): keep prototype-named keys (`__proto__`, `constructor`, …) as plain cache entries. A `__proto__` boundary used to be dropped from the cache and a commit at it could answer other keys by inheritance.
+
 ## 0.2.0
 
 ### Minor Changes
