@@ -113,6 +113,21 @@ export interface PrepareOptions {
    */
   durableGlobals?: DurableGlobals
   /**
+   * Durable modules given as host functions, keyed by specifier: the kernel
+   * writes the sandbox module for you. `import { load } from 'acme'` then
+   * calls `load(...)`, which the generated module turns into
+   * `durableCall(nextKey('acme.load'), 'acme.load', ...args)` — recorded as
+   * `acme.load#0` (scope-prefixed inside a `boundary()`), positioned, replayed
+   * from the cache, able to suspend. Nested objects become nested exports.
+   * Functions only (a data value has nothing to record), export names must be
+   * identifiers, a specifier cannot also be in `imports`, and the dotted
+   * operation name cannot collide with a `durableGlobals` name; `prepare`
+   * refuses each with the offending path. Top-level names are the module's
+   * exports and must be identifiers; nested names may be any string (reached
+   * as `obj[name]`).
+   */
+  durableImports?: Readonly<Record<string, DurableModule>>
+  /**
    * Default iso4 resource limits for every `execute` on this prefix;
    * `ExecuteOptions.limits` overrides per run. Replay is bridge-call heavy (a
    * completed boundary still round-trips through the cache lookup), so
@@ -148,7 +163,8 @@ export interface PrepareOptions {
  *   `toJSON`/getter that throws) → the run is REJECTED (terminal `rejected`
  *   outcome, nothing recorded at this key).
  */
-export type DurableGlobal = (...args: unknown[]) => unknown
+// Parameters are `any` so an ordinary typed host function `(id: string) => …` fits.
+export type DurableGlobal = (...args: any[]) => unknown
 
 /**
  * Durable globals keyed by the operation `name` the shim routes to — the
@@ -158,6 +174,14 @@ export type DurableGlobal = (...args: unknown[]) => unknown
  * omitted names keep the prepared default).
  */
 export type DurableGlobals = Readonly<Record<string, DurableGlobal>>
+
+/**
+ * A durable module given as host functions (see `PrepareOptions.durableImports`):
+ * each property is a durable function, or a nested object of them.
+ */
+export interface DurableModule {
+  readonly [name: string]: DurableGlobal | DurableModule
+}
 
 /**
  * Per-run overrides for plain iso4 globals declared at prepare: the function
@@ -235,9 +259,20 @@ export interface ExecuteOptions {
   /**
    * Rebind durable globals for this run (auth and approval answers captured
    * in closure), keyed by operation `name`. Omitted names keep the prepared
-   * default.
+   * default; `undefined` unmounts the name for this run. A value that is
+   * neither makes `execute` throw before the run starts.
    */
   durableGlobals?: DurableGlobals
+  /**
+   * Rebind functions of `durableImports` modules for this run, by the same
+   * specifier and (nested) path they were declared with — the same thing as
+   * `durableGlobals` under the dotted operation name, written the way the
+   * module was declared (the shape is not checked against the declaration; a
+   * path that matches no declared leaf simply binds a name nothing calls). If
+   * both maps name the same operation, `durableGlobals` wins. A leaf that is
+   * neither a function nor `undefined` makes `execute` throw before the run.
+   */
+  durableImports?: Readonly<Record<string, DurableModule>>
   /**
    * iso4 resource limits for this run, overriding the prefix's `prepare`
    * default.

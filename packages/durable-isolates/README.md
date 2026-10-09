@@ -20,7 +20,7 @@ pnpm add durable-isolates
 - **Pause and continue.** A host global can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
 - **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
-- **Plain and durable, side by side.** `imports` and `globals` are iso4's, untouched: plain host functions and data. `durableGlobals` are the functions a shim reaches through `durableCall`, and only those are recorded and replayed.
+- **Plain and durable, side by side.** `imports` and `globals` are iso4's, untouched: plain host functions and data. `durableGlobals` are the functions a shim reaches through `durableCall`, and only those are recorded and replayed. `durableImports` are durable modules the kernel writes the shim for.
 - **JSON in, JSON out.** Every value crossing a boundary is written and read back as JSON already on the first run, so a replay sees exactly what the first run saw. What JSON cannot write, a bigint, a cycle or a serializer that throws, ends the run with a clear message.
 - **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
 - **Keys are single-use and globals must be mounted.** A key reused within a run, a commit onto a recorded key, or a call whose global is missing ends the run too, with a message naming the rule.
@@ -73,6 +73,37 @@ runner.execute({ code, cache, imports: { 'acme/util': { clock: { now: fixedNow }
 ```
 
 Per-run overrides follow the same split: `imports` and `globals` are iso4's rebind of the plain functions for this run, `durableGlobals` rebinds the registry. A per-run override that names something iso4 cannot rebind, an unknown global or path, a string module, a data leaf, fails the run with iso4's own error. Two things are the kernel's on the plain side: the specifier `durable-isolates:internal` and the three bridge global names (`KERNEL_BRIDGE_GLOBALS`) are reserved, and a name cannot be both a plain global and a durable global, so one name never means two things. Suspension is a durable call's feature: a `SuspendIsolate` thrown from a plain function is just an error named `SuspendIsolate` in the program, and a failed run carrying that name means the call should have been durable.
+
+## Durable modules without a shim: `durableImports`
+
+Most durable modules are just "these host functions, recorded": no custom keys, no sandbox logic. For those, hand the functions to `durableImports` and the kernel writes the sandbox module itself.
+
+<!-- eslint-skip -->
+
+```ts
+const runner = await di.prepare({
+  durableImports: {
+    acme: { load, save, inventory: { count } },   // host functions, nested objects allowed
+  },
+})
+// program: import { load, inventory } from 'acme'; await load('r-1'); await inventory.count()
+runner.execute({ code, cache, durableImports: { acme: { load: authed } } })   // per-run rebind, same shape
+```
+
+The generated module for `acme` is, in full:
+
+```js
+import * as __di from 'durable-isolates:internal'
+
+const __di_op = (name) => (...args) => __di.durableCall(__di.nextKey(name), name, ...args)
+export const load = __di_op('acme.load')
+export const save = __di_op('acme.save')
+export const inventory = { count: __di_op('acme.inventory.count') }
+```
+
+So a call records as `acme.load#0` (scope-prefixed inside a `boundary()`), with `name: 'acme.load'`, and gets everything a hand-written shim gets: JSON transport, the position, divergence detection, suspension through `SuspendIsolate`. The dotted name is also the name under `durableGlobals`, so `durableGlobals: { 'acme.load': authed }` and `durableImports: { acme: { load: authed } }` are the same override.
+
+`prepare` refuses, naming the path: a data value as a leaf (nothing to record), a top-level name that is not a usable export identifier (nested names may be any string), a specifier that is also in `imports`, a dotted name that is also in `durableGlobals` or produced by two modules, and the reserved specifier. `execute` throws before the run starts if a per-run `durableGlobals` or `durableImports` value is neither a function nor `undefined`; when both name the same operation, `durableGlobals` wins.
 
 ## The cache
 

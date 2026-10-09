@@ -2585,6 +2585,99 @@ describe('plain globals and imports (iso4 semantics, not durable)', () => {
   })
 })
 
+describe('durableImports (generated durable modules)', () => {
+  test('exports become durable calls named specifier.path; records, replay and nesting work like a hand-written shim', async () => {
+    let loads = 0
+    const di = durableIsolates()
+    const r = await di.prepare({
+      durableImports: { acme: { load: (id: unknown) => {
+        loads += 1
+        return `L:${String(id)}`
+      }, inventory: { count: () => 3 } } },
+    })
+    const code = `import { load, inventory } from 'acme'
+      import { boundary } from 'durable-isolates:internal'
+      const inner = await boundary('s', () => load('nested'))
+      export default [await load('r-1'), await inventory.count(), inner]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['L:r-1', 3, 'L:nested'])
+    expect(r1.cache['acme.load#0']).toMatchObject({ name: 'acme.load', args: ['r-1'], scope: '', value: 'L:r-1' })
+    expect(r1.cache['acme.inventory.count#0']).toMatchObject({ name: 'acme.inventory.count', args: [] })
+    expect(r1.cache['s/acme.load#0']).toMatchObject({ name: 'acme.load', args: ['nested'], scope: 's' })
+
+    const r2 = await r.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)) }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['L:r-1', 3, 'L:nested'])
+    expect(loads).toBe(2) // once at the top level, once in the boundary; nothing on replay
+
+    const swapped = await r.execute({ code: `import { load, inventory } from 'acme'; await inventory.count(); export default await load('r-1')`, cache: r1.cache }).result
+    expect(swapped.outcome === 'rejected' && swapped.rejection).toMatchObject({ reason: 'divergence', mismatch: 'order' })
+    await di.dispose()
+  }, 20_000)
+
+  test('a generated export can suspend, and is rebound per run through durableImports or the dotted durableGlobals name', async () => {
+    let approved = false
+    const di = durableIsolates()
+    const r = await di.prepare({
+      durableImports: { acme: { approve: () => {
+        if (!approved)
+          throw new SuspendIsolate({ ticket: 't-1' })
+        return 'prepared'
+      } } },
+    })
+    const code = `import { approve } from 'acme'; export default await approve({ amount: 1 })`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'suspended' && r1.pending).toEqual([{ id: 'acme.approve#0', name: 'acme.approve', payload: { ticket: 't-1' } }])
+
+    const viaImports = await r.execute({ code, cache: r1.cache, durableImports: { acme: { approve: () => 'via-imports' } } }).result
+    expect(viaImports.outcome === 'completed' && viaImports.result).toBe('via-imports')
+    const viaName = await r.execute({ code, cache: r1.cache, durableGlobals: { 'acme.approve': () => 'via-name' } }).result
+    expect(viaName.outcome === 'completed' && viaName.result).toBe('via-name')
+    approved = true
+    const prepared = await r.execute({ code, cache: r1.cache }).result
+    expect(prepared.outcome === 'completed' && prepared.result).toBe('prepared')
+    await di.dispose()
+  }, 20_000)
+
+  test('prepare refuses data leaves, bad export names, and collisions, naming the path', async () => {
+    await expect(host.prepare({ durableImports: { acme: { version: '1.2' as unknown as () => unknown } } })).rejects.toThrow(/"acme\.version" is not a function/)
+    await expect(host.prepare({ durableImports: { acme: { 'bad-name': () => 1 } } })).rejects.toThrow(/"acme\.bad-name" cannot be exported/)
+    await expect(host.prepare({ durableImports: { acme: { default: () => 1 } } })).rejects.toThrow(/"acme\.default" cannot be exported/)
+    await expect(host.prepare({ durableImports: { acme: { public: () => 1 } } })).rejects.toThrow(/"acme\.public" cannot be exported/) // strict-mode reserved
+    await expect(host.prepare({ durableImports: { acme: { __di_op: () => 1 } } })).rejects.toThrow(/"acme\.__di_op" cannot be exported/)
+    await expect(host.prepare({ durableImports: { 'a.b': { c: () => 1 }, 'a': { b: { c: () => 2 } } } })).rejects.toThrow(/"a\.b\.c" is produced by two durable imports/)
+    await expect(host.prepare({ imports: { acme: 'export const x = 1' }, durableImports: { acme: { f: () => 1 } } })).rejects.toThrow(/both a plain import and a durable import/)
+    await expect(host.prepare({ durableGlobals: { 'acme.f': () => 1 }, durableImports: { acme: { f: () => 2 } } })).rejects.toThrow(/both a durable import and a durable global/)
+    await expect(host.prepare({ durableImports: { 'durable-isolates:internal': { f: () => 1 } } })).rejects.toThrow(/reserved module specifier/)
+  })
+
+  test('leaves named op/durableCall/nextKey, nested odd names, and typed host functions all work', async () => {
+    const di = durableIsolates()
+    const typed = (id: string): string => `T:${id}` // an ordinary typed function fits DurableModule
+    const r = await di.prepare({
+      durableImports: { acme: { op: () => 'op!', nextKey: () => 'nk!', typed, util: { 'bad-name': () => 'odd', ['__proto__']: () => 'proto' } } }, // computed key: an OWN leaf named __proto__
+    })
+    const code = `import { op, nextKey, typed, util } from 'acme'
+      export default [await op(), await nextKey(), await typed('x'), await util['bad-name'](), await util.__proto__(), Object.keys(util)]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['op!', 'nk!', 'T:x', 'odd', 'proto', ['bad-name', '__proto__']]) // __proto__ is an OWN property
+    await di.dispose()
+  }, 20_000)
+
+  test('a per-run durableImports leaf of undefined unmounts the operation for that run', async () => {
+    const di = durableIsolates()
+    const r = await di.prepare({ durableImports: { acme: { f: () => 1 } } })
+    const code = `import { f } from 'acme'; export default await f()`
+    const r1 = await r.execute({ code, cache: {}, durableImports: { acme: { f: undefined as unknown as () => unknown } } }).result
+    expect(r1.outcome === 'rejected' && r1.rejection).toMatchObject({ reason: 'unknown-global', name: 'acme.f' })
+    await di.dispose()
+  }, 15_000)
+
+  test('execute refuses a durable override that is not a function, before the run starts', () => {
+    expect(() => runner.execute({ code: 'export default 1', cache: {}, durableGlobals: { load: 'nope' as unknown as () => unknown } })).toThrow(/durableGlobals\["load"\] is not a function/)
+    expect(() => runner.execute({ code: 'export default 1', cache: {}, durableImports: { acme: { util: { now: 5 as unknown as () => unknown } } } })).toThrow(/durableImports "acme\.util\.now" is not a function/)
+  })
+})
+
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(

@@ -50,6 +50,9 @@ export interface DurableIsolatesRunner {
   execute: (_: ExecuteOptions) => ExecuteHandle;
   dispose: () => Promise<void>;
 }
+export interface DurableModule {
+  readonly [name: string]: DurableGlobal | DurableModule;
+}
 export interface ExecuteHandle {
   result: Promise<ExecuteResult>;
   suspend: () => Promise<ExecuteResult>;
@@ -60,6 +63,7 @@ export interface ExecuteOptions {
   imports?: PlainImportOverrides;
   globals?: PlainGlobalOverrides;
   durableGlobals?: DurableGlobals;
+  durableImports?: Readonly<Record<string, DurableModule>>;
   limits?: Partial<ResourceLimits>;
 }
 export interface FailedBoundary extends BoundaryRecordBase {
@@ -89,6 +93,7 @@ export interface PrepareOptions {
   imports?: Imports;
   globals?: HostGlobals;
   durableGlobals?: DurableGlobals;
+  durableImports?: Readonly<Record<string, DurableModule>>;
   limits?: Partial<ResourceLimits>;
 }
 export interface ProtocolRejection extends RejectionBase {
@@ -122,7 +127,7 @@ export interface WaitingBoundary extends BoundaryRecordBase {
 export type BoundaryCache = Record<string, BoundaryRecord>;
 export type BoundaryRecord = CompletedBoundary | FailedBoundary | WaitingBoundary;
 export type CreateDurableIsolates = (_?: DurableIsolatesOptions) => DurableIsolates;
-export type DurableGlobal = (..._: unknown[]) => unknown;
+export type DurableGlobal = (..._: any[]) => unknown;
 export type DurableGlobals = Readonly<Record<string, DurableGlobal>>;
 export type ExecuteResult = CompletedResult | SuspendedResult | FailedResult | RejectedResult;
 export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;

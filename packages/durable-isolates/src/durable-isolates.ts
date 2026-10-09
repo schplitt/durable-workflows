@@ -11,7 +11,7 @@ import type {
   DurableIsolates,
   DurableIsolatesRunner,
 } from './types'
-import { assertPrepareOptions, toPrepareGlobals, toPrepareImports } from './mount'
+import { assertExecuteOptions, assertPrepareOptions, flattenDurableImports, toDurableImports, toPrepareGlobals, toPrepareImports } from './mount'
 import { executeRun } from './execute'
 
 /**
@@ -32,29 +32,35 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
 
     prepare: async (prepareOptions): Promise<DurableIsolatesRunner> => {
       assertPrepareOptions(prepareOptions) // every rule, before anything is built
-      const { imports = {}, globals = {}, durableGlobals = {}, limits: prepareLimits } = prepareOptions
+      const { imports = {}, globals = {}, durableGlobals = {}, durableImports, limits: prepareLimits } = prepareOptions
 
-      const durable = new Map(Object.entries(durableGlobals)) // built once; each run copies it before applying overrides
+      const generated = toDurableImports(durableImports)
+      const durable = new Map(Object.entries({ ...generated.registry, ...durableGlobals })) // built once; each run copies it before applying overrides
       const sandbox = await getSandbox()
       const prefix: Prefix<HostGlobals, Imports> = await sandbox.prepare({
         code: '',
         globals: toPrepareGlobals(globals),
-        imports: toPrepareImports(imports),
+        imports: toPrepareImports({ ...imports, ...generated.shims }),
       })
 
       const runner: DurableIsolatesRunner = {
         prefixId: prefix.id,
-        execute: (executeOptions) => executeRun({
-          prefix,
-          durableGlobals: durable,
-          prepareLimits,
-          code: executeOptions.code,
-          cache: executeOptions.cache,
-          importOverrides: executeOptions.imports,
-          globalOverrides: executeOptions.globals,
-          durableOverrides: executeOptions.durableGlobals,
-          executeLimits: executeOptions.limits,
-        }),
+        execute: (executeOptions) => {
+          assertExecuteOptions(executeOptions) // shape rules, before the run starts
+          return executeRun({
+            prefix,
+            durableGlobals: durable,
+            prepareLimits,
+            code: executeOptions.code,
+            cache: executeOptions.cache,
+            importOverrides: executeOptions.imports,
+            globalOverrides: executeOptions.globals,
+            durableOverrides: executeOptions.durableImports === undefined && executeOptions.durableGlobals === undefined
+              ? undefined
+              : { ...flattenDurableImports(executeOptions.durableImports), ...executeOptions.durableGlobals },
+            executeLimits: executeOptions.limits,
+          })
+        },
         dispose: () => prefix.dispose(),
       }
       return runner
