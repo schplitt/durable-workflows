@@ -15,8 +15,10 @@
  * CALLER owns storage (persist `cache`, hand it back next turn), retry/eviction
  * (cache surgery), and reacting to `pending` operations. Keys are always formed
  * sandbox-side and carried over the wire — the kernel is a memoize-by-key
- * router. Determinism is a documented contract (deterministic keys, no
- * time/randomness in branches), not an enforced one: a key miss simply runs.
+ * router. A key miss simply runs; a key HIT is checked: the program must ask
+ * the same call (`name` + `args`, compared as stable JSON) the record holds,
+ * or the run is rejected as a replay divergence. Keys themselves are not
+ * policed (a changed key is just a miss).
  *
  * Everything that enters the cache must be plain JSON (see `toJson`): the
  * kernel normalizes every boundary value the way a JSON round trip would, so
@@ -176,9 +178,12 @@ export interface DurableIsolatesRunner {
 export interface ExecuteOptions {
   /**
    * ESM source — the SAME source on every replay. Keys are formed
-   * deterministically in the shim; determinism is the documented contract
-   * (deterministic keys and branches). A changed path just misses the cache and
-   * runs — the kernel does not police it. Durable calls and checkpoints
+   * deterministically in the shim. A durable call at an unrecorded key just
+   * runs; one at a RECORDED key must ask the same `name` with the same `args`
+   * (stable JSON, object key order ignored) or the run is rejected as a
+   * replay divergence — so keep durable calls in the same order on every run
+   * (parallel calls must not depend on completion order) and wrap
+   * nondeterministic inputs in `boundary()`. Durable calls and checkpoints
    * belong on the awaited path: work registered with iso4's `waitUntil` runs
    * after `execute` has returned, so anything it records lands in a `cache`
    * the caller may already have persisted — not supported.
@@ -326,9 +331,35 @@ export interface RejectedResult extends ExecuteResultBase {
 
 /**
  * Why a run was rejected — discriminated on `reason`. `key` is the boundary
- * the violation happened at (nothing is recorded there).
+ * the violation happened at (nothing new is recorded there).
  */
-export type Rejection = NonJsonRejection
+export type Rejection = NonJsonRejection | DivergenceRejection
+
+/**
+ * The program asked, at a recorded key, for a different call than the record
+ * holds: another operation `name`, the same operation with other `args`
+ * (compared as stable JSON, so object key order does not matter), or a call
+ * where the record holds no call at all (a `boundary()`/`durableCommit`
+ * checkpoint, or a record written by an older kernel). Nothing is answered,
+ * re-thrown or re-dispatched; the recorded entry is left as it was.
+ */
+export interface DivergenceRejection extends RejectionBase {
+  reason: 'divergence'
+  /**
+   * What differed: the operation name, the arguments, or the record holds no
+   * call to compare against.
+   */
+  mismatch: 'name' | 'args' | 'no-call'
+  /**
+   * The call the record at `key` holds — both absent when `mismatch` is
+   * `'no-call'`.
+   */
+  recorded: { name?: string, args?: unknown[] }
+  /**
+   * The call the program asked for this run (args JSON-normalized).
+   */
+  attempted: { name: string, args: unknown[] }
+}
 
 interface RejectionBase {
   key: string

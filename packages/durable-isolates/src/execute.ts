@@ -2,6 +2,7 @@ import type { HostGlobals, Prefix, RebindGlobals, ResourceLimits } from '@iso4/s
 import type {
   BoundaryCache,
   BoundaryRecord,
+  DivergenceRejection,
   ExecuteHandle,
   ExecuteResult,
   HostGlobal,
@@ -12,7 +13,13 @@ import type {
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL } from './shim'
-import { NonJsonValueError, toJson } from './json'
+import { NonJsonValueError, stableStringify, toJson } from './json'
+
+/**
+ * The rule a divergence message ends with — what the author (or model) must
+ * change for replays to line up.
+ */
+const DETERMINISM_RULE = 'Durable calls must be deterministic across runs: keep them in the same order (parallel calls must not depend on completion order) and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.'
 
 /**
  * The rule every rejection message ends with — written for whoever wrote the
@@ -153,9 +160,15 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       cache[key] = { seq, status: 'failed', name, args, error }
       return { ok: false, error }
     }
+    // The global gets its OWN copy: `args` is what the record stores and what
+    // every replay is compared against, so a global that defaults or edits an
+    // options object in place must not rewrite the history under itself. Cloned
+    // outside the try so a clone failure is never blamed on the global (not
+    // reachable today: iso4's bridge refuses deeper nesting first).
+    const ownArgs = structuredClone(args)
     let returned: unknown
     try {
-      returned = await global(...args)
+      returned = await global(...ownArgs)
     } catch (e) {
       if (e instanceof SuspendIsolate) {
         cache[key] = { seq, status: 'waiting', name, args }
@@ -166,9 +179,22 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       // own fields and the host stack are dropped: the cache is text a model
       // reads back, and iso4 synthesizes a fresh stack in the sandbox). The
       // bridge re-throws this and iso4 (>=0.2.2) rebuilds a real Error from it
-      // in the sandbox — no reconstruction shim. A non-Error throw is admitted
-      // like any other value.
-      const admitted = e instanceof Error ? { ok: true as const, value: { name: String(e.name), message: String(e.message) } } : admit(e, { source: 'error', key, name })
+      // in the sandbox — no reconstruction shim. `Error.isError` checks the
+      // internal slot, so an Error from another realm or a DOMException counts
+      // and no getter or Proxy trap runs; a `name`/`message` getter that throws
+      // falls back to a fixed text (this catch must always settle). A non-Error
+      // throw is admitted like any other value.
+      let admitted: { ok: true, value: unknown } | { ok: false }
+      if (Error.isError(e)) {
+        try {
+          const { name: errorName, message } = e as Error
+          admitted = { ok: true, value: { name: String(errorName), message: String(message) } }
+        } catch {
+          admitted = { ok: true, value: { name: 'Error', message: 'unreadable error' } }
+        }
+      } else {
+        admitted = admit(e, { source: 'error', key, name })
+      }
       if (!admitted.ok)
         return ABORTED
       cache[key] = { seq, status: 'failed', name, args, error: admitted.value }
@@ -220,6 +246,25 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
 
     const existing = cache[key]
     if (existing !== undefined) {
+      // A recorded key is only answered (or re-thrown, or re-dispatched) for
+      // the SAME call it was recorded for. Anything else is a replay
+      // divergence: the program's durable calls no longer line up with its
+      // history, so no answer from the cache can be trusted — reject the run.
+      const mismatch = existing.name === undefined || existing.args === undefined
+        ? 'no-call'
+        : existing.name !== name ? 'name' : stableStringify(existing.args) !== stableStringify(args) ? 'args' : undefined
+      if (mismatch !== undefined) {
+        const what = mismatch === 'name'
+          ? 'a different operation'
+          : mismatch === 'args' ? 'the same operation with different arguments' : 'a call where the record holds no call to compare (a checkpoint, or a record from an older kernel)'
+        const message = `durable-isolates: replay divergence: at a recorded boundary the program asked for ${what}. ${DETERMINISM_RULE}`
+        // `recorded` is handed out as a copy so a caller editing the rejection
+        // (redacting it for a log, say) cannot touch the history it persists.
+        const recorded: DivergenceRejection['recorded'] = mismatch === 'no-call' ? {} : { name: existing.name as string, args: structuredClone(existing.args as unknown[]) }
+        rejection ??= { reason: 'divergence', key, mismatch, recorded, attempted: { name, args }, message }
+        controller.abort()
+        return never()
+      }
       if (existing.status === 'completed')
         return existing.value
       if (existing.status === 'failed')

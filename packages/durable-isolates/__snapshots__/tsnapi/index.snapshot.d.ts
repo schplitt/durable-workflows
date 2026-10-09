@@ -13,6 +13,18 @@ export interface CompletedResult extends ExecuteResultBase {
   result: unknown;
   run: RunSuccess;
 }
+export interface DivergenceRejection extends RejectionBase {
+  reason: "divergence";
+  mismatch: "name" | "args" | "no-call";
+  recorded: {
+    name?: string;
+    args?: unknown[];
+  };
+  attempted: {
+    name: string;
+    args: unknown[];
+  };
+}
 export interface DurableIsolates {
   prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
   getSandbox: () => Promise<Sandbox>;
@@ -95,7 +107,7 @@ export type GlobalMap = Readonly<Record<string, HostGlobal>>;
 export type HostGlobal = (..._: unknown[]) => unknown;
 export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;
 export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
-export type Rejection = NonJsonRejection;
+export type Rejection = NonJsonRejection | DivergenceRejection;
 // #endregion
 
 // #region Classes
@@ -131,5 +143,9 @@ interface NonJsonRejectionBase extends RejectionBase {
   reason: "non-json";
   path: string;
   found: string;
+}
+interface RejectionBase {
+  key: string;
+  message: string;
 }
 // #endregion
