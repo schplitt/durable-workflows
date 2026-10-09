@@ -1,4 +1,4 @@
-import type { HostGlobals, Imports, ImportValue } from '@iso4/sandbox'
+import type { HostExportFunction, HostGlobals, Imports, ImportValue } from '@iso4/sandbox'
 import type { DurableGlobal, DurableModule, ExecuteOptions, PrepareOptions } from './types'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER, KERNEL_BRIDGE_GLOBALS } from './shim'
 
@@ -23,7 +23,8 @@ function unbound(): never {
  *   `imports` (one specifier, one module), every export name is an identifier
  *   the generated module can `export`, every leaf is a function (a data value
  *   has nothing to record), and its dotted operation names do not collide
- *   with `durableGlobals`.
+ *   with `durableGlobals`;
+ * - every `durableGlobals` value is a function.
  * The builders below assume these hold.
  * @param options the caller's prepare options
  */
@@ -44,6 +45,10 @@ export function assertPrepareOptions(options: PrepareOptions): void {
       throw new Error(`durable-isolates: "${name}" is a reserved global (a kernel bridge) and cannot be mounted`)
     if (Object.hasOwn(options.durableGlobals ?? {}, name))
       throw new Error(`durable-isolates: "${name}" is both a plain global and a durable global; give the two different names`)
+  }
+  for (const [name, value] of Object.entries(options.durableGlobals ?? {})) {
+    if (typeof value !== 'function') // a non-function here would surface as a failed boundary at the first call
+      throw new TypeError(`durable-isolates: durableGlobals["${name}"] is not a function`)
   }
   // Every durable import leaf becomes one registry name `specifier.path`; two
   // leaves must not produce the same name (`a.b` + `c` vs `a` + `b.c`).
@@ -108,7 +113,10 @@ export function assertExecuteOptions(options: ExecuteOptions): void {
  * entries behind them. Each function leaf at `specifier.path` becomes an
  * export calling `durableCall(nextKey(name), name, ...args)` with the dotted
  * name, and a registry entry under that name; nested objects become nested
- * exports. Assumes {@link assertPrepareOptions} passed.
+ * exports. Generated on every call (a few microseconds, nothing next to an
+ * isolate boot) so the registry always holds the functions passed THIS time —
+ * a memo keyed on the object would pin the first call's leaves. Assumes
+ * {@link assertPrepareOptions} passed.
  * @param durableImports the caller's durable modules
  */
 export function toDurableImports(durableImports: Readonly<Record<string, DurableModule>> | undefined): { shims: Record<string, string>, registry: Record<string, DurableGlobal> } {
@@ -188,12 +196,14 @@ export function toPrepareImports(imports: Imports | undefined): Imports {
  * sweeps them up — the shim reaches them by name. Assumes
  * {@link assertPrepareOptions} passed.
  * @param globals the caller's iso4 globals
+ * @param bridges the bridge handlers to declare — a one-off run passes this
+ * run's; a prefix declares placeholders and rebinds per run
  */
-export function toPrepareGlobals(globals: HostGlobals | undefined): HostGlobals {
+export function toPrepareGlobals(globals: HostGlobals | undefined, bridges: Record<string, HostExportFunction> = {}): HostGlobals {
   return {
     ...globals,
-    [DURABLE_CALL_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
-    [DURABLE_LOOKUP_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
-    [DURABLE_COMMIT_GLOBAL]: { kind: 'bridge', handler: unbound, enumerable: false },
+    [DURABLE_CALL_GLOBAL]: { kind: 'bridge', handler: bridges[DURABLE_CALL_GLOBAL] ?? unbound, enumerable: false },
+    [DURABLE_LOOKUP_GLOBAL]: { kind: 'bridge', handler: bridges[DURABLE_LOOKUP_GLOBAL] ?? unbound, enumerable: false },
+    [DURABLE_COMMIT_GLOBAL]: { kind: 'bridge', handler: bridges[DURABLE_COMMIT_GLOBAL] ?? unbound, enumerable: false },
   }
 }

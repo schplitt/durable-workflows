@@ -29,7 +29,7 @@
  * write — a `bigint`, a circular structure, a `toJSON` or getter that throws —
  * REJECTS the run (a terminal `rejected` outcome, uncatchable in-sandbox).
  */
-import type { HostExportFunction, HostGlobals, HostModuleObject, Imports, ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
+import type { HostExportFunction, HostGlobals, HostModuleObject, Imports, OneOffResourceLimits, ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Host — owns the one iso4 sandbox (the Rust bind)
@@ -76,8 +76,20 @@ export interface DurableIsolates {
    */
   getSandbox: () => Promise<Sandbox>
   /**
-   * Tear down the sandbox and every prefix prepared on it. Not terminal: a
-   * later `prepare`/`getSandbox` creates a fresh sandbox.
+   * One replay turn WITHOUT a prefix: iso4's one-off `sandbox.run`, a fresh
+   * isolate for this run alone (no warm-instance carryover, no prefix to
+   * create and dispose). Takes what `prepare` and `execute` take together —
+   * the modules, globals, durable registry, code and cache — and returns the
+   * same handle. The right call for single runs that arrive independently
+   * (one request, one program), and for code that must not share an isolate
+   * with anything else; a program replayed many times is cheaper on a
+   * prepared prefix.
+   */
+  run: (options: RunOptions) => ExecuteHandle
+  /**
+   * Tear down the sandbox, every prefix prepared on it and any one-off run in
+   * flight (its `handle.result` rejects with iso4's "runtime is disposed").
+   * Not terminal: a later `prepare`/`run`/`getSandbox` creates a fresh sandbox.
    */
   dispose: () => Promise<void>
 }
@@ -108,8 +120,9 @@ export interface PrepareOptions {
    * The durable registry: host functions a shim reaches ONLY through
    * `durableCall(key, name, …args)`, keyed by that `name`. Every call to one
    * is recorded, positioned, replayed from the cache, and can suspend the
-   * run. A `name` whose per-run state (auth, approval answers) is captured
-   * per run can be supplied on `ExecuteOptions.durableGlobals` instead.
+   * run. On a prefix, a `name` whose state is per run (auth, approval
+   * answers) can be supplied on `ExecuteOptions.durableGlobals` instead; a
+   * one-off `run` takes everything here.
    */
   durableGlobals?: DurableGlobals
   /**
@@ -122,7 +135,7 @@ export interface PrepareOptions {
    * Functions only (a data value has nothing to record), export names must be
    * identifiers, a specifier cannot also be in `imports`, and the dotted
    * operation name cannot collide with a `durableGlobals` name; `prepare`
-   * refuses each with the offending path. Top-level names are the module's
+   * and `run` refuse each with the offending path. Top-level names are the module's
    * exports and must be identifiers; nested names may be any string (reached
    * as `obj[name]`).
    */
@@ -278,6 +291,19 @@ export interface ExecuteOptions {
    * default.
    */
   limits?: Partial<ResourceLimits>
+}
+
+/**
+ * A one-off run (`DurableIsolates.run`): everything `prepare` takes, plus the
+ * turn's `code` and `cache`. There are no per-run overrides because there is
+ * no prepared default — `durableGlobals`/`durableImports`/`globals`/`imports`
+ * are simply this run's. `limits` are iso4's one-off limits, which also allow
+ * `memoryMb` for the fresh isolate.
+ */
+export interface RunOptions extends Omit<PrepareOptions, 'limits'> {
+  code: string
+  cache: BoundaryCache
+  limits?: Partial<OneOffResourceLimits>
 }
 
 /**

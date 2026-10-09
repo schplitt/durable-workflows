@@ -40,6 +40,7 @@ export interface DuplicateKeyRejection extends RejectionBase {
 export interface DurableIsolates {
   prepare: (_: PrepareOptions) => Promise<DurableIsolatesRunner>;
   getSandbox: () => Promise<Sandbox>;
+  run: (_: RunOptions) => ExecuteHandle;
   dispose: () => Promise<void>;
 }
 export interface DurableIsolatesOptions {
@@ -106,6 +107,11 @@ export interface RejectedResult extends ExecuteResultBase {
   outcome: "rejected";
   rejection: Rejection;
   run: RunResult;
+}
+export interface RunOptions extends Omit<PrepareOptions, "limits"> {
+  code: string;
+  cache: BoundaryCache;
+  limits?: Partial<OneOffResourceLimits>;
 }
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";

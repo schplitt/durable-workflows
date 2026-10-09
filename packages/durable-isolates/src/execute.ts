@@ -1,4 +1,4 @@
-import type { HostGlobals, Imports, Prefix, RebindGlobals, RebindImports, ResourceLimits } from '@iso4/sandbox'
+import type { HostExportFunction, ResourceLimits, RunResult } from '@iso4/sandbox'
 import type {
   BoundaryCache,
   BoundaryRecord,
@@ -10,8 +10,6 @@ import type {
   ExecuteResult,
   NonJsonCallRejection,
   PendingOperation,
-  PlainGlobalOverrides,
-  PlainImportOverrides,
   Rejection,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
@@ -75,22 +73,25 @@ type CallEnvelope
     | { ok: false, error: unknown }
 
 export interface ExecuteRunParams {
-  prefix: Prefix<HostGlobals, Imports>
   /**
-   * This run's overrides for the plain side — iso4 imports (host-module
-   * function leaves) and globals — handed to iso4 as given.
+   * Starts the iso4 run for this turn, given the three bridge globals bound to
+   * it, the merged limits and the abort signal: a prefix `execute` (bridges
+   * rebound, plain overrides passed through) or a one-off `sandbox.run`
+   * (bridges declared, everything built for this one run).
    */
-  importOverrides: PlainImportOverrides | undefined
-  globalOverrides: PlainGlobalOverrides | undefined
+  start: (bridges: Record<string, HostExportFunction>, limits: Partial<ResourceLimits>, signal: AbortSignal) => Promise<RunResult>
   /**
-   * The durable registry declared at prepare, plus this run's overrides.
+   * The durable registry, plus this run's overrides.
    */
   durableGlobals: Map<string, DurableGlobal>
   durableOverrides: DurableGlobals | undefined
-  prepareLimits: Partial<ResourceLimits> | undefined
+  /**
+   * The caller's limits (a prefix merges prepare's under execute's; a one-off
+   * passes its own). They are applied OVER the kernel's defaults here.
+   */
+  limits: Partial<ResourceLimits> | undefined
   code: string
   cache: BoundaryCache
-  executeLimits: Partial<ResourceLimits> | undefined
 }
 
 /**
@@ -119,10 +120,10 @@ export interface ExecuteRunParams {
  * still lands in the cache, while its resolution into a dead isolate is a
  * harmless no-op. `handle.suspend()` aborts the isolate and resolves after the
  * drain — the external-teardown path.
- * @param params the prefix, the declared plain imports/globals and their per-run overrides, the durable registry and its overrides, code, cache and limits
+ * @param params how to start the isolate (`start`), the durable registry and its overrides, code, cache and limits
  */
 export function executeRun(params: ExecuteRunParams): ExecuteHandle {
-  const { prefix, importOverrides, globalOverrides, durableOverrides, prepareLimits, code, executeLimits } = params
+  const { start, durableOverrides } = params
 
   const registry = new Map(params.durableGlobals)
   if (durableOverrides !== undefined) {
@@ -475,26 +476,17 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     throw settled.error
   }
 
-  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...prepareLimits, ...executeLimits }
+  const limits: Partial<ResourceLimits> = { ...DEFAULT_LIMITS, ...params.limits }
 
   const result = (async (): Promise<ExecuteResult> => {
-    // The plain side is iso4's: its per-run overrides go through as given (a
-    // wrong one fails the run with iso4's own error), and the kernel adds only
-    // its three bridges.
-    const result = await prefix.execute({
-      code,
-      globals: {
-        ...globalOverrides,
-        [DURABLE_CALL_GLOBAL]: callBridge,
-        [DURABLE_LOOKUP_GLOBAL]: lookupBridge,
-        [DURABLE_COMMIT_GLOBAL]: commitBridge,
-      } as RebindGlobals<HostGlobals>,
-      // The kernel's imports are dynamic, so iso4's shape-inferred rebind type
-      // collapses here; the runtime contract (function leaves only) is iso4's.
-      imports: importOverrides as unknown as RebindImports<Imports>,
-      limits,
-      signal: controller.signal,
-    })
+    // The caller's `start` runs the isolate (a prefix rebinds, a one-off
+    // declares); the kernel contributes only its three bridges, the merged
+    // limits and the abort signal.
+    const result = await start({
+      [DURABLE_CALL_GLOBAL]: callBridge,
+      [DURABLE_LOOKUP_GLOBAL]: lookupBridge,
+      [DURABLE_COMMIT_GLOBAL]: commitBridge,
+    }, limits, controller.signal)
 
     // Drain: let every in-flight dispatch finish and land in the cache before
     // the result is built — the IO is kept even though the isolate is gone.

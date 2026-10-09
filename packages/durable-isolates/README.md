@@ -105,6 +105,26 @@ So a call records as `acme.load#0` (scope-prefixed inside a `boundary()`), with 
 
 `prepare` refuses, naming the path: a data value as a leaf (nothing to record), a top-level name that is not a usable export identifier (nested names may be any string), a specifier that is also in `imports`, a dotted name that is also in `durableGlobals` or produced by two modules, and the reserved specifier. `execute` throws before the run starts if a per-run `durableGlobals` or `durableImports` value is neither a function nor `undefined`; when both name the same operation, `durableGlobals` wins.
 
+## One-off runs
+
+`prepare` builds a prefix that iso4 keeps warm for many runs, which is what a workflow replayed turn after turn wants. A single run that arrives on its own, one request and one program, does not want a prefix it would dispose right after. `di.run` takes everything `prepare` and `execute` take, together, and runs the turn in a fresh iso4 isolate:
+
+<!-- eslint-skip -->
+
+```ts
+const r = await di.run({
+  code,
+  cache,
+  imports: { tools: shim },
+  globals: { log },
+  durableGlobals: { load },
+  durableImports: { acme },
+  limits: { memoryMb: 128 },   // iso4's one-off limits; memoryMb is per fresh isolate
+}).result
+```
+
+Same handle, same outcomes, same cache, same rules. Two things differ: there is no per-run override, since there is no prepared default to override, and nothing carries over between runs, since each gets its own isolate. Nothing is cached between one-offs either: the functions you pass are the ones the run uses, so rotating a credential is just passing the new function.
+
 ## The cache
 
 The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. Any string is a valid key, including `__proto__` or `constructor`. Each record has a `status`, a `seq` (write order, for eviction and timelines), and a position: `scope` (the `boundary()` the operation was issued in, `''` at the top level) plus `order` (its number within that scope, counted in source order). The position is what the replay check below compares.

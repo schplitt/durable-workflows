@@ -2678,6 +2678,128 @@ describe('durableImports (generated durable modules)', () => {
   })
 })
 
+describe('one-off runs (di.run, a fresh isolate per call)', () => {
+  test('a durable call records, and a second run with the cache replays it; durableImports and plain globals work too', async () => {
+    let loads = 0
+    const di = durableIsolates()
+    const acme = { load: (id: string) => {
+      loads += 1
+      return `L:${id}`
+    } }
+    const turn = (cache: BoundaryCache) => di.run({
+      code: `import { load } from 'acme'; import { call } from 'tools'; export default [await load('r-1'), await call('ping', {}), await who()]`,
+      cache,
+      imports: { tools: SHIM },
+      globals: { who: () => 'plain' },
+      durableGlobals: { ping: () => 'pong' },
+      durableImports: { acme },
+    }).result
+
+    const r1 = await turn({})
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['L:r-1', 'pong', 'plain'])
+    expect(Object.keys(r1.cache).sort()).toEqual(['acme.load#0', 'ping#0'])
+    const r2 = await turn(JSON.parse(JSON.stringify(r1.cache)))
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['L:r-1', 'pong', 'plain'])
+    expect(loads).toBe(1)
+    await di.dispose()
+  }, 20_000)
+
+  test('each run is a fresh isolate: globalThis does not carry over, unlike a prefix', async () => {
+    const di = durableIsolates()
+    const first = await di.run({ code: `globalThis.leak = 1; export default 'set'`, cache: {} }).result
+    expect(first.outcome === 'completed' && first.result).toBe('set')
+    const second = await di.run({ code: `export default typeof globalThis.leak`, cache: {} }).result
+    expect(second.outcome === 'completed' && second.result).toBe('undefined')
+    // The contrast: a prefix serves runs from warm instances, so the same
+    // pair CAN see the leak (iso4 documents the prefix as the trust boundary).
+    const prefix = await di.prepare({})
+    expect((await prefix.execute({ code: `globalThis.leak = 1; export default 'set'`, cache: {} }).result).outcome).toBe('completed')
+    const onPrefix = await prefix.execute({ code: `export default typeof globalThis.leak`, cache: {} }).result
+    expect(onPrefix.outcome === 'completed' && onPrefix.result).toBe('number')
+    await di.dispose()
+  }, 20_000)
+
+  test('the functions passed to THIS run are the ones used: swapping a durableImports leaf between runs is honored (credential rotation)', async () => {
+    const di = durableIsolates()
+    const code = `import { load } from 'acme'; export default await load('r-1')`
+    const acme = { load: () => 'old-token' }
+    const r1 = await di.run({ code, cache: {}, durableImports: { acme } }).result
+    expect(r1.outcome === 'completed' && r1.result).toBe('old-token')
+    acme.load = () => 'new-token' // same object, new function — nothing may be memoized on the object
+    const r2 = await di.run({ code, cache: {}, durableImports: { acme } }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('new-token')
+    const prefix = await di.prepare({ durableImports: { acme } })
+    acme.load = () => 'rotated-again'
+    const r3 = await di.run({ code, cache: {}, durableImports: { acme } }).result
+    expect(r3.outcome === 'completed' && r3.result).toBe('rotated-again')
+    // A prefix captured its registry at prepare — that is the prefix contract, not a memo.
+    const r4 = await prefix.execute({ code, cache: {} }).result
+    expect(r4.outcome === 'completed' && r4.result).toBe('new-token')
+    await di.dispose()
+  }, 20_000)
+
+  test('handle.suspend() on a one-off drains the in-flight dispatch and the next one-off replays it', async () => {
+    const di = durableIsolates()
+    let slowRuns = 0
+    let started: () => void
+    const startedOnce = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const durableGlobals: DurableGlobals = {
+      slow: async () => {
+        slowRuns += 1
+        started()
+        await new Promise((resolve) => {
+          setTimeout(resolve, 150)
+        })
+        return 'expensive-io'
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('slow', {})`
+    const handle = di.run({ code, cache: {}, imports: { tools: SHIM }, durableGlobals })
+    await startedOnce
+    const r1 = await handle.suspend()
+    expect(r1.outcome === 'suspended' && r1.pending).toEqual([])
+    expect(r1.outcome === 'suspended' && r1.cache['slow#0']).toMatchObject({ status: 'completed', value: 'expensive-io' })
+    const r2 = await di.run({ code, cache: r1.cache, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('expensive-io')
+    expect(slowRuns).toBe(1)
+    await di.dispose()
+  }, 20_000)
+
+  test('the kernel default maxBridgeCalls (1000) applies to a one-off with no limits given; a caller limit overrides it', async () => {
+    const di = durableIsolates()
+    const code = `import { call } from 'tools'; const out = []; for (let i = 0; i < 30; i++) out.push(await call('ping', i)); export default out.length`
+    const durableGlobals: DurableGlobals = { ping: (i: number) => i }
+    const r1 = await di.run({ code, cache: {}, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r1.outcome === 'completed' && r1.result).toBe(30) // well past iso4's own default of 10
+    const r2 = await di.run({ code, cache: {}, imports: { tools: SHIM }, durableGlobals, limits: { maxBridgeCalls: 5 } }).result
+    expect(r2.outcome === 'failed' && r2.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    await di.dispose()
+  }, 20_000)
+
+  test('suspension, divergence and the prepare rules all apply to a one-off', async () => {
+    const di = durableIsolates()
+    let approved = false
+    const durableGlobals = { approve: () => {
+      if (!approved)
+        throw new SuspendIsolate({ t: 1 })
+      return 'ok'
+    } }
+    const code = `import { step } from 'tools'; export default await step('g', 'approve', {})`
+    const r1 = await di.run({ code, cache: {}, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r1.outcome === 'suspended' && r1.pending).toEqual([{ id: 'g', name: 'approve', payload: { t: 1 } }])
+    approved = true
+    const r2 = await di.run({ code, cache: r1.cache, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('ok')
+    const swapped = await di.run({ code: `import { step } from 'tools'; export default await step('g', 'approve', { changed: true })`, cache: r2.cache, imports: { tools: SHIM }, durableGlobals }).result
+    expect(swapped.outcome === 'rejected' && swapped.rejection).toMatchObject({ reason: 'divergence', mismatch: 'args' })
+    expect(() => di.run({ code, cache: {}, globals: { __di_call: () => 1 } })).toThrow(/reserved global/)
+    expect(() => di.run({ code, cache: {}, durableGlobals: { approve: 'nope' as unknown as DurableGlobal } })).toThrow(/durableGlobals\["approve"\] is not a function/)
+    await di.dispose()
+  }, 20_000)
+})
+
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(
