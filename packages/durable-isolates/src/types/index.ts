@@ -119,7 +119,10 @@ export interface ModuleDefinition {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * A host-side global for one operation `name`. The kernel invokes it only when
+ * A host-side global for one operation `name`. A call that has to RUN (a new
+ * key, or a waiting record being resumed) and finds no mounted global rejects
+ * the run (`reason: 'unknown-global'`); a call answered from the cache needs
+ * none. The kernel invokes it only when
  * the call's `key` is not already completed/failed in the cache, so globals
  * never see replay of a settled boundary. A `waiting` boundary IS re-dispatched
  * (that is the resume path): the global consults host/app state and either
@@ -342,10 +345,35 @@ export interface RejectedResult extends ExecuteResultBase {
 }
 
 /**
- * Why a run was rejected — discriminated on `reason`. `key` is the boundary
+ * Why a run was rejected — discriminated on `reason`: `non-json` (a value
+ * JSON cannot write), `divergence` (the replay no longer lines up with the
+ * history), `duplicate-key` (a key used twice, or a commit onto a recorded
+ * key), `unknown-global` (a call that has to run has no mounted global), and
+ * `protocol` (a bridge payload the shim never sends). `key` is the boundary
  * the violation happened at (nothing new is recorded there).
  */
-export type Rejection = NonJsonRejection | DivergenceRejection | ProtocolRejection
+export type Rejection = NonJsonRejection | DivergenceRejection | DuplicateKeyRejection | UnknownGlobalRejection | ProtocolRejection
+
+/**
+ * A boundary key was used twice: by two operations in this run (a step id
+ * reused in a loop, two parallel steps with one id), or by a commit onto a key
+ * the history already holds. Nothing new is recorded.
+ */
+export interface DuplicateKeyRejection extends RejectionBase {
+  reason: 'duplicate-key'
+  detail: 'used twice in this run' | 'already recorded'
+}
+
+/**
+ * The program called an operation no mounted global answers (`name`): the
+ * mounted globals changed since the run was recorded, or the shim routes to a
+ * name that was never mounted. Nothing is recorded — a waiting record at `key`
+ * stays as it was — so mounting the global and running the same cache resumes.
+ */
+export interface UnknownGlobalRejection extends RejectionBase {
+  reason: 'unknown-global'
+  name: string
+}
 
 /**
  * A bridge payload the kernel shim never sends: a program reached a bridge
@@ -370,23 +398,24 @@ export interface ProtocolRejection extends RejectionBase {
  * The program's durable operations no longer line up with the history. Either
  * an operation was issued at a different POSITION than recorded (`order`: the
  * operations are not in the recorded order — a swapped pair, a flipped branch,
- * an insertion), or at a recorded key the program asked for a different call:
+ * an insertion), or at a recorded key the program asked for something else:
  * another operation `name`, the same operation with other `args` (compared as
- * stable JSON, so object key order does not matter), or a call where the
- * record holds no call at all (a `boundary()`/`durableCommit` checkpoint, or a
- * record written by an older kernel). Nothing is answered, re-thrown or
+ * stable JSON, so object key order does not matter), or a different `kind` of
+ * operation (a durable call where a `boundary()`/`durableCommit` checkpoint
+ * was recorded, or the reverse). Nothing is answered, re-thrown or
  * re-dispatched; the history is left as it was.
  */
 export interface DivergenceRejection extends RejectionBase {
   reason: 'divergence'
   /**
    * What differed: the position, the operation name, the arguments, or the
-   * record holds no call to compare against.
+   * kind of operation (a durable call where a checkpoint was recorded, or a
+   * checkpoint where a call was).
    */
-  mismatch: 'order' | 'name' | 'args' | 'no-call'
+  mismatch: 'order' | 'name' | 'args' | 'kind'
   /**
    * What the history holds where the conflict is: the record at `key` for
-   * `name`, `args` and `no-call` (then `recorded.key === key`); for `order`,
+   * `name`, `args` and `kind` (then `recorded.key === key`); for `order`,
    * the record that owns the asked position — at `key` if `key` is recorded
    * at another position, else the OTHER key already holding that position.
    * `name`/`args` are absent on a checkpoint record; `scope`/`order` on a
@@ -529,9 +558,9 @@ export interface CompletedBoundary extends BoundaryRecordBase {
 export interface FailedBoundary extends BoundaryRecordBase {
   status: 'failed'
   /**
-   * The operation `name` that was dispatched — also on a "no global for
-   * `name`" failure. The kernel always writes it; optional in the type because
-   * the cache is caller-persisted data that may predate this field.
+   * The operation `name` that was dispatched. The kernel always writes it;
+   * optional in the type because the cache is caller-persisted data that may
+   * predate this field.
    */
   name?: string
   /**
