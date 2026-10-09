@@ -87,9 +87,7 @@ export interface RejectedResult extends ExecuteResultBase {
 export interface SuspendedResult extends ExecuteResultBase {
   outcome: "suspended";
   pending: PendingOperation[];
-  run: Extract<RunResult, {
-    status: "aborted";
-  }>;
+  run: RunResult;
 }
 export interface WaitingBoundary extends BoundaryRecordBase {
   status: "waiting";
@@ -111,19 +109,10 @@ export type Rejection = NonJsonRejection | DivergenceRejection;
 // #endregion
 
 // #region Classes
-export declare class NonJsonValueError extends Error {
-  readonly path: string;
-  readonly found: string;
-  constructor(_: string, _: string);
-}
 export declare class SuspendIsolate extends Error {
   readonly payload: unknown;
   constructor(_?: unknown);
 }
-// #endregion
-
-// #region Functions
-export declare function toJson(_: unknown): unknown;
 // #endregion
 
 // #region Variables
@@ -141,8 +130,7 @@ interface ExecuteResultBase {
 }
 interface NonJsonRejectionBase extends RejectionBase {
   reason: "non-json";
-  path: string;
-  found: string;
+  detail: string;
 }
 interface RejectionBase {
   key: string;

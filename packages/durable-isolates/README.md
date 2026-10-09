@@ -20,7 +20,7 @@ pnpm add durable-isolates
 - **Pause and continue.** A host global can pause the whole run; continue by running again with the saved cache. No value is ever injected from outside.
 - **Nested scopes, sequential or parallel.** Group work with `boundary(key, fn)`; nested keys stay isolated per branch, even under `Promise.all`.
 - **You own storage.** The kernel keeps nothing. It hands back a cache, you persist it and pass it back next time.
-- **JSON in, JSON out.** Every value crossing a boundary is checked and normalized to plain JSON, so a replay reads back exactly what the first run saw. Anything else ends the run with a message that says where and what.
+- **JSON in, JSON out.** Every value crossing a boundary is written and read back as JSON already on the first run, so a replay sees exactly what the first run saw. What JSON cannot write, a bigint, a cycle or a serializer that throws, ends the run with a clear message.
 - **Divergence is caught.** A replay that asks a recorded key for a different call (another operation, or other arguments) ends the run with a message saying what differed, instead of answering from a history that no longer fits.
 
 ## Quick start
@@ -77,43 +77,43 @@ r.cache['load#0']
 
 Retry and eviction are plain edits to this object: delete a `failed` record to run that boundary again, or delete every record from a `seq` onwards to evict a boundary and everything after it.
 
-## Values must be JSON
+## Values cross as JSON
 
-Everything that crosses a durable boundary must be plain JSON: `null`, booleans, finite numbers, strings, arrays and plain objects. That covers the arguments of a durable call, what a global returns or throws, and what a `boundary()` body returns or `durableCommit` stores. The cache is saved and read back as JSON, so a value JSON cannot carry would look one way on the first run and another way on replay. The kernel refuses such a value instead of storing an approximation.
+Everything that crosses a durable boundary is written with `JSON.stringify` and read back with `JSON.parse` before anyone sees it, already on the first run. That covers the arguments of a durable call, what a global returns or throws, and what a `boundary()` body returns or `durableCommit` stores. The cache is saved and read back as JSON anyway, so doing the same on the first run means every run sees the same value.
 
-Rejected: `Date`, `Map`, `Set`, `RegExp`, bytes (`Uint8Array`, `ArrayBuffer`), `bigint`, `NaN` and `Infinity`, functions, symbols, class instances (including `Error` objects as values), sparse arrays (holes), arrays with extra named properties, and cyclic structures. Objects with a `toJSON` method are not special-cased: the method is a function and is rejected as such. Convert values before the boundary: a date to an ISO string, bytes to text or base64, a `Map` to an object. There is no depth limit; a value too deep to walk is rejected rather than crashing.
+What that means in practice, exactly as JSON does it:
 
-`undefined` follows JSON's own rules, and the kernel applies them already on the first run so every run sees the same value: a key with `undefined` is dropped from an object, `undefined` in an array becomes `null`, a bare `undefined` return stays `undefined`, and `-0` becomes `0`. Thrown `Error`s are stored as their `name` and `message` only.
+| You Pass                   | Everyone Sees                            |
+| -------------------------- | ---------------------------------------- |
+| `new Date(0)`              | `'1970-01-01T00:00:00.000Z'`             |
+| `new Map(…)`, `new Set(…)` | `{}`                                     |
+| `NaN`, `Infinity`          | `null`                                   |
+| a class instance           | its fields, or what its `toJSON` returns |
+| `new Uint8Array([1, 2])`   | `{ "0": 1, "1": 2 }`                     |
+| `{ a: undefined }`         | `{}`                                     |
+| `[undefined, -0]`          | `[null, 0]`                              |
+| a function, a symbol       | dropped in objects, `null` in arrays     |
 
-The message never contains text the program wrote: the key and the global's name are in the structured fields, the `path` quotes any key that is not a plain identifier, and `found` is a class or type name.
+The kernel does not guard against a lossy reading: a `Response` returned from a global is recorded as `{}`, forever. Convert values yourself where the JSON reading is not what you want: a response to its parsed body, bytes to text or base64, a `Map` to an object. Thrown `Error`s are stored as their `name` and `message` only.
 
-A violation ends the run with `outcome: 'rejected'`. The isolate is aborted and the violating call never settles, so a `try/catch` in the program cannot swallow it. Nothing is recorded at the violating key, every other in-flight call is still drained into `cache`, and `rejection` says what happened:
+What JSON cannot write at all, a `bigint`, a circular structure, or a `toJSON` or getter that throws while serializing, ends the run with `outcome: 'rejected'`. The isolate is aborted and the violating call never settles, so a `try/catch` in the program cannot swallow it. Nothing is recorded at the violating key, every other in-flight call is still drained into `cache`, and `rejection` says what happened:
 
 <!-- eslint-skip -->
 
 ```ts
-const r = await runner.execute({ code, cache, globals: { now: () => ({ at: new Date() }) } }).result
+const r = await runner.execute({ code, cache, globals: { count: () => ({ total: 10n }) } }).result
 if (r.outcome === 'rejected') {
   r.rejection.reason // 'non-json'
   r.rejection.source // 'result' — or 'args', 'error', 'commit'
-  r.rejection.key // 'now#0'
-  r.rejection.path // '$.at'
-  r.rejection.found // 'Date'
-  r.rejection.message // 'durable-isolates: non-JSON value in what a global returned: Date at $.at. Only JSON values (…) can cross a durable boundary; …'
+  r.rejection.key // 'count#0'
+  r.rejection.detail // 'Do not know how to serialize a BigInt'
+  r.rejection.message // 'durable-isolates: a value in what a global returned cannot be written as JSON. Only values JSON can write may cross a durable boundary: …'
 }
 ```
 
-The message is written for whoever wrote the program, so it can be handed to a model as is. Fix the global or the program and run the same `cache` again.
+The message never contains text the program wrote. The key, the global's name and the serializer's `detail`, which may quote a property name, are in the structured fields. Fix the global or the program and run the same `cache` again.
 
-The check is exported as `toJson(value)`. It returns the JSON-normalized copy or throws `NonJsonValueError` with `path` and `found`, so you can validate your own inputs the same way before a run:
-
-<!-- eslint-skip -->
-
-```ts
-import { NonJsonValueError, toJson } from 'durable-isolates'
-
-const input = toJson(untrusted) // throws NonJsonValueError('$.items[2].at', 'Date')
-```
+Values from the program (call arguments, committed values) are stringified inside the sandbox, on the real object, so `toJSON` methods and getters behave as they would under `JSON.stringify`, and a getter is read exactly once.
 
 ## Replays must ask the same calls
 
@@ -158,11 +158,11 @@ A failed run resolves with `{ outcome: 'failed', error }`, where `error` is iso4
 
 Every result also carries `run`, which is iso4's own result for that turn, passed through unchanged. It has the per-run clocks (`durationMs`, `wallTimeMs`, `cpuTimeMs`, `queueWaitMs`), `heapUsedBytes`, `bridgeCalls` and `stdout`/`stderr`. Which iso4 arm you get depends on `outcome`:
 
-| `outcome`   | `run`              | Notes                                                                                                      |
-| ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------- |
-| `completed` | `RunSuccess`       | `queueWaitMs` only when the run queued for a slot                                                          |
-| `failed`    | `RunFailure`       | `run.error` is `error`; no `queueWaitMs` on `ERR_QUEUE_FULL` (refused before admission)                    |
-| `suspended` | iso4's aborted arm | Numbers up to the pause; no `queueWaitMs` or `heapUsedBytes`; zero timings if aborted in a tight sync loop |
+| `outcome`   | `run`              | Notes                                                                                                                                                                                                                                  |
+| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `completed` | `RunSuccess`       | `queueWaitMs` only when the run queued for a slot                                                                                                                                                                                      |
+| `failed`    | `RunFailure`       | `run.error` is `error`; no `queueWaitMs` on `ERR_QUEUE_FULL` (refused before admission)                                                                                                                                                |
+| `suspended` | iso4's aborted arm | Numbers up to the pause; no `queueWaitMs` or `heapUsedBytes`; zero timings if aborted in a tight sync loop. If the program finished without awaiting the suspending call, the outcome is still `suspended` and `run` is iso4's own arm |
 
 The clocks stop when the isolate settles. Letting in-flight dispatches finish afterwards (the drain) is not counted.
 

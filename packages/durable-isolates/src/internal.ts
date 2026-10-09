@@ -28,11 +28,11 @@ export type DurableLookup = (key: string) => Promise<{ hit: true, value: unknown
  * Record a completed boundary at `key` from the sandbox ("cache this so we
  * remember after a restart"). Value-only: a failed stretch throws, stays
  * unrecorded, and re-runs on the next turn. Resolves with the value AS
- * RECORDED — JSON-normalized (`undefined` dropped in objects / `null` in
- * arrays, `-0` → `0`), so a caller that returns it (as `boundary()` does)
- * sees on the first run exactly what replays will read from the cache. A
- * value JSON cannot carry rejects the whole run; the returned promise then
- * never settles.
+ * RECORDED — as it reads back from JSON (`undefined` dropped in objects /
+ * `null` in arrays, a `Date` as its ISO string, …), so a caller that returns
+ * it (as `boundary()` does) sees on the first run exactly what replays will
+ * read from the cache. A value JSON refuses (a bigint, a cycle) rejects the
+ * whole run; the returned promise then never settles.
  */
 export type DurableCommit = (key: string, value: unknown) => Promise<unknown>
 

@@ -2,4 +2,4 @@
 "durable-isolates": minor
 ---
 
-Boundary records written by a global dispatch now store the call itself: the `name` that was dispatched and the `args` the shim forwarded. `completed` and `failed` records (including a "no global for `name`" failure) gain optional `name`/`args`; `waiting` records gain `args` next to their existing `name`. Records written by `durableCommit`/`boundary()` are unchanged and carry neither.
+feat(durable-isolates): record call name and args on boundary records. Dispatch records (`completed`, `failed`, `waiting`) now carry `name` and `args`; commit records from `durableCommit`/`boundary()` carry neither.
