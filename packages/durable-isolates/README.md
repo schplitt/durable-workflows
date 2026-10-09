@@ -52,6 +52,29 @@ if (r.outcome === 'completed')
 cache = r.cache // persist, then hand back next time
 ```
 
+## The cache
+
+The cache is a plain JSON object: one record per boundary, keyed by the key the sandbox formed. The kernel matches by key only, never by position. Each record has a `status` and a `seq` (history order, for eviction and timelines).
+
+A record written by a host call (`durableCall`) also stores the call itself: the `name` that was dispatched and the `args` the shim forwarded. So the cache says what was asked at each key, not only what came back.
+
+| `status`    | Written By                                 | Fields                              |
+| ----------- | ------------------------------------------ | ----------------------------------- |
+| `completed` | a global returning                         | `name`, `args`, `value`             |
+| `failed`    | a global throwing, or no global for `name` | `name`, `args`, `error`             |
+| `waiting`   | a global throwing `SuspendIsolate`         | `name`, `args`                      |
+| `completed` | `boundary()` / `durableCommit`             | `value` only (no `name`, no `args`) |
+
+<!-- eslint-skip -->
+
+```ts
+const r = await runner.execute({ code, cache: {}, globals: { load } }).result
+r.cache['load#0']
+// { seq: 0, status: 'completed', name: 'load', args: ['r-1'], value: { … } }
+```
+
+Retry and eviction are plain edits to this object: delete a `failed` record to run that boundary again, or delete every record from a `seq` onwards to evict a boundary and everything after it.
+
 ## Sandbox metrics and errors
 
 `durableIsolates({ sandbox })` takes iso4 `SandboxOptions` and owns the one sandbox: it is created lazily and torn down by `dispose()`. To reach the iso4 API directly (for example `stats()` for load metrics), use `getSandbox()`. It returns the same sandbox `prepare` uses, creating it first if needed, so you can scrape metrics before the first run. Leave teardown to `di.dispose()`.

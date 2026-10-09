@@ -88,24 +88,27 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       seqNext = r.seq + 1
   }
 
-  // Run one global and record the boundary. Always SETTLES (suspension
-  // resolves the sentinel) so the drain can await every dispatch.
+  // Run one global and record the boundary. Every record a dispatch writes
+  // carries the call's `name` and `args` (what the shim forwarded), so the
+  // history says WHAT was asked at each key, not only what came back. Always
+  // SETTLES (suspension resolves the sentinel) so the drain can await every
+  // dispatch.
   const dispatch = async (key: string, name: string, args: unknown[], seq: number): Promise<CallEnvelope | typeof SUSPENDED> => {
     const global = registry.get(name)
     if (global === undefined) {
       // Plain, persistable record (see the catch below); iso4 rebuilds it as an
       // Error in the sandbox when the bridge re-throws it.
       const error = { name: 'Error', message: `durable-isolates: no global for "${name}"` }
-      cache[key] = { seq, status: 'failed', error }
+      cache[key] = { seq, status: 'failed', name, args, error }
       return { ok: false, error }
     }
     try {
       const value = await global(...args)
-      cache[key] = { seq, status: 'completed', value }
+      cache[key] = { seq, status: 'completed', name, args, value }
       return { ok: true, value }
     } catch (e) {
       if (e instanceof SuspendIsolate) {
-        cache[key] = { seq, status: 'waiting', name }
+        cache[key] = { seq, status: 'waiting', name, args }
         pending.push({ id: key, name, payload: e.payload })
         return SUSPENDED
       }
@@ -116,7 +119,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       // synthesizes a fresh one. The bridge re-throws this, and iso4 (>=0.2.2)
       // rebuilds a real Error from it in the sandbox — no reconstruction shim.
       const error = e instanceof Error ? { ...e, name: e.name, message: e.message } : e
-      cache[key] = { seq, status: 'failed', error }
+      cache[key] = { seq, status: 'failed', name, args, error }
       return { ok: false, error }
     }
   }
