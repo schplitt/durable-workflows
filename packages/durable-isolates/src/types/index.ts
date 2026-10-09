@@ -29,7 +29,7 @@
  * write — a `bigint`, a circular structure, a `toJSON` or getter that throws —
  * REJECTS the run (a terminal `rejected` outcome, uncatchable in-sandbox).
  */
-import type { ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
+import type { HostExportFunction, HostGlobals, HostModuleObject, Imports, ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Host — owns the one iso4 sandbox (the Rust bind)
@@ -56,9 +56,14 @@ export interface DurableIsolatesOptions {
 
 export interface DurableIsolates {
   /**
-   * Prepare a prefix from a set of mounted modules — their shims (plus
-   * `durable-isolates:internal`) become the prefix source, served by warm
-   * resident instances. Many prefixes share the one sandbox and its run slots.
+   * Prepare a prefix from iso4 `imports` and `globals` (passed through, plain)
+   * plus the durable registry `durableGlobals`; the kernel adds its own
+   * `durable-isolates:internal` module and three bridge globals. Served by
+   * warm resident instances — many prefixes share the one sandbox and its run
+   * slots, and a prefix is the trust boundary (runs on one prefix share
+   * `globalThis` carryover). Per-run overrides for the plain side are
+   * handed to iso4 as given, so a wrong one fails the run with iso4's own
+   * `ERR_UNDECLARED_BINDING` / `ERR_FROZEN_BINDING`.
    */
   prepare: (options: PrepareOptions) => Promise<DurableIsolatesRunner>
   /**
@@ -79,10 +84,34 @@ export interface DurableIsolates {
 
 export interface PrepareOptions {
   /**
-   * The mounted modules. Keys ARE the virtual module specifiers — the mount
-   * points in-sandbox code imports (e.g. `import { request } from 'acme'`).
+   * iso4's `imports`, passed through as they are: keys are the specifiers
+   * sandbox code imports; a string value is a sandbox module's ESM source (a
+   * shim forming keys and calling `durableCall`/`boundary` from
+   * `durable-isolates:internal`, or any other code), an object value is an
+   * iso4 host module (plain host functions and data, nested up to 64 levels).
+   * Plain host functions here are NOT durable and the kernel never touches
+   * them: nothing is recorded, values cross with iso4's own V8 serialization,
+   * and a `SuspendIsolate` thrown from one is just an error named
+   * `SuspendIsolate` in the program (suspension is a durable call's feature).
+   * The specifier `durable-isolates:internal` is reserved.
    */
-  modules: Readonly<Record<string, ModuleDefinition>>
+  imports?: Imports
+  /**
+   * iso4's `globals`, passed through as they are: plain host functions (or
+   * strings / data constants) installed on `globalThis` in the sandbox. Not
+   * durable — same as a host-module function above. The three kernel bridge
+   * names (`KERNEL_BRIDGE_GLOBALS`) are reserved, and a name cannot also be a
+   * durable global.
+   */
+  globals?: HostGlobals
+  /**
+   * The durable registry: host functions a shim reaches ONLY through
+   * `durableCall(key, name, …args)`, keyed by that `name`. Every call to one
+   * is recorded, positioned, replayed from the cache, and can suspend the
+   * run. A `name` whose per-run state (auth, approval answers) is captured
+   * per run can be supplied on `ExecuteOptions.durableGlobals` instead.
+   */
+  durableGlobals?: DurableGlobals
   /**
    * Default iso4 resource limits for every `execute` on this prefix;
    * `ExecuteOptions.limits` overrides per run. Replay is bridge-call heavy (a
@@ -92,34 +121,12 @@ export interface PrepareOptions {
   limits?: Partial<ResourceLimits>
 }
 
-/**
- * One mounted module: an in-sandbox shim plus its default host globals.
- */
-export interface ModuleDefinition {
-  /**
-   * In-sandbox ESM source compiled into the prefix, exposing this module's
-   * public API. It forms a deterministic `key` in the sandbox (its own scheme,
-   * or `nextKey` from `durable-isolates:internal`) and calls
-   * `durableCall(key, name, ...args)` for each durable operation. Non-durable
-   * work just calls a plain iso4 global.
-   */
-  shim: string
-  /**
-   * Default host globals, keyed by the `name` the shim routes to. OPTIONAL:
-   * globals whose per-instance state (e.g. auth) is captured per run can be
-   * supplied via `ExecuteOptions.globals` instead. Effective global = the
-   * per-execute override falling back to this default; a `name` with neither
-   * fails that call.
-   */
-  globals?: GlobalMap
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Globals
+// Durable globals
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * A host-side global for one operation `name`. A call that has to RUN (a new
+ * A host-side durable global for one operation `name`. A call that has to RUN (a new
  * key, or a waiting record being resumed) and finds no mounted global rejects
  * the run (`reason: 'unknown-global'`); a call answered from the cache needs
  * none. The kernel invokes it only when
@@ -141,20 +148,33 @@ export interface ModuleDefinition {
  *   `toJSON`/getter that throws) → the run is REJECTED (terminal `rejected`
  *   outcome, nothing recorded at this key).
  */
-export type HostGlobal = (...args: unknown[]) => unknown
+export type DurableGlobal = (...args: unknown[]) => unknown
 
 /**
- * Host globals keyed by the operation `name` the shim routes to.
+ * Durable globals keyed by the operation `name` the shim routes to — the
+ * registry at prepare, or a per-run override map on `execute` (the
+ * credentials story: fresh functions per run, auth in their closure,
+ * including any approval answers the function consults on re-dispatch;
+ * omitted names keep the prepared default).
  */
-export type GlobalMap = Readonly<Record<string, HostGlobal>>
+export type DurableGlobals = Readonly<Record<string, DurableGlobal>>
 
 /**
- * Per-`execute` global overrides, keyed by operation `name`. Rebinds the host
- * global for THIS run (the credentials story: fresh globals per run, auth in
- * their closure — including any approval/consent answers the global consults
- * on re-dispatch). Omitted names reuse the module's default global.
+ * Per-run overrides for plain iso4 globals declared at prepare: the function
+ * (or bridge handler) under that name for THIS run — iso4's `globals` rebind,
+ * handed through as given. An unknown name fails the run with iso4's own
+ * `ERR_UNDECLARED_BINDING`.
  */
-export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>
+export type PlainGlobalOverrides = Readonly<Record<string, HostExportFunction>>
+
+/**
+ * Per-run overrides for the function leaves of host-module imports declared
+ * at prepare, by specifier, mirroring the declared shape (nested objects
+ * allowed) — iso4's `imports` rebind, handed through as given. An unknown
+ * specifier or path, a string module or a data leaf fails the run with iso4's
+ * own `ERR_UNDECLARED_BINDING` / `ERR_FROZEN_BINDING`.
+ */
+export type PlainImportOverrides = Readonly<Record<string, HostModuleObject>>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Runner — a prepared prefix; one replay turn per execute
@@ -204,10 +224,20 @@ export interface ExecuteOptions {
    */
   cache: BoundaryCache
   /**
-   * Rebind host globals for this run (auth and approval answers captured in
-   * closure), keyed by operation `name`. Omitted names reuse the module default.
+   * Per-run overrides for the function leaves of host-module `imports`
+   * declared at prepare (iso4 semantics, plain).
    */
-  globals?: PerExecuteGlobals
+  imports?: PlainImportOverrides
+  /**
+   * Per-run overrides for plain iso4 `globals` declared at prepare.
+   */
+  globals?: PlainGlobalOverrides
+  /**
+   * Rebind durable globals for this run (auth and approval answers captured
+   * in closure), keyed by operation `name`. Omitted names keep the prepared
+   * default.
+   */
+  durableGlobals?: DurableGlobals
   /**
    * iso4 resource limits for this run, overriding the prefix's `prepare`
    * default.

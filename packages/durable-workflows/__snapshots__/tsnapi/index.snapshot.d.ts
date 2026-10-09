@@ -76,7 +76,7 @@ export interface TerminatedInstanceRecord extends InstanceRecordBase {
 export interface WorkflowExecuteOptions {
   input?: unknown;
   cache: BoundaryCache;
-  globals?: PerExecuteGlobals;
+  globals?: DurableGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowInstanceHandle {
@@ -86,7 +86,9 @@ export interface WorkflowInstanceHandle {
 }
 export interface WorkflowPrepareOptions {
   workflow: string;
-  plugins?: Readonly<Record<string, ModuleDefinition>>;
+  plugins?: Readonly<Record<string, {
+    shim: string;
+  }>>;
   limits?: Partial<ResourceLimits>;
 }
 export interface WorkflowRunner {

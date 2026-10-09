@@ -1,10 +1,10 @@
 import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
-import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, HostGlobal, PerExecuteGlobals } from '../src'
+import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, DurableGlobal, DurableGlobals } from '../src'
 import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
 
-// A mounted module whose shim forms the key IN THE SANDBOX two ways:
+// A shim (a string import) that forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
 //  - `step(key, name, …)` takes the key directly (workflow-author style)
 const SHIM = /* js */ `
@@ -22,7 +22,7 @@ let runner: DurableIsolatesRunner
 
 beforeAll(async () => {
   host = durableIsolates()
-  runner = await host.prepare({ modules: { tools: { shim: SHIM } } })
+  runner = await host.prepare({ imports: { tools: SHIM } })
 }, 30_000)
 
 afterAll(async () => {
@@ -32,7 +32,7 @@ afterAll(async () => {
 describe('durable calls (key from the sandbox)', () => {
   test('auto-keyed call: completes, caches; global runs once across replays', async () => {
     let pings = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       ping: () => {
         pings += 1
         return 'pong'
@@ -40,7 +40,7 @@ describe('durable calls (key from the sandbox)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('ping', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -48,7 +48,7 @@ describe('durable calls (key from the sandbox)', () => {
     expect(Object.keys(r1.cache)).toEqual(['ping#0'])
     expect(pings).toBe(1)
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -58,7 +58,7 @@ describe('durable calls (key from the sandbox)', () => {
 
   test('explicit key via step(): the sandbox-supplied key is the boundary id', async () => {
     let runs = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       compute: () => {
         runs += 1
         return 42
@@ -66,21 +66,21 @@ describe('durable calls (key from the sandbox)', () => {
     }
     const code = `import { step } from 'tools'; export default await step('load-report', 'compute', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
     expect(r1.result).toBe(42)
     expect(Object.keys(r1.cache)).toEqual(['load-report'])
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     expect(runs).toBe(1) // cached by the explicit key
   }, 15_000)
 
   test('forwards all args; repeated names get distinct keys', async () => {
     const seen: unknown[] = []
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       echo: (a, b) => {
         seen.push([a, b])
         return { a, b }
@@ -91,7 +91,7 @@ describe('durable calls (key from the sandbox)', () => {
       const y = await call('echo', 'q', 2)
       export default [x, y]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -101,7 +101,7 @@ describe('durable calls (key from the sandbox)', () => {
   }, 15_000)
 
   test('parallel leaf calls: keys form in source order even when the second completes first', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       echo: async (v) => {
         await new Promise((resolve) => {
           setTimeout(resolve, v === 'first' ? 40 : 5) // the second call finishes first
@@ -113,7 +113,7 @@ describe('durable calls (key from the sandbox)', () => {
       const [a, b] = await Promise.all([call('echo', 'first'), call('echo', 'second')])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -123,26 +123,27 @@ describe('durable calls (key from the sandbox)', () => {
     expect(r1.cache['echo#1']).toMatchObject({ status: 'completed', value: 'second' })
   }, 15_000)
 
-  test('a per-execute global overrides the module default (per-run auth)', async () => {
+  test('a per-execute durable global overrides the prepared default (per-run auth)', async () => {
     const withDefault = await host.prepare({
-      modules: { tools: { shim: SHIM, globals: { who: () => 'default' } } },
+      imports: { tools: SHIM },
+      durableGlobals: { who: () => 'default' },
     })
     const code = `import { call } from 'tools'; export default await call('who', {})`
 
     const def = await withDefault.execute({ code, cache: {} }).result
     expect(def.outcome === 'completed' && def.result).toBe('default')
 
-    const overridden = await withDefault.execute({ code, cache: {}, globals: { who: () => 'per-run' } }).result
+    const overridden = await withDefault.execute({ code, cache: {}, durableGlobals: { who: () => 'per-run' } }).result
     expect(overridden.outcome === 'completed' && overridden.result).toBe('per-run')
   }, 15_000)
 })
 
 describe('boundary records carry the call (name + args)', () => {
   test('completed: the record holds the dispatched name and the forwarded args', async () => {
-    const globals: PerExecuteGlobals = { echo: (a, b) => ({ a, b }) }
+    const globals: DurableGlobals = { echo: (a, b) => ({ a, b }) }
     const code = `import { call } from 'tools'; export default await call('echo', 'p', { n: 1, tags: ['x'] })`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache['echo#0']).toEqual({
       seq: 0,
@@ -156,7 +157,7 @@ describe('boundary records carry the call (name + args)', () => {
   }, 15_000)
 
   test('failed: a throwing global records name and args next to the error', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw new TypeError('nope')
       },
@@ -165,7 +166,7 @@ describe('boundary records carry the call (name + args)', () => {
       try { await call('boom', 7) } catch {}
       export default 'survived'`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache['boom#0']).toEqual({
       seq: 0,
@@ -181,7 +182,7 @@ describe('boundary records carry the call (name + args)', () => {
   test('waiting: the record holds the args the resume re-dispatch forwards again', async () => {
     const seen: unknown[][] = []
     let approved = false
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: (...args) => {
         seen.push(args)
         if (!approved)
@@ -191,12 +192,12 @@ describe('boundary records carry the call (name + args)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('gate', { subject: 's-1' })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     expect(r1.cache['gate#0']).toEqual({ seq: 0, status: 'waiting', name: 'gate', args: [{ subject: 's-1' }], scope: '', order: 0 })
 
     approved = true
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     expect(r2.cache['gate#0']).toEqual({ seq: 0, status: 'completed', name: 'gate', args: [{ subject: 's-1' }], scope: '', order: 0, value: 'opened' })
     expect(seen).toEqual([[{ subject: 's-1' }], [{ subject: 's-1' }]]) // same args both dispatches
@@ -208,7 +209,7 @@ describe('boundary records carry the call (name + args)', () => {
       await durableCommit('manual', { ok: true })
       export default a`
 
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache.scope).toEqual({ seq: 0, status: 'completed', scope: '', order: 0, value: 'in-sandbox' })
     expect(r.cache.manual).toEqual({ seq: 1, status: 'completed', value: { ok: true } }) // a raw commit carries no position
@@ -220,7 +221,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     let loads = 0
     let approves = 0
     let answer: { approved: boolean } | undefined
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => {
         loads += 1
         return { title: 't' }
@@ -237,7 +238,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       const b = await call('approve', { subject: a.title })
       export default { a, b }`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -251,7 +252,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(approves).toBe(1)
 
     answer = { approved: true } // host state — the global returns it on re-dispatch
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -259,7 +260,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(loads).toBe(1) // read cached — NOT re-invoked
     expect(approves).toBe(2) // the answer entered the cache through the live re-dispatch
 
-    const r3 = await runner.execute({ code, cache: r2.cache, globals }).result
+    const r3 = await runner.execute({ code, cache: r2.cache, durableGlobals: globals }).result
     expect(r3.outcome).toBe('completed')
     expect(approves).toBe(2) // now settled in the cache — no further dispatch
   }, 15_000)
@@ -267,7 +268,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
   test('implicit gate: gated call suspends, then does the real work on resume', async () => {
     let approved = false
     let dispatches = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       del: () => {
         dispatches += 1
         if (!approved)
@@ -277,7 +278,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('del', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -286,7 +287,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     expect(r1.pending[0]?.payload).toEqual({ op: 'DELETE' })
 
     approved = true // app state — same cache, just re-run
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -296,7 +297,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('denial: the global throws on re-dispatch, catchable in the sandbox', async () => {
     let denied = false
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       del: () => {
         if (denied) {
           const e = new Error('user declined')
@@ -311,13 +312,13 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       try { await call('del', {}) } catch (e) { msg = e.name + ': ' + e.message }
       export default msg`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
 
     denied = true
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -326,7 +327,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('a parallel branch in flight at suspension is drained and kept', async () => {
     let slowRuns = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slow: async () => {
         slowRuns += 1
         await new Promise((resolve) => {
@@ -342,7 +343,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       const [a, b] = await Promise.all([call('slow', {}), call('gate', {})])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -354,7 +355,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     const r2 = await runner.execute({
       code,
       cache: r1.cache,
-      globals: { ...globals, gate: () => 'approved' },
+      durableGlobals: { ...globals, gate: () => 'approved' },
     }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
@@ -365,7 +366,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('a sandbox try/catch around the suspending call cannot swallow it', async () => {
     let approves = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       approve: () => {
         approves += 1
         throw new SuspendIsolate({})
@@ -376,7 +377,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
       try { await call('approve', {}) } catch { swallowed = true }
       export default { swallowed }`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -386,7 +387,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 
   test('bare re-execution re-dispatches and re-suspends with the same id', async () => {
     let dispatches = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: () => {
         dispatches += 1
         throw new SuspendIsolate({})
@@ -394,12 +395,12 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('gate', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('suspended')
     if (r2.outcome !== 'suspended')
       return
@@ -411,7 +412,7 @@ describe('suspension (SuspendIsolate + re-dispatch resume)', () => {
 describe('checkpoints (lookup / commit / boundary)', () => {
   test('lookup+commit: the committed value survives eviction of the work that produced it', async () => {
     let produces = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       produce: () => {
         produces += 1
         return `v${produces}`
@@ -425,7 +426,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
       else { v = await call('produce', {}); await durableCommit('memo', v) }
       export default v`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -435,7 +436,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     // Evict the inner work; the checkpoint alone answers the replay.
     const surgically: BoundaryCache = { ...r1.cache }
     delete surgically['produce#0']
-    const r2 = await runner.execute({ code, cache: surgically, globals }).result
+    const r2 = await runner.execute({ code, cache: surgically, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -447,7 +448,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     let approved = false
     let probes = 0
     let gates = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       probe: () => {
         probes += 1
         return 41
@@ -466,7 +467,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
         return a + 1
       })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -474,7 +475,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     expect(probes).toBe(1)
 
     approved = true
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -484,7 +485,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
     // Evict the inner records: the committed scope must skip its body wholesale.
     const pruned: BoundaryCache = { scope: r2.cache.scope! }
-    const r3 = await runner.execute({ code, cache: pruned, globals }).result
+    const r3 = await runner.execute({ code, cache: pruned, durableGlobals: globals }).result
     expect(r3.outcome).toBe('completed')
     if (r3.outcome !== 'completed')
       return
@@ -495,7 +496,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
   test('nested boundary: keys concatenate; the outer commit alone answers replays', async () => {
     let probes = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       probe: () => {
         probes += 1
         return 41
@@ -509,7 +510,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
         return a + 1
       })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -517,7 +518,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
     expect(Object.keys(r1.cache).sort()).toEqual(['outer', 'outer/inner', 'outer/inner/probe#0'])
 
     const pruned: BoundaryCache = { outer: r1.cache.outer! }
-    const r2 = await runner.execute({ code, cache: pruned, globals }).result
+    const r2 = await runner.execute({ code, cache: pruned, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -527,7 +528,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
   test('parallel nested boundaries: async context keeps each branch prefix isolated', async () => {
     let probes = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       probe: () => {
         probes += 1
         return 'ok'
@@ -548,7 +549,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
       const [a, b] = await Promise.all([branch('charge'), branch('refund')])
       export default [a, b]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -565,7 +566,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
 
     // The outer commits alone answer the replay — both bodies skip wholesale.
     const pruned: BoundaryCache = { charge: r1.cache.charge!, refund: r1.cache.refund! }
-    const r2 = await runner.execute({ code, cache: pruned, globals }).result
+    const r2 = await runner.execute({ code, cache: pruned, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -581,7 +582,7 @@ describe('external suspension (handle.suspend())', () => {
     const startedOnce = new Promise<void>((resolve) => {
       started = resolve
     })
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slow: async () => {
         slowRuns += 1
         started()
@@ -593,7 +594,7 @@ describe('external suspension (handle.suspend())', () => {
     }
     const code = `import { call } from 'tools'; export default await call('slow', {})`
 
-    const handle = runner.execute({ code, cache: {}, globals })
+    const handle = runner.execute({ code, cache: {}, durableGlobals: globals })
     await startedOnce
     const r1 = await handle.suspend() // server teardown mid-dispatch
     expect(r1.outcome).toBe('suspended')
@@ -602,7 +603,7 @@ describe('external suspension (handle.suspend())', () => {
     expect(r1.pending).toEqual([]) // nothing waits on the outside — we stopped it
     expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', name: 'slow', args: [{}], scope: '', order: 0, value: 'expensive-io' }) // drained write kept
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -611,10 +612,10 @@ describe('external suspension (handle.suspend())', () => {
   }, 15_000)
 
   test('suspend() after completion is a no-op resolving the completed result', async () => {
-    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const globals: DurableGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'; export default await call('ping', {})`
 
-    const handle = runner.execute({ code, cache: {}, globals })
+    const handle = runner.execute({ code, cache: {}, durableGlobals: globals })
     const r1 = await handle.result
     expect(r1.outcome).toBe('completed')
 
@@ -623,14 +624,14 @@ describe('external suspension (handle.suspend())', () => {
   }, 15_000)
 
   test('a run suspended on approval is inert — suspend() has nothing to drain and resolves the same result', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: () => {
         throw new SuspendIsolate({})
       },
     }
     const code = `import { call } from 'tools'; export default await call('gate', {})`
 
-    const handle = runner.execute({ code, cache: {}, globals })
+    const handle = runner.execute({ code, cache: {}, durableGlobals: globals })
     const r1 = await handle.result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
@@ -644,7 +645,7 @@ describe('external suspension (handle.suspend())', () => {
 describe('error plane', () => {
   test('a failed call is recorded and re-throws deterministically (global once)', async () => {
     let booms = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         booms += 1
         throw new Error('kaboom')
@@ -655,18 +656,18 @@ describe('error plane', () => {
       try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
       export default out`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual(['Error', 'kaboom'])
     expect(booms).toBe(1)
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual(['Error', 'kaboom']) // the SAME error, re-thrown from the cache
     expect(booms).toBe(1)
   }, 15_000)
 
   test('retry is cache surgery: delete the failed entry to re-execute that boundary', async () => {
     let attempts = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       flaky: () => {
         attempts += 1
         if (attempts === 1)
@@ -676,7 +677,7 @@ describe('error plane', () => {
     }
     const code = `import { call } from 'tools'; export default await call('flaky', {})`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
@@ -684,7 +685,7 @@ describe('error plane', () => {
 
     const retried: BoundaryCache = { ...r1.cache }
     delete retried['flaky#0'] // the caller's retry policy decided to re-execute
-    const r2 = await runner.execute({ code, cache: retried, globals }).result
+    const r2 = await runner.execute({ code, cache: retried, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -693,7 +694,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a durable failure preserves the error name in the in-sandbox catch', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         const e = new Error('nope')
         e.name = 'NonRetryableError'
@@ -705,7 +706,7 @@ describe('error plane', () => {
       try { await call('boom', {}) } catch (e) { name = e.name }
       export default name`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -713,7 +714,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a host throw reaches the sandbox catch as a real Error with name + message only', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw Object.assign(new Error('payment declined'), { name: 'PaymentError', status: 402, cause: new Response('x') })
       },
@@ -725,7 +726,7 @@ describe('error plane', () => {
       }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -744,7 +745,7 @@ describe('error plane', () => {
   }, 15_000)
 
   test('a non-Error host throw crosses without an assumed shape', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
         throw { code: 'DENY', reason: 'nope' }
@@ -755,7 +756,7 @@ describe('error plane', () => {
       try { await call('boom', {}) } catch (e) { out = { code: e.code, reason: e.reason } }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -764,14 +765,14 @@ describe('error plane', () => {
   }, 15_000)
 
   test('an uncaught host throw surfaces as a structured run-level failure', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw Object.assign(new Error('boom'), { name: 'PaymentError', status: 402 })
       },
     }
     const code = `import { call } from 'tools'; export default await call('boom', {})`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('failed')
     if (r.outcome !== 'failed')
       return
@@ -783,19 +784,19 @@ describe('error plane', () => {
 
   test('a changed program with a NEW call appended at a free position just runs', async () => {
     let bs = 0
-    const globals: PerExecuteGlobals = { a: () => 1, b: () => {
+    const globals: DurableGlobals = { a: () => 1, b: () => {
       bs += 1
       return 2
     } }
 
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
 
     // 'b#0' is a fresh key at a free position (after 'a#0'): nothing to compare
     // against, so it runs.
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -812,7 +813,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
     let gets = 0
     let deletes = 0
 
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       fetch: createSafeFetch({
         pinDns: false,
         rules: {
@@ -840,7 +841,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
       const del = await call('fetch', 'https://example.test/inventory/42', { method: 'DELETE' }).then((r) => r.body)
       export default { read, del }`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     if (r1.outcome !== 'suspended')
       return
@@ -849,7 +850,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
     expect(deletes).toBe(1)
 
     approved = true
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -865,7 +866,7 @@ describe('e2e: @iso4/fetch mounted durably', () => {
 describe('e2e: @iso4/fetch byte bodies', () => {
   // Shared fetch wiring: `decode` chooses whether the middleware hands the kernel
   // raw bytes (what a real HTTP body is) or text.
-  const fetchGlobals = (decode: boolean): PerExecuteGlobals => ({
+  const fetchGlobals = (decode: boolean): DurableGlobals => ({
     fetch: createSafeFetch({
       pinDns: false,
       rules: {
@@ -883,7 +884,7 @@ describe('e2e: @iso4/fetch byte bodies', () => {
     export default await call('fetch', 'https://example.test/file').then((r) => r.body)`
 
   test('a raw byte body is stored the way JSON writes a Uint8Array — an index object', async () => {
-    const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(false) }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: fetchGlobals(false) }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -891,7 +892,7 @@ describe('e2e: @iso4/fetch byte bodies', () => {
   }, 20_000)
 
   test('converting the body to text in the middleware keeps it usable', async () => {
-    const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(true) }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: fetchGlobals(true) }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -911,13 +912,13 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
         return { amount: this.cents / 100 }
       }
     }
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => ({ at: new Date(0), m: new Map([['k', 1]]), n: Number.NaN, money: new Money(500), fn: () => 1, bytes: new Uint8Array([1]) }),
     }
     const code = `import { call } from 'tools'; export default await call('load', {})`
     const expected = { at: '1970-01-01T00:00:00.000Z', m: {}, n: null, money: { amount: 5 }, bytes: { 0: 1 } }
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -925,7 +926,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
     expect(r1.cache['load#0']).toMatchObject({ value: expected })
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -934,7 +935,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
 
   test('sandbox args are written as JSON on the real object: toJSON honoured, class flattened, getter read once', async () => {
     const seen: unknown[] = []
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       save: (...args) => {
         seen.push(args)
         return 'saved'
@@ -947,7 +948,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
       const out = await call('save', new Req(), opts)
       export default { out, reads }`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -964,7 +965,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
       const v = await boundary('m', () => ({ money: new Money(500), get a() { return ++reads }, gone: undefined, list: [undefined, -0] }))
       export default { v, reads }`
 
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -975,12 +976,12 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
   }, 15_000)
 
   test('a bare undefined is an absent value, on the first run and after a store round trip', async () => {
-    const globals: PerExecuteGlobals = { nothing: () => undefined }
+    const globals: DurableGlobals = { nothing: () => undefined }
     const code = `import { call } from 'tools'
       import { boundary } from 'durable-isolates:internal'
       export default { a: await call('nothing', {}), b: await boundary('b', () => undefined) }`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -988,7 +989,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
     expect(r1.cache.b).toEqual({ seq: 1, status: 'completed', scope: '', order: 1 })
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -997,7 +998,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
 
   test('an own __proto__ key in a sandbox value reaches the global as data, not as a prototype', async () => {
     let inside: unknown
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       inspect: (o) => {
         inside = { keys: Object.keys(o as object), isAdmin: (o as { isAdmin?: unknown }).isAdmin }
         return 'ok'
@@ -1005,19 +1006,19 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
     }
     const code = `import { call } from 'tools'; export default await call('inspect', JSON.parse('{"__proto__":{"isAdmin":true},"a":1}'))`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(inside).toEqual({ keys: ['__proto__', 'a'], isAdmin: undefined })
   }, 15_000)
 
   test('lossy host results are recorded as JSON reads them, identically on replay: Error → {}, Response → {}, -0 → 0', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => ({ err: new Error('boom'), res: new Response('hi'), zero: -0, proto: JSON.parse('{"__proto__":{"x":1},"y":2}') }),
     }
     const code = `import { call } from 'tools'; export default await call('load', {})`
     const expected = { err: {}, res: {}, zero: 0, proto: { ['__proto__']: { x: 1 }, y: 2 } }
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -1026,7 +1027,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
     expect(Object.is((r1.result as { zero: number }).zero, 0)).toBe(true)
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -1037,10 +1038,10 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
 
 describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   test('a global returning a bigint rejects the run; nothing is recorded at the key', async () => {
-    const globals: PerExecuteGlobals = { count: () => ({ items: [0, 1, { total: 10n }] }) }
+    const globals: DurableGlobals = { count: () => ({ items: [0, 1, { total: 10n }] }) }
     const code = `import { call } from 'tools'; export default await call('count', {})`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1059,7 +1060,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
 
   test('a cyclic argument from the sandbox rejects the run before any lookup; the global never runs', async () => {
     let calls = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       save: () => {
         calls += 1
         return 'ok'
@@ -1069,7 +1070,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
       const o = { name: 'loop' }; o.self = o
       export default await call('save', o)`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1082,7 +1083,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   }, 15_000)
 
   test('a global throwing a non-Error value JSON refuses rejects the run', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
         throw { code: 1n }
@@ -1090,7 +1091,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     }
     const code = `import { call } from 'tools'; export default await call('boom', {})`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1102,7 +1103,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     const code = `import { boundary } from 'durable-isolates:internal'
       export default await boundary('total', async () => ({ amount: 10n }))`
 
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1117,13 +1118,13 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   }, 15_000)
 
   test('a sandbox try/catch around the violating call cannot swallow the rejection', async () => {
-    const globals: PerExecuteGlobals = { big: () => 1n }
+    const globals: DurableGlobals = { big: () => 1n }
     const code = `import { call } from 'tools'
       let out = 'not reached'
       try { await call('big', {}) } catch (e) { out = 'caught: ' + e.message }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1133,7 +1134,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
 
   test('a parallel branch in flight at rejection is drained and kept; the first violation wins', async () => {
     let slowRuns = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slow: async () => {
         slowRuns += 1
         await new Promise((resolve) => {
@@ -1157,7 +1158,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     const code = `import { call } from 'tools'
       export default await Promise.all([call('slow', {}), call('bad', {}), call('alsoBad', {})])`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('rejected')
     if (r1.outcome !== 'rejected')
       return
@@ -1167,8 +1168,8 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     expect(r1.cache['alsoBad#0']).toBeUndefined()
 
     // Fix the globals, run the same cache: the drained IO is not redone.
-    const fixed: PerExecuteGlobals = { ...globals, bad: () => 'b', alsoBad: () => 'c' }
-    const r2 = await runner.execute({ code, cache: r1.cache, globals: fixed }).result
+    const fixed: DurableGlobals = { ...globals, bad: () => 'b', alsoBad: () => 'c' }
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: fixed }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -1177,13 +1178,13 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   }, 15_000)
 
   test('args are checked even at a key the cache would have answered', async () => {
-    const globals: PerExecuteGlobals = { p: () => 'cached' }
+    const globals: DurableGlobals = { p: () => 'cached' }
     const first = `import { step } from 'tools'; export default await step('k', 'p', 'fine')`
-    const r1 = await runner.execute({ code: first, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: first, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
     const changed = `import { step } from 'tools'; export default await step('k', 'p', 1n)`
-    const r2 = await runner.execute({ code: changed, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: changed, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1191,12 +1192,12 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   }, 15_000)
 
   test('a program that never awaits the violating call is still rejected', async () => {
-    const globals: PerExecuteGlobals = { bad: () => 1n }
+    const globals: DurableGlobals = { bad: () => 1n }
     const code = `import { call } from 'tools'
       call('bad', {}) // fire and forget
       export default 'done'`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1205,7 +1206,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
 
   test('calls queued behind a rejecting call do not run their globals (iso4 >= 0.6.2 drops them)', async () => {
     let charges = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       bad: () => 1n,
       charge: () => {
         charges += 1
@@ -1217,14 +1218,14 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
       const rest = [1, 2, 3].map((i) => step('k' + i, 'charge', {})) // sent in the same synchronous stretch
       export default await Promise.all([first, ...rest])`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     expect(charges).toBe(0) // nothing ran after the rejection
     expect(r.cache).toEqual({})
   }, 15_000)
 
   test('an Error with a non-string message is recorded as text', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw Object.assign(new Error('x'), { message: { d: new Date(0) } })
       },
@@ -1233,16 +1234,16 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
       try { await call('boom', {}) } catch {}
       export default 'survived'`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { name: 'Error', message: '[object Object]' } })
   }, 15_000)
 
   test('a host toJSON or getter that throws rejects the run with its message as detail', async () => {
-    const globals: PerExecuteGlobals = { load: () => ({ toJSON() {
+    const globals: DurableGlobals = { load: () => ({ toJSON() {
       throw new Error('nope')
     } }) }
-    const r = await runner.execute({ code: `import { call } from 'tools'; export default await call('load', {})`, cache: {}, globals }).result
+    const r = await runner.execute({ code: `import { call } from 'tools'; export default await call('load', {})`, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1252,7 +1253,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   test('a sandbox toJSON that throws rejects the run too; the message says nothing about the value', async () => {
     const code = `import { boundary } from 'durable-isolates:internal'
       export default await boundary('k', () => ({ toJSON() { throw new Error('secret-ish text') } }))`
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1261,7 +1262,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
   }, 15_000)
 
   test('a serializer complaint that cannot be read falls back to a fixed detail; a long one is cut', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       weird: () => ({ toJSON() {
         throw Object.create(null) // String() of this throws
       } }),
@@ -1269,13 +1270,13 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
         throw new Error('x'.repeat(5000))
       } }),
     }
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('weird', {})`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('weird', {})`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('rejected')
     if (r1.outcome !== 'rejected')
       return
     expect(r1.rejection).toMatchObject({ source: 'result', detail: 'unserializable value' })
 
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('loud', {})`, cache: {}, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('loud', {})`, cache: {}, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1284,7 +1285,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
 
   test('the shim uses captured JSON intrinsics: a program patching JSON.stringify cannot change what crosses', async () => {
     const seen: unknown[] = []
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       save: (...args) => {
         seen.push(args)
         return 'ok'
@@ -1304,13 +1305,13 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
         JSON.parse = origParse
       }
       export default out`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(seen).toEqual([[{ real: true }]])
   }, 15_000)
 
   test('a thrown symbol has no JSON reading and is recorded with a fixed shape', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw Symbol('s')
       },
@@ -1319,7 +1320,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
       let out
       try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
       export default out`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1331,7 +1332,7 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
 describe('prototype-named keys are plain cache entries', () => {
   test('a boundary keyed "__proto__" is recorded, survives a JSON round trip, and runs once', async () => {
     let charges = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       charge: () => {
         charges += 1
         return 'charged'
@@ -1339,7 +1340,7 @@ describe('prototype-named keys are plain cache entries', () => {
     }
     const code = `import { step } from 'tools'; export default await step('__proto__', 'charge', 42)`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -1348,7 +1349,7 @@ describe('prototype-named keys are plain cache entries', () => {
     expect(JSON.stringify(r1.cache)).toContain('"__proto__":{"seq":0')
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -1358,7 +1359,7 @@ describe('prototype-named keys are plain cache entries', () => {
 
   test('a "__proto__" commit cannot forge answers for other keys', async () => {
     let loads = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => {
         loads += 1
         return 'real'
@@ -1369,7 +1370,7 @@ describe('prototype-named keys are plain cache entries', () => {
       await durableCommit('__proto__', { forged: { seq: 0, status: 'completed', value: 'forged' } })
       export default await step('forged', 'load', {})`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1380,7 +1381,7 @@ describe('prototype-named keys are plain cache entries', () => {
 
   test('"constructor" and "toString" keys are ordinary misses, then ordinary entries', async () => {
     const seen: string[] = []
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       echo: (v) => {
         seen.push(String(v))
         return v
@@ -1393,7 +1394,7 @@ describe('prototype-named keys are plain cache entries', () => {
       const c = await boundary('hasOwnProperty', () => 'h')
       export default [a, b, c]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
@@ -1401,7 +1402,7 @@ describe('prototype-named keys are plain cache entries', () => {
     expect(r1.cache.constructor).toMatchObject({ seq: 0, status: 'completed', value: 'c' })
     expect(r1.cache.toString).toMatchObject({ seq: 1, status: 'completed', value: 'in-sandbox' })
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     expect(seen).toEqual(['c']) // replay answered all three from the cache
   }, 15_000)
@@ -1417,16 +1418,16 @@ describe('replay divergence (recorded key, different call)', () => {
 
   test('reordered parallel calls diverge: echo#0 was recorded for other args', async () => {
     let echoes = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       echo: (v) => {
         echoes += 1
         return v
       },
     }
-    const r1 = await runner.execute({ code: inOrder, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: inOrder, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: reordered, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: reordered, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1446,11 +1447,11 @@ describe('replay divergence (recorded key, different call)', () => {
   }, 15_000)
 
   test('same key, different operation name', async () => {
-    const globals: PerExecuteGlobals = { a: () => 1, b: () => 2 }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, globals }).result
+    const globals: DurableGlobals = { a: () => 1, b: () => 2 }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'b', {})`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'b', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1460,16 +1461,16 @@ describe('replay divergence (recorded key, different call)', () => {
 
   test('a waiting boundary is NOT re-dispatched when the resume asks with other args', async () => {
     let approves = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       approve: () => {
         approves += 1
         throw new SuspendIsolate({})
       },
     }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'a' })`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'a' })`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'b' })`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', { subject: 'b' })`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1479,15 +1480,15 @@ describe('replay divergence (recorded key, different call)', () => {
   }, 15_000)
 
   test('a failed record is NOT re-thrown when the program asks with other args', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw new Error('nope')
       },
     }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 1) } catch {}; export default 'ok'`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 1) } catch {}; export default 'ok'`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 2) } catch {}; export default 'ok'`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; try { await step('k', 'boom', 2) } catch {}; export default 'ok'`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1496,11 +1497,11 @@ describe('replay divergence (recorded key, different call)', () => {
   }, 15_000)
 
   test('a durable call at a checkpoint key diverges: the record holds the other kind of operation', async () => {
-    const globals: PerExecuteGlobals = { load: () => 'from-global' }
-    const r1 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('k', () => 'from-body')`, cache: {}, globals }).result
+    const globals: DurableGlobals = { load: () => 'from-global' }
+    const r1 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('k', () => 'from-body')`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1515,20 +1516,20 @@ describe('replay divergence (recorded key, different call)', () => {
   }, 15_000)
 
   test('reordered object keys in args are NOT a divergence; reordered array items are', async () => {
-    const globals: PerExecuteGlobals = { save: () => 'saved' }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [1, 2] } })`, cache: {}, globals }).result
+    const globals: DurableGlobals = { save: () => 'saved' }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [1, 2] } })`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const sameKeysReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { b: { x: [1, 2] }, a: 1 })`, cache: r1.cache, globals }).result
+    const sameKeysReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { b: { x: [1, 2] }, a: 1 })`, cache: r1.cache, durableGlobals: globals }).result
     expect(sameKeysReordered.outcome).toBe('completed')
 
-    const arrayReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [2, 1] } })`, cache: r1.cache, globals }).result
+    const arrayReordered = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'save', { a: 1, b: { x: [2, 1] } })`, cache: r1.cache, durableGlobals: globals }).result
     expect(arrayReordered.outcome).toBe('rejected')
   }, 15_000)
 
   test('a sandbox try/catch cannot swallow a divergence; a parallel branch in flight is drained', async () => {
     let slowRuns = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       a: () => 'a',
       slow: async () => {
         slowRuns += 1
@@ -1544,14 +1545,14 @@ describe('replay divergence (recorded key, different call)', () => {
       try { await step('k', 'a', ${arg}) } catch (e) { out = 'caught: ' + e.message }
       await slow
       export default out`
-    const r1 = await runner.execute({ code: program(1), cache: {}, globals }).result
+    const r1 = await runner.execute({ code: program(1), cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
     // Same program, other args at 'k'; 'slow' is in flight again (a replay re-runs nothing cached, but its record is answered — so re-dispatch it by evicting it)
     const cache = { ...r1.cache }
     delete cache.slow
     slowRuns = 0
-    const r2 = await runner.execute({ code: program(2), cache, globals }).result
+    const r2 = await runner.execute({ code: program(2), cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1563,7 +1564,7 @@ describe('replay divergence (recorded key, different call)', () => {
 
   test('a global that edits its options in place does not rewrite the recorded args', async () => {
     let sends = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       send: (opts) => {
         sends += 1
         ;(opts as { retries?: number }).retries ??= 3 // defaulting in place — common and harmless
@@ -1572,18 +1573,18 @@ describe('replay divergence (recorded key, different call)', () => {
     }
     const code = `import { step } from 'tools'; export default await step('k', 'send', { to: 'a' })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     expect(r1.cache.k).toMatchObject({ args: [{ to: 'a' }] }) // the record holds what the program passed
 
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed') // no false divergence
     expect(sends).toBe(1)
   }, 15_000)
 
   test('a waiting global that edits its options can still be resumed', async () => {
     let ready = false
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       sleep: (o) => {
         ;(o as { until?: number }).until ??= 123
         if (!ready)
@@ -1593,12 +1594,12 @@ describe('replay divergence (recorded key, different call)', () => {
     }
     const code = `import { step } from 'tools'; export default await step('nap', 'sleep', { ms: 5 })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('suspended')
     expect(r1.cache.nap).toEqual({ seq: 0, status: 'waiting', name: 'sleep', args: [{ ms: 5 }], scope: '', order: 0 })
 
     ready = true
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -1608,7 +1609,7 @@ describe('replay divergence (recorded key, different call)', () => {
 
 describe('error reduction edge cases', () => {
   test('an Error whose message getter throws is recorded with a fixed text; the run settles', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         const e = new Error('x')
         Object.defineProperty(e, 'message', { get() {
@@ -1622,7 +1623,7 @@ describe('error reduction edge cases', () => {
       try { await call('boom', {}) } catch (e) { out = e.message }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1631,7 +1632,7 @@ describe('error reduction edge cases', () => {
   }, 15_000)
 
   test('an Error from another realm is recorded as a failure, not rejected as non-JSON', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         throw runInNewContext('new TypeError("far away")')
       },
@@ -1641,7 +1642,7 @@ describe('error reduction edge cases', () => {
       try { await call('boom', {}) } catch (e) { out = [e.name, e.message] }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1649,7 +1650,7 @@ describe('error reduction edge cases', () => {
   }, 15_000)
 
   test('a DOMException (fetch timeout / abort) is a catchable failed step, not a rejected run', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slowFetch: () => {
         throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
       },
@@ -1659,7 +1660,7 @@ describe('error reduction edge cases', () => {
       try { await call('slowFetch', {}) } catch (e) { out = [e.name, e.message] }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1668,7 +1669,7 @@ describe('error reduction edge cases', () => {
   }, 15_000)
 
   test('a thrown value with a throwing Symbol.toStringTag getter is still handled (no getter is read)', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       boom: () => {
         // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
         throw { code: 'DENY', get [Symbol.toStringTag]() {
@@ -1681,7 +1682,7 @@ describe('error reduction edge cases', () => {
       try { await call('boom', {}) } catch (e) { out = e.code }
       export default out`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1691,7 +1692,7 @@ describe('error reduction edge cases', () => {
 
 describe('pinned edge cases', () => {
   test('a suspension the program never awaited is still reported: outcome suspended, pending filled', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: () => {
         throw new SuspendIsolate({ need: 'approval' })
       },
@@ -1700,7 +1701,7 @@ describe('pinned edge cases', () => {
       step('g', 'gate', {}) // fire and forget
       export default 'done'`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('suspended')
     if (r.outcome !== 'suspended')
       return
@@ -1710,7 +1711,7 @@ describe('pinned edge cases', () => {
   }, 15_000)
 
   test('two parallel suspensions give two pending entries', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: async (who) => {
         await new Promise((resolve) => {
           setTimeout(resolve, 10)
@@ -1721,7 +1722,7 @@ describe('pinned edge cases', () => {
     const code = `import { step } from 'tools'
       export default await Promise.all([step('g1', 'gate', 'a'), step('g2', 'gate', 'b')])`
 
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('suspended')
     if (r.outcome !== 'suspended')
       return
@@ -1732,7 +1733,7 @@ describe('pinned edge cases', () => {
 
   test('args survive a store round trip without a false divergence: Date, undefined, -0, NaN', async () => {
     let saves = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       save: () => {
         saves += 1
         return 'saved'
@@ -1741,27 +1742,27 @@ describe('pinned edge cases', () => {
     const code = `import { step } from 'tools'
       export default await step('k', 'save', { d: new Date(0), u: undefined, z: -0, l: [undefined], n: NaN })`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     expect(r1.cache.k).toMatchObject({ args: [{ d: '1970-01-01T00:00:00.000Z', z: 0, l: [null], n: null }] })
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome).toBe('completed')
     expect(saves).toBe(1)
   }, 15_000)
 
   test('an own __proto__ key inside recorded args takes part in the compare', async () => {
-    const globals: PerExecuteGlobals = { save: () => 'saved' }
+    const globals: DurableGlobals = { save: () => 'saved' }
     const same = `import { step } from 'tools'; export default await step('k', 'save', JSON.parse('{"__proto__":{"x":1},"a":1}'))`
     const changed = `import { step } from 'tools'; export default await step('k', 'save', JSON.parse('{"__proto__":{"x":2},"a":1}'))`
 
-    const r1 = await runner.execute({ code: same, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: same, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    expect((await runner.execute({ code: same, cache: roundTripped, globals }).result).outcome).toBe('completed')
+    expect((await runner.execute({ code: same, cache: roundTripped, durableGlobals: globals }).result).outcome).toBe('completed')
 
-    const r3 = await runner.execute({ code: changed, cache: roundTripped, globals }).result
+    const r3 = await runner.execute({ code: changed, cache: roundTripped, durableGlobals: globals }).result
     expect(r3.outcome).toBe('rejected')
     if (r3.outcome !== 'rejected')
       return
@@ -1769,40 +1770,40 @@ describe('pinned edge cases', () => {
   }, 15_000)
 
   test('seq continues after the highest seq in the input cache; a rejected dispatch leaves no gap', async () => {
-    const globals: PerExecuteGlobals = { a: () => 'a', b: () => 1n }
+    const globals: DurableGlobals = { a: () => 'a', b: () => 1n }
     const seeded: BoundaryCache = { old: { seq: 5, status: 'completed', value: 'x' } }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('n', 'a', {})`, cache: seeded, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('n', 'a', {})`, cache: seeded, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     expect(r1.cache.n).toMatchObject({ seq: 6 })
 
     const code = `import { step } from 'tools'
       const a = await step('a', 'a', {})
       export default await step('b', 'b', {})`
-    const r2 = await runner.execute({ code, cache: {}, globals }).result
+    const r2 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     expect(r2.cache).toEqual({ a: { seq: 0, status: 'completed', name: 'a', args: [{}], scope: '', order: 0, value: 'a' } })
-    const r3 = await runner.execute({ code, cache: r2.cache, globals: { ...globals, b: () => 'b' } }).result
+    const r3 = await runner.execute({ code, cache: r2.cache, durableGlobals: { ...globals, b: () => 'b' } }).result
     expect(r3.outcome).toBe('completed')
     expect(r3.cache.b).toMatchObject({ seq: 1 }) // the rejected dispatch consumed nothing
   }, 15_000)
 
   test('a nested boundary commits its outer record after the inner calls', async () => {
-    const globals: PerExecuteGlobals = { probe: () => 1 }
+    const globals: DurableGlobals = { probe: () => 1 }
     const code = `import { boundary, durableCall, nextKey } from 'durable-isolates:internal'
       export default await boundary('outer', async () => (await durableCall(nextKey('probe'), 'probe', {})) + 1)`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache['outer/probe#0']).toMatchObject({ seq: 0 })
     expect(r.cache.outer).toMatchObject({ seq: 1, value: 2 })
   }, 15_000)
 
   test('default limits: a replay-heavy run makes far more than iso4\'s 10 bridge calls', async () => {
-    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const globals: DurableGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'
       const out = []
       for (let i = 0; i < 30; i++) out.push(await call('ping', i))
       export default out.length`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -1810,25 +1811,25 @@ describe('pinned edge cases', () => {
   }, 15_000)
 
   test('prepare limits apply to every run; execute limits override them', async () => {
-    const tight = await host.prepare({ modules: { tools: { shim: SHIM } }, limits: { maxBridgeCalls: 3 } })
-    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const tight = await host.prepare({ imports: { tools: SHIM }, limits: { maxBridgeCalls: 3 } })
+    const globals: DurableGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'
       for (let i = 0; i < 5; i++) await call('ping', i)
       export default 'ok'`
 
-    const r1 = await tight.execute({ code, cache: {}, globals }).result
+    const r1 = await tight.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('failed')
     if (r1.outcome !== 'failed')
       return
     expect(r1.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
 
-    const r2 = await tight.execute({ code, cache: {}, globals, limits: { maxBridgeCalls: 100 } }).result
+    const r2 = await tight.execute({ code, cache: {}, durableGlobals: globals, limits: { maxBridgeCalls: 100 } }).result
     expect(r2.outcome).toBe('completed')
     await tight.dispose()
   }, 20_000)
 
   test('bridge payloads the shim never sends are protocol faults; nothing is recorded', async () => {
-    const globals: PerExecuteGlobals = { e: () => 'ran' }
+    const globals: DurableGlobals = { e: () => 'ran' }
     for (const [code, expected] of [
       [`globalThis.__di_call('k', 'e', '[1', undefined, 0, ''); export default 1`, { source: 'args', name: 'e', detail: 'malformed JSON text' }],
       [`globalThis.__di_call('k', 'e', 5, undefined, 0, ''); export default 1`, { source: 'args', name: 'e', detail: 'not JSON text' }],
@@ -1838,7 +1839,7 @@ describe('pinned edge cases', () => {
       [`globalThis.__di_commit('k', 123); export default 1`, { source: 'commit', detail: 'not JSON text' }],
       [`globalThis.__di_commit('k', '1', undefined, 'zero', ''); export default 1`, { source: 'commit', detail: 'malformed position' }],
     ] as const) {
-      const r = await runner.execute({ code, cache: {}, globals }).result
+      const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
       expect(r.outcome).toBe('rejected')
       if (r.outcome !== 'rejected')
         return
@@ -1853,7 +1854,7 @@ describe('pinned edge cases', () => {
       code: `import { boundary } from 'durable-isolates:internal'
         export default await boundary('k', () => ({ toJSON() { throw ${thrown} } }))`,
       cache: {},
-      globals: {},
+      durableGlobals: {},
     }).result
 
     const plain = await run(`'plain'`)
@@ -1865,7 +1866,7 @@ describe('pinned edge cases', () => {
   }, 20_000)
 
   test('nothing is recorded or changed at the violating key, for every rejection kind', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       a: () => 'a',
       boom: () => {
         // eslint-disable-next-line no-throw-literal -- exercising a non-Error throw on purpose
@@ -1873,32 +1874,32 @@ describe('pinned edge cases', () => {
       },
     }
     // error source
-    const r0 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'boom', {})`, cache: {}, globals }).result
+    const r0 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'boom', {})`, cache: {}, durableGlobals: globals }).result
     expect(r0.outcome).toBe('rejected')
     expect(r0.cache).toEqual({})
 
     // name divergence, kind divergence, args violation at a recorded key: history untouched
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
     for (const code of [
       `import { step } from 'tools'; export default await step('k', 'boom', 1)`,
       `import { step } from 'tools'; export default await step('k', 'a', 1n)`,
     ]) {
-      const r = await runner.execute({ code, cache: r1.cache, globals }).result
+      const r = await runner.execute({ code, cache: r1.cache, durableGlobals: globals }).result
       expect(r.outcome).toBe('rejected')
       expect(r.cache).toEqual(r1.cache)
     }
-    const checkpoint = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('c', () => 'v')`, cache: {}, globals }).result
+    const checkpoint = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'; export default await boundary('c', () => 'v')`, cache: {}, durableGlobals: globals }).result
     expect(checkpoint.outcome).toBe('completed')
-    const noCall = await runner.execute({ code: `import { step } from 'tools'; export default await step('c', 'a', {})`, cache: checkpoint.cache, globals }).result
+    const noCall = await runner.execute({ code: `import { step } from 'tools'; export default await step('c', 'a', {})`, cache: checkpoint.cache, durableGlobals: globals }).result
     expect(noCall.outcome).toBe('rejected')
     expect(noCall.cache).toEqual(checkpoint.cache)
   }, 30_000)
 
   test('a record from an older kernel (no order, no args) diverges on the position check', async () => {
-    const globals: PerExecuteGlobals = { ok: () => 'new' }
+    const globals: DurableGlobals = { ok: () => 'new' }
     const old: BoundaryCache = { k: { seq: 0, status: 'completed', name: 'ok', value: 'old' } }
-    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'ok', {})`, cache: old, globals }).result
+    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'ok', {})`, cache: old, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -1906,13 +1907,13 @@ describe('pinned edge cases', () => {
   }, 15_000)
 
   test('the input cache is never mutated and `recorded` is a copy of the history', async () => {
-    const globals: PerExecuteGlobals = { a: () => 'a' }
+    const globals: DurableGlobals = { a: () => 'a' }
     const input: BoundaryCache = {}
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 1 })`, cache: input, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 1 })`, cache: input, durableGlobals: globals }).result
     expect(input).toEqual({})
     expect(r1.cache).not.toBe(input)
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 2 })`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', { v: 2 })`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected' || r2.rejection.reason !== 'divergence')
       return
@@ -1922,7 +1923,7 @@ describe('pinned edge cases', () => {
   }, 15_000)
 
   test('a drained fire-and-forget call lands in the cache even when the program completed first', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slow: async () => {
         await new Promise((resolve) => {
           setTimeout(resolve, 100)
@@ -1930,7 +1931,7 @@ describe('pinned edge cases', () => {
         return 'late'
       },
     }
-    const r = await runner.execute({ code: `import { step } from 'tools'; step('s', 'slow', {}); export default 'done'`, cache: {}, globals }).result
+    const r = await runner.execute({ code: `import { step } from 'tools'; step('s', 'slow', {}); export default 'done'`, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache.s).toMatchObject({ status: 'completed', value: 'late' })
   }, 15_000)
@@ -1940,18 +1941,18 @@ describe('pinned edge cases', () => {
       let out
       try { await boundary('k', () => { throw new Error('body boom') }) } catch (e) { out = e.message }
       export default out`
-    const r1 = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r1.outcome).toBe('completed')
     if (r1.outcome !== 'completed')
       return
     expect(r1.result).toBe('body boom')
     expect(r1.cache).toEqual({})
-    const r2 = await runner.execute({ code, cache: r1.cache, globals: {} }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: {} }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('body boom')
   }, 15_000)
 
   test('thrown null, undefined and a function: null stays null, the others get the fixed shape', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       nul: () => {
         // eslint-disable-next-line no-throw-literal -- exercising non-Error throws on purpose
         throw null
@@ -1969,7 +1970,7 @@ describe('pinned edge cases', () => {
       const out = {}
       for (const n of ['nul', 'undef', 'fn']) { try { await step(n, n, {}) } catch (e) { out[n] = e && e.message !== undefined ? e.message : e } }
       export default out`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     expect(r.cache.nul).toMatchObject({ status: 'failed', error: null })
     expect(r.cache.undef).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'non-JSON throw' } })
@@ -1978,32 +1979,30 @@ describe('pinned edge cases', () => {
 
   test('the SuspendIsolate payload is handed out as is, never through JSON', async () => {
     const payload = { big: 1n, when: new Date(0) }
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       gate: () => {
         throw new SuspendIsolate(payload)
       },
     }
-    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('g', 'gate', {})`, cache: {}, globals }).result
+    const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('g', 'gate', {})`, cache: {}, durableGlobals: globals }).result
     expect(r.outcome === 'suspended' && r.pending[0]?.payload).toBe(payload)
   }, 15_000)
 
   test('every rejection message is a fixed template', async () => {
-    const globals: PerExecuteGlobals = { big: () => 1n, a: () => 'a' }
-    const nonJson = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'big', {})`, cache: {}, globals }).result
+    const globals: DurableGlobals = { big: () => 1n, a: () => 'a' }
+    const nonJson = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'big', {})`, cache: {}, durableGlobals: globals }).result
     expect(nonJson.outcome === 'rejected' && nonJson.rejection.message).toBe(
       'durable-isolates: a value in what a global returned cannot be written as JSON. Only values JSON can write may cross a durable boundary: no bigint, no circular structure, no toJSON or getter that throws; convert the value before it reaches one.',
     )
-    const first = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
-    const diverged = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 2)`, cache: first.cache, globals }).result
+    const first = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, durableGlobals: globals }).result
+    const diverged = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 2)`, cache: first.cache, durableGlobals: globals }).result
     expect(diverged.outcome === 'rejected' && diverged.rejection.message).toBe(
       'durable-isolates: replay divergence: at a recorded boundary the program asked for the same operation with different arguments. Durable calls must be deterministic across runs: keep them in the same order, give each parallel branch that makes more than one durable call its own boundary(), and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.',
     )
   }, 20_000)
 
-  test('mount: a global defined by two modules is refused; a disposed runner refuses to execute', async () => {
-    await expect(host.prepare({ modules: { a: { shim: SHIM, globals: { x: () => 1 } }, b: { shim: SHIM, globals: { x: () => 2 } } } })).rejects.toThrow(/duplicate global "x"/)
-
-    const disposable = await host.prepare({ modules: { tools: { shim: SHIM } } })
+  test('a disposed runner refuses to execute', async () => {
+    const disposable = await host.prepare({ imports: { tools: SHIM } })
     await disposable.dispose()
     const r = await disposable.execute({ code: `export default 1`, cache: {} }).result
     expect(r.outcome).toBe('failed')
@@ -2029,7 +2028,7 @@ describe('deep values (iso4 >= 0.6.3 has no host → sandbox nesting cap)', () =
 
   test('a deep host result is delivered on the first run and on replay', async () => {
     let loads = 0
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => {
         loads += 1
         return deep(200)
@@ -2040,17 +2039,17 @@ describe('deep values (iso4 >= 0.6.3 has no host → sandbox nesting cap)', () =
       while (v && typeof v === 'object') { v = v.d; n++ }
       export default [n, v]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual([200, 'leaf'])
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual([200, 'leaf'])
     expect(loads).toBe(1)
   }, 15_000)
 
   test('a deep committed value and deep args work on the first run and on replay', async () => {
     const seen: unknown[] = []
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       save: (v) => {
         seen.push(leafOf(v))
         return 'saved'
@@ -2064,22 +2063,22 @@ describe('deep values (iso4 >= 0.6.3 has no host → sandbox nesting cap)', () =
       while (v && typeof v === 'object') { v = v.d; n++ }
       export default [n, v, await step('k', 'save', make())]`
 
-    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual([200, 'leaf', 'saved'])
     expect(leafOf((r1.cache.deep as { value: unknown }).value)).toBe('leaf')
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
-    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    const r2 = await runner.execute({ code, cache: roundTripped, durableGlobals: globals }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual([200, 'leaf', 'saved'])
     expect(seen).toEqual(['leaf']) // the global ran once; the deep args compared equal on replay
   }, 15_000)
 })
 
 describe('issue order (position) divergence', () => {
-  const globals: PerExecuteGlobals = { a: () => 'A', b: () => 'B', n: () => 'N' }
+  const globals: DurableGlobals = { a: () => 'A', b: () => 'B', n: () => 'N' }
 
   test('every record carries the position at which the program issued it; a resume keeps them', async () => {
     let approved = false
-    const g: PerExecuteGlobals = {
+    const g: DurableGlobals = {
       ...globals,
       approve: () => {
         if (!approved)
@@ -2093,23 +2092,23 @@ describe('issue order (position) divergence', () => {
       const t = await boundary('t', () => a + '!')
       export default await call('approve', t)`
 
-    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r1.outcome).toBe('suspended')
     expect(r1.cache['a#0']).toMatchObject({ order: 0 })
     expect(r1.cache.t).toMatchObject({ order: 1 })
     expect(r1.cache['approve#0']).toMatchObject({ order: 2, status: 'waiting' })
 
     approved = true
-    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('ok')
     expect(r2.cache['approve#0']).toMatchObject({ order: 2, status: 'completed' })
   }, 15_000)
 
   test('two calls swapped: the first key sits at another position → divergence, even though both keys match', async () => {
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('b', {}); export default await call('a', {})`, cache: r1.cache, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('b', {}); export default await call('a', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -2126,14 +2125,14 @@ describe('issue order (position) divergence', () => {
 
   test('a flipped branch: a NEW key at a position another key holds → divergence instead of running', async () => {
     let ns = 0
-    const g: PerExecuteGlobals = { ...globals, n: () => {
+    const g: DurableGlobals = { ...globals, n: () => {
       ns += 1
       return 'N'
     } }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('x', 'a', 1)`, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('x', 'a', 1)`, cache: {}, durableGlobals: g }).result
     expect(r1.outcome).toBe('completed')
 
-    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('y', 'n', 1)`, cache: r1.cache, globals: g }).result
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('y', 'n', 1)`, cache: r1.cache, durableGlobals: g }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -2142,8 +2141,8 @@ describe('issue order (position) divergence', () => {
   }, 15_000)
 
   test('a call inserted before recorded ones diverges at the insertion', async () => {
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('n', {}); export default await call('a', {})`, cache: r1.cache, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, durableGlobals: globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('n', {}); export default await call('a', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -2151,17 +2150,17 @@ describe('issue order (position) divergence', () => {
   }, 15_000)
 
   test('a call appended after recorded ones just runs (its position is free)', async () => {
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('n', {})`, cache: r1.cache, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, durableGlobals: globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('n', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('N')
     expect(r2.cache['n#0']).toMatchObject({ order: 1 })
   }, 15_000)
 
   test('a checkpoint inserted before a recorded call diverges at the lookup (attempted has only the position)', async () => {
-    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, durableGlobals: globals }).result
     const r2 = await runner.execute({ code: `import { call } from 'tools'
       import { boundary } from 'durable-isolates:internal'
-      await boundary('s', () => 1); export default await call('a', {})`, cache: r1.cache, globals }).result
+      await boundary('s', () => 1); export default await call('a', {})`, cache: r1.cache, durableGlobals: globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -2178,7 +2177,7 @@ describe('issue order (position) divergence', () => {
 
   test('parallel calls keep source-order positions whichever finishes first → no divergence on replay', async () => {
     let delays: Record<string, number> = { first: 40, second: 5 }
-    const g: PerExecuteGlobals = {
+    const g: DurableGlobals = {
       echo: async (v) => {
         await new Promise((resolve) => {
           setTimeout(resolve, delays[v as string])
@@ -2189,19 +2188,19 @@ describe('issue order (position) divergence', () => {
     const code = `import { call } from 'tools'
       export default await Promise.all([call('echo', 'first'), call('echo', 'second')])`
 
-    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual(['first', 'second'])
     expect(r1.cache['echo#0']).toMatchObject({ order: 0, value: 'first' })
     expect(r1.cache['echo#1']).toMatchObject({ order: 1, value: 'second' })
 
     delays = { first: 5, second: 40 } // timing flips; positions do not
-    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual(['first', 'second'])
   }, 15_000)
 
   test('nested boundary: the inner ops count in their own scope; a hit on the outer skips them without shifting later positions', async () => {
     let cs = 0
-    const g: PerExecuteGlobals = { ...globals, c: () => {
+    const g: DurableGlobals = { ...globals, c: () => {
       cs += 1
       return 'C'
     } }
@@ -2209,20 +2208,20 @@ describe('issue order (position) divergence', () => {
       const call = (n, ...a) => durableCall(nextKey(n), n, ...a) // scoped keys, like a real shim
       const o = await boundary('o', async () => (await call('a', {})) + (await call('b', {})))
       export default o + (await call('c', {}))`
-    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r1.outcome === 'completed' && r1.result).toBe('ABC')
     expect(r1.cache.o).toMatchObject({ scope: '', order: 0, seq: 2 }) // committed after its body settled
     expect(r1.cache['o/a#0']).toMatchObject({ scope: 'o', order: 0 })
     expect(r1.cache['o/b#0']).toMatchObject({ scope: 'o', order: 1 })
     expect(r1.cache['c#0']).toMatchObject({ scope: '', order: 1 }) // the body never touched the top-level count
 
-    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('ABC') // the hit on 'o' skips a and b; c still sits at position 1
     expect(cs).toBe(1)
   }, 15_000)
 
   test('parallel boundaries: each body numbers its own ops; interleaving cannot shift them', async () => {
-    const g: PerExecuteGlobals = {
+    const g: DurableGlobals = {
       slow: async (v) => {
         await new Promise((resolve) => {
           setTimeout(resolve, v === 'x' ? 30 : 5)
@@ -2236,7 +2235,7 @@ describe('issue order (position) divergence', () => {
         boundary('p', async () => (await call('slow', 'x')) + (await call('slow', 'y'))),
         boundary('q', async () => (await call('slow', 'z'))),
       ])`
-    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual(['xy', 'z'])
     expect(r1.cache.p).toMatchObject({ scope: '', order: 0 })
     expect(r1.cache.q).toMatchObject({ scope: '', order: 1 })
@@ -2247,13 +2246,13 @@ describe('issue order (position) divergence', () => {
     // Evict q's commit only: its body re-runs on replay while p hits — positions still line up.
     const pruned = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
     delete pruned.q
-    const r2 = await runner.execute({ code, cache: pruned, globals: g }).result
+    const r2 = await runner.execute({ code, cache: pruned, durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual(['xy', 'z'])
   }, 15_000)
 
   test('raw durableLookup/durableCommit are outside the position check: a call after them replays fine', async () => {
     let loads = 0
-    const g: PerExecuteGlobals = { load: () => {
+    const g: DurableGlobals = { load: () => {
       loads += 1
       return 'L'
     } }
@@ -2262,24 +2261,24 @@ describe('issue order (position) divergence', () => {
       const r = await durableLookup('k')
       const v = r.hit ? r.value : await durableCommit('k', 5)
       export default [v, await call('load', {})]`
-    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r1.outcome === 'completed' && r1.result).toEqual([5, 'L'])
     expect(r1.cache.k).toEqual({ seq: 0, status: 'completed', value: 5 }) // no position on a raw commit
     expect(r1.cache['load#0']).toMatchObject({ scope: '', order: 0 }) // the raw pair consumed none
-    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual([5, 'L'])
     expect(loads).toBe(1)
   }, 15_000)
 })
 
 describe('history rules (keys are used once, globals must be mounted)', () => {
-  const globals: PerExecuteGlobals = { a: () => 'A', load: () => 'from-global' }
+  const globals: DurableGlobals = { a: () => 'A', load: () => 'from-global' }
   test('a call to a name with no mounted global rejects the run; nothing is recorded', async () => {
     const code = `import { call } from 'tools'
       try { await call('missing', 'a', 1) } catch {}
       export default 'survived'`
 
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: {} }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -2290,21 +2289,21 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
   }, 15_000)
 
   test('a per-execute override of undefined counts as unmounted: the waiting gate survives', async () => {
-    const withApprove: PerExecuteGlobals = { ...globals, approve: () => {
+    const withApprove: DurableGlobals = { ...globals, approve: () => {
       throw new SuspendIsolate({})
     } }
     const code = `import { step } from 'tools'; export default await step('gate', 'approve', {})`
-    const r1 = await runner.execute({ code, cache: {}, globals: withApprove }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: withApprove }).result
     expect(r1.outcome).toBe('suspended')
     // `{ approve: maybeFn }` with maybeFn undefined — a JS caller's spread
-    const r2 = await runner.execute({ code, cache: r1.cache, globals: { ...globals, approve: undefined as unknown as HostGlobal } }).result
+    const r2 = await runner.execute({ code, cache: r1.cache, durableGlobals: { ...globals, approve: undefined as unknown as DurableGlobal } }).result
     expect(r2.outcome === 'rejected' && r2.rejection).toMatchObject({ reason: 'unknown-global', key: 'gate', name: 'approve' })
     expect(r2.cache.gate).toMatchObject({ status: 'waiting' })
   }, 15_000)
 
   test('a retry in the same run must use a new key', async () => {
     let attempts = 0
-    const g: PerExecuteGlobals = { ...globals, flaky: () => {
+    const g: DurableGlobals = { ...globals, flaky: () => {
       attempts += 1
       if (attempts === 1)
         throw new Error('transient')
@@ -2315,7 +2314,7 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       let out
       try { out = await boundary('s', () => step('f', 'flaky', {})) } catch { out = await boundary('s', () => 'gave up') }
       export default out`
-    const r1 = await runner.execute({ code: sameKey, cache: {}, globals: g }).result
+    const r1 = await runner.execute({ code: sameKey, cache: {}, durableGlobals: g }).result
     expect(r1.outcome === 'rejected' && r1.rejection).toMatchObject({ reason: 'duplicate-key', key: 's', detail: 'used twice in this run' })
 
     attempts = 0
@@ -2324,12 +2323,12 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       let out
       try { out = await boundary('s', () => step('f', 'flaky', {})) } catch { out = await boundary('s-retry', () => 'gave up') }
       export default out`
-    const r2 = await runner.execute({ code: newKey, cache: {}, globals: g }).result
+    const r2 = await runner.execute({ code: newKey, cache: {}, durableGlobals: g }).result
     expect(r2.outcome === 'completed' && r2.result).toBe('gave up')
   }, 20_000)
 
   test('a positioned commit without its lookup is a protocol fault, so a forged commit cannot race a dispatch', async () => {
-    const g: PerExecuteGlobals = { ...globals, slow: async () => {
+    const g: DurableGlobals = { ...globals, slow: async () => {
       await new Promise((resolve) => {
         setTimeout(resolve, 50)
       })
@@ -2340,7 +2339,7 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       const p = step('k', 'slow', 1)
       await durableCommit('k', 'forged', { order: 9, scope: '' })
       export default await p`
-    const r = await runner.execute({ code, cache: {}, globals: g }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(r.outcome === 'rejected' && r.rejection).toMatchObject({ reason: 'protocol', source: 'commit', key: 'k', detail: 'commit without lookup' })
     expect(r.cache.k).toMatchObject({ value: 'real' }) // the in-flight dispatch was drained; the forgery never landed
   }, 15_000)
@@ -2350,7 +2349,7 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       const out = []
       for (const i of [1, 2]) out.push(await boundary('fetch', () => i))
       export default out`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
@@ -2361,47 +2360,47 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
   test('two parallel steps with one id, and a call reusing a step\'s key, are rejected too', async () => {
     const parallel = `import { boundary } from 'durable-isolates:internal'
       export default await Promise.all([boundary('k', () => 1), boundary('k', () => 2)])`
-    const r1 = await runner.execute({ code: parallel, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: parallel, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome === 'rejected' && r1.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'used twice in this run' })
 
     const mixed = `import { boundary } from 'durable-isolates:internal'
       import { step } from 'tools'
       await boundary('k', () => 1)
       export default await step('k', 'a', {})`
-    const r2 = await runner.execute({ code: mixed, cache: {}, globals }).result
+    const r2 = await runner.execute({ code: mixed, cache: {}, durableGlobals: globals }).result
     expect(r2.outcome === 'rejected' && r2.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'used twice in this run' })
 
     const calls = `import { step } from 'tools'; await step('k', 'a', 1); export default await step('k', 'a', 1)`
-    const r3 = await runner.execute({ code: calls, cache: {}, globals }).result
+    const r3 = await runner.execute({ code: calls, cache: {}, durableGlobals: globals }).result
     expect(r3.outcome === 'rejected' && r3.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k' })
   }, 20_000)
 
   test('a commit never overwrites a record: a raw commit onto a recorded key is rejected, a waiting gate cannot be forged over', async () => {
-    const seeded = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, globals }).result
+    const seeded = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', {})`, cache: {}, durableGlobals: globals }).result
     expect(seeded.outcome).toBe('completed')
-    const over = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('k', 'forged'); export default 1`, cache: seeded.cache, globals }).result
+    const over = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('k', 'forged'); export default 1`, cache: seeded.cache, durableGlobals: globals }).result
     expect(over.outcome === 'rejected' && over.rejection).toMatchObject({ reason: 'duplicate-key', key: 'k', detail: 'already recorded' })
     expect(over.cache).toEqual(seeded.cache)
 
-    const gated = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', {})`, cache: {}, globals: { approve: () => {
+    const gated = await runner.execute({ code: `import { step } from 'tools'; export default await step('gate', 'approve', {})`, cache: {}, durableGlobals: { approve: () => {
       throw new SuspendIsolate({})
     } } }).result
     expect(gated.outcome).toBe('suspended')
-    const forged = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('gate', 'yes'); export default 1`, cache: gated.cache, globals }).result
+    const forged = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('gate', 'yes'); export default 1`, cache: gated.cache, durableGlobals: globals }).result
     expect(forged.outcome === 'rejected' && forged.rejection).toMatchObject({ reason: 'duplicate-key', key: 'gate', detail: 'already recorded' })
     expect(forged.cache.gate).toMatchObject({ status: 'waiting' }) // the gate is still a gate
 
-    const twice = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('c', 1); await durableCommit('c', 2); export default 1`, cache: {}, globals }).result
+    const twice = await runner.execute({ code: `import { durableCommit } from 'durable-isolates:internal'; await durableCommit('c', 1); await durableCommit('c', 2); export default 1`, cache: {}, durableGlobals: globals }).result
     expect(twice.outcome === 'rejected' && twice.rejection).toMatchObject({ reason: 'duplicate-key', key: 'c', detail: 'used twice in this run' })
   }, 30_000)
 
   test('a step landing on a call\'s record is a kind divergence (the mirror of a call on a checkpoint)', async () => {
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: {}, globals }).result
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'load', {})`, cache: {}, durableGlobals: globals }).result
     expect(r1.outcome === 'completed' && r1.result).toBe('from-global')
     let bodyRan = false
     const r2 = await runner.execute({ code: `import { boundary } from 'durable-isolates:internal'
       import { step } from 'tools'
-      export default await boundary('k', async () => { await step('m', 'mark', {}); return 'fresh' })`, cache: r1.cache, globals: { ...globals, mark: () => {
+      export default await boundary('k', async () => { await step('m', 'mark', {}); return 'fresh' })`, cache: r1.cache, durableGlobals: { ...globals, mark: () => {
       bodyRan = true
       return 1
     } } }).result
@@ -2422,27 +2421,27 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
 
   test('resuming without the waiting global rejects the run and leaves the waiting record intact', async () => {
     let approved = false
-    const withApprove: PerExecuteGlobals = { ...globals, approve: () => {
+    const withApprove: DurableGlobals = { ...globals, approve: () => {
       if (!approved)
         throw new SuspendIsolate({ ticket: 't-1' })
       return 'ok'
     } }
     const code = `import { step } from 'tools'; await step('a', 'a', {}); export default await step('gate', 'approve', { amount: 1 })`
-    const r1 = await runner.execute({ code, cache: {}, globals: withApprove }).result
+    const r1 = await runner.execute({ code, cache: {}, durableGlobals: withApprove }).result
     expect(r1.outcome).toBe('suspended')
 
     // Deploy drift: the resume runs without `approve` mounted.
-    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals }).result
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), durableGlobals: globals }).result
     expect(r2.outcome === 'rejected' && r2.rejection).toEqual({ reason: 'unknown-global', key: 'gate', name: 'approve', message: expect.any(String) })
     expect(r2.cache).toEqual(r1.cache) // still waiting, not turned into a failure
 
     approved = true
-    const r3 = await runner.execute({ code, cache: r2.cache, globals: withApprove }).result
+    const r3 = await runner.execute({ code, cache: r2.cache, durableGlobals: withApprove }).result
     expect(r3.outcome === 'completed' && r3.result).toBe('ok') // the global is back; the resume works
   }, 20_000)
 
   test('the used-key set is per run: two concurrent runs reuse the same keys independently', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       echo: async (v) => {
         await new Promise((resolve) => {
           setTimeout(resolve, 20)
@@ -2456,8 +2455,8 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       const b = await boundary('b', () => '${tag}-2')
       export default [a, b, await call('echo', '${tag}-3')]`
     const [x, y] = await Promise.all([
-      runner.execute({ code: code('x'), cache: {}, globals }).result,
-      runner.execute({ code: code('y'), cache: {}, globals }).result,
+      runner.execute({ code: code('x'), cache: {}, durableGlobals: globals }).result,
+      runner.execute({ code: code('y'), cache: {}, durableGlobals: globals }).result,
     ])
     expect(x.outcome === 'completed' && x.result).toEqual(['x-1', 'x-2', 'x-3'])
     expect(y.outcome === 'completed' && y.result).toEqual(['y-1', 'y-2', 'y-3'])
@@ -2468,7 +2467,7 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
   test('a fresh host resumes from a persisted cache: reads are not re-dispatched', async () => {
     let loads = 0
     let approved = false
-    const g: PerExecuteGlobals = {
+    const g: DurableGlobals = {
       load: () => {
         loads += 1
         return 'data'
@@ -2480,24 +2479,116 @@ describe('history rules (keys are used once, globals must be mounted)', () => {
       },
     }
     const code = `import { step } from 'tools'; const d = await step('d', 'load', {}); export default [d, await step('g', 'approve', {})]`
-    const first = await runner.execute({ code, cache: {}, globals: g }).result
+    const first = await runner.execute({ code, cache: {}, durableGlobals: g }).result
     expect(first.outcome).toBe('suspended')
     const persisted = JSON.stringify(first.cache)
 
     approved = true
     const other = durableIsolates()
-    const otherRunner = await other.prepare({ modules: { tools: { shim: SHIM } } })
-    const resumed = await otherRunner.execute({ code, cache: JSON.parse(persisted), globals: g }).result
+    const otherRunner = await other.prepare({ imports: { tools: SHIM } })
+    const resumed = await otherRunner.execute({ code, cache: JSON.parse(persisted), durableGlobals: g }).result
     await other.dispose()
     expect(resumed.outcome === 'completed' && resumed.result).toEqual(['data', 'ok'])
     expect(loads).toBe(1)
   }, 30_000)
 })
 
+describe('plain globals and imports (iso4 semantics, not durable)', () => {
+  test('a plain global is called every run, records nothing, and carries raw V8 values', async () => {
+    let calls = 0
+    const di = durableIsolates()
+    const r = await di.prepare({
+      globals: { now: (d: unknown) => {
+        calls += 1
+        return { got: d instanceof Date, at: new Date(0) }
+      } },
+    })
+    const code = `const v = await now(new Date(1)); export default [v.got, v.at instanceof Date]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual([true, true]) // a Date stays a Date, both ways
+    expect(r1.cache).toEqual({})
+    const r2 = await r.execute({ code, cache: r1.cache }).result
+    expect(r2.outcome).toBe('completed')
+    expect(calls).toBe(2) // plain: ran again
+    await di.dispose()
+  }, 20_000)
+
+  test('a host-module import exposes plain functions and data; functions can be rebound per run', async () => {
+    const di = durableIsolates()
+    const r = await di.prepare({
+      imports: { 'acme/util': { version: '1.2', clock: { now: () => 1 } } },
+    })
+    const code = `import { version, clock } from 'acme/util'; export default [version, await clock.now()]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['1.2', 1])
+    const r2 = await r.execute({ code, cache: {}, imports: { 'acme/util': { clock: { now: () => 2 } } } }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['1.2', 2])
+    await di.dispose()
+  }, 20_000)
+
+  test('a plain global can be rebound per run and works next to durable calls', async () => {
+    const di = durableIsolates()
+    const r = await di.prepare({
+      imports: { tools: SHIM },
+      globals: { who: () => 'default' },
+      durableGlobals: { load: () => 'L' },
+    })
+    const code = `import { call } from 'tools'; export default [await who(), await call('load', {})]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['default', 'L'])
+    const r2 = await r.execute({ code, cache: r1.cache, globals: { who: () => 'alice' } }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['alice', 'L']) // plain rebound, durable from the cache
+    expect(Object.keys(r2.cache)).toEqual(['load#0'])
+    await di.dispose()
+  }, 20_000)
+
+  test('a SuspendIsolate thrown from a plain function is just an error in the program (suspension is durable-only)', async () => {
+    const di = durableIsolates()
+    const r = await di.prepare({ globals: { gate: () => {
+      throw new SuspendIsolate({ ticket: 't-1' })
+    } } })
+    const caught = await r.execute({ code: `let out; try { await gate() } catch (e) { out = e.name } export default out`, cache: {} }).result
+    expect(caught.outcome === 'completed' && caught.result).toBe('SuspendIsolate') // catchable, nothing suspended
+    const uncaught = await r.execute({ code: `export default await gate()`, cache: {} }).result
+    expect(uncaught.outcome === 'failed' && uncaught.error.name).toBe('SuspendIsolate') // the debug signal: this call should have been durable
+    await di.dispose()
+  }, 20_000)
+
+  test('object-form bridge globals pass through, and a bad override fails with iso4\'s own error', async () => {
+    const di = durableIsolates()
+    const r = await di.prepare({
+      globals: { gate: { kind: 'bridge', enumerable: false, handler: () => 'declared' } },
+      imports: { acme: { tick: () => 1, label: 'x' } },
+    })
+    const code = `import { tick } from 'acme'; export default [await gate(), await tick(), Object.keys(globalThis).includes('gate')]`
+    const r1 = await r.execute({ code, cache: {} }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['declared', 1, false]) // enumerable: false as declared
+
+    const r2 = await r.execute({ code, cache: {}, globals: { gate: () => 'override' } }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['override', 1, false]) // iso4's per-run rebind, as is
+
+    for (const [bad, code] of [
+      [{ globals: { typo: () => 1 } }, 'ERR_UNDECLARED_BINDING'],
+      [{ imports: { acme: { nope: () => 1 } } }, 'ERR_UNDECLARED_BINDING'],
+      [{ imports: { acme: { label: () => 1 } } }, 'ERR_FROZEN_BINDING'],
+      [{ imports: { nope: { f: () => 1 } } }, 'ERR_UNDECLARED_BINDING'],
+    ] as const) {
+      const rb = await r.execute({ code, cache: {}, ...bad }).result
+      expect(rb.outcome === 'failed' && rb.error.code).toBe(code)
+    }
+    await di.dispose()
+  }, 20_000)
+
+  test('a kernel bridge name cannot be mounted as a plain global; a name cannot be both plain and durable', async () => {
+    await expect(host.prepare({ globals: { __di_call: () => 1 } })).rejects.toThrow(/reserved global/)
+    await expect(host.prepare({ globals: { load: () => 1 }, durableGlobals: { load: () => 2 } })).rejects.toThrow(/both a plain global and a durable global/)
+  })
+})
+
 describe('mount guards', () => {
   test('mounting the reserved internal specifier throws (kernel shim cannot be shadowed)', async () => {
     await expect(
-      host.prepare({ modules: { 'durable-isolates:internal': { shim: 'export const x = 1' } } }),
+      host.prepare({ imports: { 'durable-isolates:internal': 'export const x = 1' } }),
     ).rejects.toThrow(/reserved module specifier/)
   })
 
@@ -2525,7 +2616,7 @@ describe('sandbox access (getSandbox)', () => {
       const stats = await sandbox.stats() // scrapeable before the first prepare/run
       expect(stats.activeRuns).toBe(0)
 
-      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      const r = await di.prepare({ imports: { tools: SHIM } })
       expect(await di.getSandbox()).toBe(sandbox)
       // `stats().prefixes` lists a prefix once it has an instance — warm one.
       expect((await r.execute({ code: `export default 1`, cache: {} }).result).outcome).toBe('completed')
@@ -2538,7 +2629,7 @@ describe('sandbox access (getSandbox)', () => {
   test('dispose() tears the sandbox down; the next getSandbox() creates a fresh one', async () => {
     const di = durableIsolates()
     const first = await di.getSandbox()
-    await di.prepare({ modules: { tools: { shim: SHIM } } })
+    await di.prepare({ imports: { tools: SHIM } })
     await di.dispose()
     expect(first.alive).toBe(false)
 
@@ -2562,26 +2653,26 @@ describe('iso4 error codes pass through verbatim', () => {
   }, 15_000)
 
   test('ERR_WALL_TIMEOUT — and the durable call in flight is still drained into the cache', async () => {
-    const globals: PerExecuteGlobals = { slow: () => new Promise((resolve) => {
+    const globals: DurableGlobals = { slow: () => new Promise((resolve) => {
       setTimeout(resolve, 300, 'late')
     }) }
     const code = `import { step } from 'tools'; export default await step('s', 'slow')`
-    const r = await runner.execute({ code, cache: {}, globals, limits: { wallTimeMs: 100 } }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals, limits: { wallTimeMs: 100 } }).result
     expect(codeOf(r)).toBe('ERR_WALL_TIMEOUT')
     expect(r.cache.s).toMatchObject({ status: 'completed', value: 'late' })
   }, 15_000)
 
   test('ERR_BRIDGE_CALL_LIMIT_EXCEEDED', async () => {
-    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const globals: DurableGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'; for (let i = 0; i < 5; i++) await call('ping'); export default 1`
-    const r = await runner.execute({ code, cache: {}, globals, limits: { maxBridgeCalls: 2 } }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals, limits: { maxBridgeCalls: 2 } }).result
     expect(codeOf(r)).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
   }, 15_000)
 
   test('ERR_MEMORY_LIMIT', async () => {
     const di = durableIsolates({ sandbox: { memoryMb: { hard: 16 } } })
     try {
-      const r = await (await di.prepare({ modules: {} })).execute({
+      const r = await (await di.prepare({})).execute({
         code: `const a = []; while (true) a.push(new Array(1e6).fill(1))`,
         cache: {},
       }).result
@@ -2594,13 +2685,13 @@ describe('iso4 error codes pass through verbatim', () => {
   test('ERR_QUEUE_FULL — a capacity refusal is a failed outcome, not a rejection', async () => {
     const di = durableIsolates({ sandbox: { maxConcurrentRuns: 1, maxQueuedRuns: 0 } })
     try {
-      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      const r = await di.prepare({ imports: { tools: SHIM } })
       let release!: (v: string) => void
       let entered!: () => void
       const running = new Promise<void>((resolve) => {
         entered = resolve
       })
-      const globals: PerExecuteGlobals = {
+      const globals: DurableGlobals = {
         hold: () => {
           entered()
           return new Promise<string>((resolve) => {
@@ -2609,7 +2700,7 @@ describe('iso4 error codes pass through verbatim', () => {
         },
       }
       const code = `import { step } from 'tools'; export default await step('h', 'hold')`
-      const first = r.execute({ code, cache: {}, globals })
+      const first = r.execute({ code, cache: {}, durableGlobals: globals })
       await running // the one slot is now held
 
       const refused = await r.execute({ code: `export default 1`, cache: {} }).result
@@ -2625,9 +2716,9 @@ describe('iso4 error codes pass through verbatim', () => {
 
 describe('per-run metrics (iso4 result passed through as `run`)', () => {
   test('completed: RunSuccess verbatim — clocks, heap, logs, kernel bridge calls', async () => {
-    const globals: PerExecuteGlobals = { ping: () => 'pong' }
+    const globals: DurableGlobals = { ping: () => 'pong' }
     const code = `import { call } from 'tools'; console.log('hi'); export default await call('ping')`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
@@ -2642,7 +2733,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
     expect(r.run.bridgeCalls.filter((c) => !KERNEL_BRIDGE_GLOBALS.some((n) => n === c.name))).toEqual([])
 
     // A replay answered from the cache still round-trips the bridge.
-    const replay = await runner.execute({ code, cache: r.cache, globals }).result
+    const replay = await runner.execute({ code, cache: r.cache, durableGlobals: globals }).result
     expect(replay.run.bridgeCalls.map((c) => c.name)).toEqual(['__di_call'])
   }, 15_000)
 
@@ -2669,13 +2760,13 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
   test('failed before admission (ERR_QUEUE_FULL): no `queueWaitMs`', async () => {
     const di = durableIsolates({ sandbox: { maxConcurrentRuns: 1, maxQueuedRuns: 0 } })
     try {
-      const r = await di.prepare({ modules: { tools: { shim: SHIM } } })
+      const r = await di.prepare({ imports: { tools: SHIM } })
       let release!: (v: string) => void
       let entered!: () => void
       const running = new Promise<void>((resolve) => {
         entered = resolve
       })
-      const globals: PerExecuteGlobals = {
+      const globals: DurableGlobals = {
         hold: () => {
           entered()
           return new Promise<string>((resolve) => {
@@ -2683,7 +2774,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
           })
         },
       }
-      const first = r.execute({ code: `import { step } from 'tools'; export default await step('h', 'hold')`, cache: {}, globals })
+      const first = r.execute({ code: `import { step } from 'tools'; export default await step('h', 'hold')`, cache: {}, durableGlobals: globals })
       await running
 
       const refused = await r.execute({ code: `export default 1`, cache: {} }).result
@@ -2701,7 +2792,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
   }, 30_000)
 
   test('suspended: iso4\'s aborted arm with the numbers up to the pause', async () => {
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       load: () => 'x',
       approve: () => {
         throw new SuspendIsolate({ need: 'approval' })
@@ -2710,7 +2801,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
     const code = `import { call } from 'tools'
       await call('load')
       export default await call('approve')`
-    const r = await runner.execute({ code, cache: {}, globals }).result
+    const r = await runner.execute({ code, cache: {}, durableGlobals: globals }).result
     expect(r.outcome).toBe('suspended')
     if (r.outcome !== 'suspended')
       return
@@ -2727,7 +2818,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
     const startedOnce = new Promise<void>((resolve) => {
       started = resolve
     })
-    const globals: PerExecuteGlobals = {
+    const globals: DurableGlobals = {
       slow: async () => {
         started()
         await new Promise((resolve) => {
@@ -2736,7 +2827,7 @@ describe('per-run metrics (iso4 result passed through as `run`)', () => {
         return 'io'
       },
     }
-    const handle = runner.execute({ code: `import { call } from 'tools'; export default await call('slow')`, cache: {}, globals })
+    const handle = runner.execute({ code: `import { call } from 'tools'; export default await call('slow')`, cache: {}, durableGlobals: globals })
     await startedOnce
     const r = await handle.suspend()
     expect(r.outcome).toBe('suspended')

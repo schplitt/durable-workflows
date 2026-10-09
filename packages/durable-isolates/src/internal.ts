@@ -1,7 +1,7 @@
 /**
  * `durable-isolates:internal` — the shim-facing contract.
  *
- * What mounted module shims import (never end-user code). Self-contained by
+ * What shims (sandbox modules passed as string imports) import (never end-user code). Self-contained by
  * design (imports nothing) so it can be shipped as raw text and injected as the
  * ambient module into an editor / codemode `.d.ts`, or imported normally by
  * shim authors from `durable-isolates/internal`.

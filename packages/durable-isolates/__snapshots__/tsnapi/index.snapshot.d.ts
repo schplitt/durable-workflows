@@ -57,7 +57,9 @@ export interface ExecuteHandle {
 export interface ExecuteOptions {
   code: string;
   cache: BoundaryCache;
-  globals?: PerExecuteGlobals;
+  imports?: PlainImportOverrides;
+  globals?: PlainGlobalOverrides;
+  durableGlobals?: DurableGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface FailedBoundary extends BoundaryRecordBase {
@@ -70,10 +72,6 @@ export interface FailedResult extends ExecuteResultBase {
   outcome: "failed";
   error: RunError;
   run: RunFailure;
-}
-export interface ModuleDefinition {
-  shim: string;
-  globals?: GlobalMap;
 }
 export interface NonJsonCallRejection extends NonJsonRejectionBase {
   source: "args" | "result" | "error";
@@ -88,7 +86,9 @@ export interface PendingOperation {
   payload: unknown;
 }
 export interface PrepareOptions {
-  modules: Readonly<Record<string, ModuleDefinition>>;
+  imports?: Imports;
+  globals?: HostGlobals;
+  durableGlobals?: DurableGlobals;
   limits?: Partial<ResourceLimits>;
 }
 export interface ProtocolRejection extends RejectionBase {
@@ -122,11 +122,12 @@ export interface WaitingBoundary extends BoundaryRecordBase {
 export type BoundaryCache = Record<string, BoundaryRecord>;
 export type BoundaryRecord = CompletedBoundary | FailedBoundary | WaitingBoundary;
 export type CreateDurableIsolates = (_?: DurableIsolatesOptions) => DurableIsolates;
+export type DurableGlobal = (..._: unknown[]) => unknown;
+export type DurableGlobals = Readonly<Record<string, DurableGlobal>>;
 export type ExecuteResult = CompletedResult | SuspendedResult | FailedResult | RejectedResult;
-export type GlobalMap = Readonly<Record<string, HostGlobal>>;
-export type HostGlobal = (..._: unknown[]) => unknown;
 export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection;
-export type PerExecuteGlobals = Readonly<Record<string, HostGlobal>>;
+export type PlainGlobalOverrides = Readonly<Record<string, HostExportFunction>>;
+export type PlainImportOverrides = Readonly<Record<string, HostModuleObject>>;
 export type Rejection = NonJsonRejection | DivergenceRejection | DuplicateKeyRejection | UnknownGlobalRejection | ProtocolRejection;
 // #endregion
 

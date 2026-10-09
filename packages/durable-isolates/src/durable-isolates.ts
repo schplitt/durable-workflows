@@ -1,18 +1,23 @@
+/**
+ * The durable-isolates factory: binds ONE iso4 sandbox (lazily) and prepares
+ * prefixes on it. A prefix is the caller's iso4 `imports` and `globals` as
+ * they are, plus the kernel shim and its three bridge globals; its
+ * `durableGlobals` are the registry a shim reaches through `durableCall`.
+ */
 import { createSandbox } from '@iso4/sandbox'
-import type { HostGlobals, Prefix, Sandbox } from '@iso4/sandbox'
+import type { HostGlobals, Imports, Prefix, Sandbox } from '@iso4/sandbox'
 import type {
   CreateDurableIsolates,
   DurableIsolates,
   DurableIsolatesRunner,
 } from './types'
-import { prepareGlobals, resolveDefaultGlobals, toPrepareImports } from './mount'
+import { assertPrepareOptions, toPrepareGlobals, toPrepareImports } from './mount'
 import { executeRun } from './execute'
 
 /**
- * Bind one iso4 sandbox (the Rust core). The sandbox is created
- * lazily on the first `prepare` (or `getSandbox`) and reused for every prefix;
- * `dispose()` tears it — and all its prefixes — down. See {@link CreateDurableIsolates}.
- * @param options the sandbox options for the one iso4 bind
+ * Bind ONE iso4 sandbox (lazily, on the first `prepare` or `getSandbox`) and
+ * prepare prefixes on it. See {@link DurableIsolates}.
+ * @param options iso4 sandbox options (the one Rust bind) — see {@link DurableIsolatesOptions}
  */
 export const durableIsolates: CreateDurableIsolates = (options = {}) => {
   let sandboxPromise: Promise<Sandbox> | null = null
@@ -26,25 +31,28 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
     getSandbox,
 
     prepare: async (prepareOptions): Promise<DurableIsolatesRunner> => {
-      const { modules, limits: prepareLimits } = prepareOptions
-      const defaults = resolveDefaultGlobals(modules)
+      assertPrepareOptions(prepareOptions) // every rule, before anything is built
+      const { imports = {}, globals = {}, durableGlobals = {}, limits: prepareLimits } = prepareOptions
 
+      const durable = new Map(Object.entries(durableGlobals)) // built once; each run copies it before applying overrides
       const sandbox = await getSandbox()
-      const prefix: Prefix<HostGlobals, Record<string, never>> = await sandbox.prepare({
+      const prefix: Prefix<HostGlobals, Imports> = await sandbox.prepare({
         code: '',
-        globals: prepareGlobals(),
-        imports: toPrepareImports(modules),
+        globals: toPrepareGlobals(globals),
+        imports: toPrepareImports(imports),
       })
 
       const runner: DurableIsolatesRunner = {
         prefixId: prefix.id,
         execute: (executeOptions) => executeRun({
           prefix,
-          defaults,
+          durableGlobals: durable,
           prepareLimits,
           code: executeOptions.code,
           cache: executeOptions.cache,
-          globals: executeOptions.globals,
+          importOverrides: executeOptions.imports,
+          globalOverrides: executeOptions.globals,
+          durableOverrides: executeOptions.durableGlobals,
           executeLimits: executeOptions.limits,
         }),
         dispose: () => prefix.dispose(),
