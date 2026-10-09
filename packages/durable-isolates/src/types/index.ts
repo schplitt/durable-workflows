@@ -15,10 +15,12 @@
  * CALLER owns storage (persist `cache`, hand it back next turn), retry/eviction
  * (cache surgery), and reacting to `pending` operations. Keys are always formed
  * sandbox-side and carried over the wire — the kernel is a memoize-by-key
- * router. A key miss simply runs; a key HIT is checked: the program must ask
- * the same call (`name` + `args`, compared as stable JSON) the record holds,
- * or the run is rejected as a replay divergence. Keys themselves are not
- * policed (a changed key is just a miss).
+ * router — and a position checker: every durable call and `boundary()` is
+ * issued at a position (`scope` + `order`, counted per boundary scope in
+ * source order) that is recorded and compared on replay, and a durable call at
+ * a recorded key must ask the same call (`name` + `args`, compared as stable
+ * JSON) the record holds. Anything else is rejected as a replay divergence. A
+ * new key at a free position simply runs.
  *
  * Every value crossing a boundary is written with `JSON.stringify` and read
  * back with `JSON.parse` before anyone sees it, already on the first run, so
@@ -181,12 +183,13 @@ export interface DurableIsolatesRunner {
 export interface ExecuteOptions {
   /**
    * ESM source — the SAME source on every replay. Keys are formed
-   * deterministically in the shim. A durable call at an unrecorded key just
-   * runs; one at a RECORDED key must ask the same `name` with the same `args`
-   * (stable JSON, object key order ignored) or the run is rejected as a
-   * replay divergence — so keep durable calls in the same order on every run
-   * (parallel calls must not depend on completion order) and wrap
-   * nondeterministic inputs in `boundary()`. Durable calls and checkpoints
+   * deterministically in the shim. Every durable call and `boundary()` must be
+   * issued at the position it was recorded at, and a durable call at a
+   * RECORDED key must ask the same `name` with the same `args` (stable JSON,
+   * object key order ignored), or the run is rejected as a replay divergence —
+   * so keep durable calls in the same order on every run, give each parallel
+   * branch that makes more than one durable call its own `boundary()`, and
+   * wrap nondeterministic inputs in `boundary()`. Durable calls and checkpoints
    * belong on the awaited path: work registered with iso4's `waitUntil` runs
    * after `execute` has returned, so anything it records lands in a `cache`
    * the caller may already have persisted — not supported.
@@ -321,6 +324,9 @@ export interface FailedResult extends ExecuteResultBase {
  * aborted and the violating bridge call never settles); every in-flight
  * dispatch is still drained into `cache`, but nothing is recorded at the
  * violating key — fix the program or the global and run the same cache again.
+ * A suspension that happened in the same run is not reported (its waiting
+ * record is in `cache`, its `pending` entry is dropped): a rejected run is
+ * dead, and the resume re-dispatches the waiting boundary anyway.
  * `rejection` says what was refused and why, discriminated on `reason`; its
  * `message` is written for the author (or the model) that wrote the program.
  */
@@ -339,32 +345,60 @@ export interface RejectedResult extends ExecuteResultBase {
  * Why a run was rejected — discriminated on `reason`. `key` is the boundary
  * the violation happened at (nothing new is recorded there).
  */
-export type Rejection = NonJsonRejection | DivergenceRejection
+export type Rejection = NonJsonRejection | DivergenceRejection | ProtocolRejection
 
 /**
- * The program asked, at a recorded key, for a different call than the record
- * holds: another operation `name`, the same operation with other `args`
- * (compared as stable JSON, so object key order does not matter), or a call
- * where the record holds no call at all (a `boundary()`/`durableCommit`
- * checkpoint, or a record written by an older kernel). Nothing is answered,
- * re-thrown or re-dispatched; the recorded entry is left as it was.
+ * A bridge payload the kernel shim never sends: a program reached a bridge
+ * global directly (`__di_call` with non-array args or no position, non-text
+ * where text is expected, …). Nothing is recorded.
+ */
+export interface ProtocolRejection extends RejectionBase {
+  reason: 'protocol'
+  source: 'args' | 'commit'
+  /**
+   * The global the call routed to (`args` only).
+   */
+  name?: string
+  /**
+   * What was wrong, in fixed words (`not JSON text`, `malformed JSON text`,
+   * `args are not a JSON array`, `missing issue position`, `malformed position`).
+   */
+  detail: string
+}
+
+/**
+ * The program's durable operations no longer line up with the history. Either
+ * an operation was issued at a different POSITION than recorded (`order`: the
+ * operations are not in the recorded order — a swapped pair, a flipped branch,
+ * an insertion), or at a recorded key the program asked for a different call:
+ * another operation `name`, the same operation with other `args` (compared as
+ * stable JSON, so object key order does not matter), or a call where the
+ * record holds no call at all (a `boundary()`/`durableCommit` checkpoint, or a
+ * record written by an older kernel). Nothing is answered, re-thrown or
+ * re-dispatched; the history is left as it was.
  */
 export interface DivergenceRejection extends RejectionBase {
   reason: 'divergence'
   /**
-   * What differed: the operation name, the arguments, or the record holds no
-   * call to compare against.
+   * What differed: the position, the operation name, the arguments, or the
+   * record holds no call to compare against.
    */
-  mismatch: 'name' | 'args' | 'no-call'
+  mismatch: 'order' | 'name' | 'args' | 'no-call'
   /**
-   * The call the record at `key` holds — both absent when `mismatch` is
-   * `'no-call'`.
+   * What the history holds where the conflict is: the record at `key` for
+   * `name`, `args` and `no-call` (then `recorded.key === key`); for `order`,
+   * the record that owns the asked position — at `key` if `key` is recorded
+   * at another position, else the OTHER key already holding that position.
+   * `name`/`args` are absent on a checkpoint record; `scope`/`order` on a
+   * record written without a position (an older kernel, a raw commit).
    */
-  recorded: { name?: string, args?: unknown[] }
+  recorded: { key: string, name?: string, args?: unknown[], scope?: string, order?: number }
   /**
-   * The call the program asked for this run (args JSON-normalized).
+   * What the program asked for this run: a durable call (its `name` and `args`
+   * as they read back from JSON) or a checkpoint, at the issue position
+   * `scope` + `order`.
    */
-  attempted: { name: string, args: unknown[] }
+  attempted: { scope: string, order: number, name: string, args: unknown[] } | { scope: string, order: number }
 }
 
 interface RejectionBase {
@@ -427,8 +461,9 @@ export interface PendingOperation {
 
 /**
  * The durable history: one record per boundary, keyed by the boundary id (the
- * sandbox-formed key). Matching is by id only — the kernel never matches by
- * position. Plain JSON data; the caller persists it however it likes.
+ * sandbox-formed key); each record also remembers the position (`scope` +
+ * `order`) it was issued at, which replay verifies. Plain JSON data; the
+ * caller persists it however it likes.
  */
 export type BoundaryCache = Record<string, BoundaryRecord>
 
@@ -455,6 +490,25 @@ interface BoundaryRecordBase {
    * History order — eviction and timeline only, never matching.
    */
   seq: number
+  /**
+   * The scope the operation was issued in: the ambient `boundary()` path
+   * (`''` at the top level, `outer`, `outer/inner`, …). Positions are counted
+   * per scope, so a boundary answered from the cache skips its whole subtree
+   * without disturbing the parent's count, and parallel bodies never
+   * interleave each other's numbering. Written on every record a durable call
+   * or `boundary()` produces; absent on a raw `durableCommit` record and on
+   * records from an older kernel.
+   */
+  scope?: string
+  /**
+   * Issue position within `scope`: a counter over every durable call and
+   * checkpoint issued in that scope, taken when the operation was issued
+   * (source order — stable under `Promise.all`, unlike `seq`). Compared on
+   * replay: an operation at a different position than recorded, or a new key
+   * at a position another key already holds, is a divergence. Present
+   * together with `scope`.
+   */
+  order?: number
 }
 
 export interface CompletedBoundary extends BoundaryRecordBase {

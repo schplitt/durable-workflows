@@ -149,6 +149,8 @@ describe('boundary records carry the call (name + args)', () => {
       status: 'completed',
       name: 'echo',
       args: ['p', { n: 1, tags: ['x'] }],
+      scope: '',
+      order: 0,
       value: { a: 'p', b: { n: 1, tags: ['x'] } },
     })
   }, 15_000)
@@ -170,6 +172,8 @@ describe('boundary records carry the call (name + args)', () => {
       status: 'failed',
       name: 'boom',
       args: [7],
+      scope: '',
+      order: 0,
       error: { name: 'TypeError', message: 'nope' },
     })
   }, 15_000)
@@ -186,6 +190,8 @@ describe('boundary records carry the call (name + args)', () => {
       status: 'failed',
       name: 'missing',
       args: ['a', 1],
+      scope: '',
+      order: 0,
       error: { name: 'Error', message: 'durable-isolates: no global for "missing"' },
     })
   }, 15_000)
@@ -205,12 +211,12 @@ describe('boundary records carry the call (name + args)', () => {
 
     const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
-    expect(r1.cache['gate#0']).toEqual({ seq: 0, status: 'waiting', name: 'gate', args: [{ subject: 's-1' }] })
+    expect(r1.cache['gate#0']).toEqual({ seq: 0, status: 'waiting', name: 'gate', args: [{ subject: 's-1' }], scope: '', order: 0 })
 
     approved = true
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
-    expect(r2.cache['gate#0']).toEqual({ seq: 0, status: 'completed', name: 'gate', args: [{ subject: 's-1' }], value: 'opened' })
+    expect(r2.cache['gate#0']).toEqual({ seq: 0, status: 'completed', name: 'gate', args: [{ subject: 's-1' }], scope: '', order: 0, value: 'opened' })
     expect(seen).toEqual([[{ subject: 's-1' }], [{ subject: 's-1' }]]) // same args both dispatches
   }, 15_000)
 
@@ -222,8 +228,8 @@ describe('boundary records carry the call (name + args)', () => {
 
     const r = await runner.execute({ code, cache: {}, globals: {} }).result
     expect(r.outcome).toBe('completed')
-    expect(r.cache.scope).toEqual({ seq: 0, status: 'completed', value: 'in-sandbox' })
-    expect(r.cache.manual).toEqual({ seq: 1, status: 'completed', value: { ok: true } })
+    expect(r.cache.scope).toEqual({ seq: 0, status: 'completed', scope: '', order: 0, value: 'in-sandbox' })
+    expect(r.cache.manual).toEqual({ seq: 1, status: 'completed', value: { ok: true } }) // a raw commit carries no position
   }, 15_000)
 })
 
@@ -492,7 +498,7 @@ describe('checkpoints (lookup / commit / boundary)', () => {
       return
     expect(r2.result).toBe(42)
     expect(probes).toBe(1) // inner probe fast-pathed on the resume replay
-    expect(r2.cache.scope).toEqual({ seq: expect.any(Number), status: 'completed', value: 42 })
+    expect(r2.cache.scope).toEqual({ seq: expect.any(Number), status: 'completed', scope: '', order: 0, value: 42 })
 
     // Evict the inner records: the committed scope must skip its body wholesale.
     const pruned: BoundaryCache = { scope: r2.cache.scope! }
@@ -612,7 +618,7 @@ describe('external suspension (handle.suspend())', () => {
     if (r1.outcome !== 'suspended')
       return
     expect(r1.pending).toEqual([]) // nothing waits on the outside — we stopped it
-    expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', name: 'slow', args: [{}], value: 'expensive-io' }) // drained write kept
+    expect(r1.cache['slow#0']).toEqual({ seq: 0, status: 'completed', name: 'slow', args: [{}], scope: '', order: 0, value: 'expensive-io' }) // drained write kept
 
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
@@ -749,6 +755,8 @@ describe('error plane', () => {
       status: 'failed',
       name: 'boom',
       args: [{}],
+      scope: '',
+      order: 0,
       error: { name: 'PaymentError', message: 'payment declined' },
     })
   }, 15_000)
@@ -791,7 +799,7 @@ describe('error plane', () => {
     expect(err.fields?.status).toBeUndefined() // own fields are not recorded, so none reach the run-level error
   }, 15_000)
 
-  test('a changed program at an UNRECORDED key just misses and runs — keys are not policed', async () => {
+  test('a changed program with a NEW call appended at a free position just runs', async () => {
     let bs = 0
     const globals: PerExecuteGlobals = { a: () => 1, b: () => {
       bs += 1
@@ -803,10 +811,9 @@ describe('error plane', () => {
     if (r1.outcome !== 'completed')
       return
 
-    // 'b#0' is a fresh key: nothing to compare against, so it runs. The
-    // abandoned 'a#0' record lingers harmlessly (a recorded key is only checked
-    // when the program asks for it).
-    const r2 = await runner.execute({ code: `import { call } from 'tools'; export default await call('b', {})`, cache: r1.cache, globals }).result
+    // 'b#0' is a fresh key at a free position (after 'a#0'): nothing to compare
+    // against, so it runs.
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: r1.cache, globals }).result
     expect(r2.outcome).toBe('completed')
     if (r2.outcome !== 'completed')
       return
@@ -996,7 +1003,7 @@ describe('values cross as JSON (converted like JSON.stringify, same on every run
     if (r1.outcome !== 'completed')
       return
     expect(r1.result).toEqual({ a: undefined, b: undefined })
-    expect(r1.cache.b).toEqual({ seq: 1, status: 'completed' })
+    expect(r1.cache.b).toEqual({ seq: 1, status: 'completed', scope: '', order: 1 })
 
     const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
     const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
@@ -1234,17 +1241,6 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     expect(r.cache).toEqual({})
   }, 15_000)
 
-  test('a program calling the commit bridge directly with non-text is rejected (the trust boundary holds)', async () => {
-    const code = `globalThis.__di_commit('k', 123); export default 'done'`
-
-    const r = await runner.execute({ code, cache: {}, globals: {} }).result
-    expect(r.outcome).toBe('rejected')
-    if (r.outcome !== 'rejected')
-      return
-    expect(r.rejection).toMatchObject({ source: 'commit', key: 'k', detail: 'not JSON text' })
-    expect(r.cache).toEqual({})
-  }, 15_000)
-
   test('an Error with a non-string message is recorded as text', async () => {
     const globals: PerExecuteGlobals = {
       boom: () => {
@@ -1302,17 +1298,6 @@ describe('what JSON refuses rejects the run (bigint, cycles)', () => {
     if (r2.outcome !== 'rejected')
       return
     expect((r2.rejection as { detail: string }).detail.length).toBe(1024)
-  }, 15_000)
-
-  test('a program calling the call bridge directly with non-array args is rejected', async () => {
-    const globals: PerExecuteGlobals = { e: () => 'ran' }
-    const code = `globalThis.__di_call('k', 'e', '{"a":1}'); export default 'done'`
-    const r = await runner.execute({ code, cache: {}, globals }).result
-    expect(r.outcome).toBe('rejected')
-    if (r.outcome !== 'rejected')
-      return
-    expect(r.rejection).toMatchObject({ source: 'args', key: 'k', detail: 'args are not a JSON array' })
-    expect(r.cache).toEqual({})
   }, 15_000)
 
   test('the shim uses captured JSON intrinsics: a program patching JSON.stringify cannot change what crosses', async () => {
@@ -1467,8 +1452,8 @@ describe('replay divergence (recorded key, different call)', () => {
       reason: 'divergence',
       mismatch: 'args',
       key: 'echo#0',
-      recorded: { name: 'echo', args: ['first'] },
-      attempted: { name: 'echo', args: ['second'] },
+      recorded: { key: 'echo#0', scope: '', order: 0, name: 'echo', args: ['first'] },
+      attempted: { name: 'echo', args: ['second'], scope: '', order: 0 },
       message: expect.stringContaining('replay divergence: at a recorded boundary the program asked for the same operation with different arguments'),
     })
     expect(r2.rejection.message).toContain('wrap nondeterministic inputs')
@@ -1541,8 +1526,8 @@ describe('replay divergence (recorded key, different call)', () => {
       reason: 'divergence',
       mismatch: 'no-call',
       key: 'k',
-      recorded: {},
-      attempted: { name: 'load', args: [{}] },
+      recorded: { key: 'k', scope: '', order: 0 },
+      attempted: { name: 'load', args: [{}], scope: '', order: 0 },
       message: expect.stringContaining('the record holds no call to compare'),
     })
   }, 15_000)
@@ -1571,16 +1556,20 @@ describe('replay divergence (recorded key, different call)', () => {
         return 'slow-result'
       },
     }
-    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
-    expect(r1.outcome).toBe('completed')
-
-    const code = `import { step } from 'tools'
+    const program = (arg: number) => `import { step } from 'tools'
       const slow = step('slow', 'slow', {})
       let out = 'not reached'
-      try { await step('k', 'a', 2) } catch (e) { out = 'caught: ' + e.message }
+      try { await step('k', 'a', ${arg}) } catch (e) { out = 'caught: ' + e.message }
       await slow
       export default out`
-    const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
+    const r1 = await runner.execute({ code: program(1), cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    // Same program, other args at 'k'; 'slow' is in flight again (a replay re-runs nothing cached, but its record is answered — so re-dispatch it by evicting it)
+    const cache = { ...r1.cache }
+    delete cache.slow
+    slowRuns = 0
+    const r2 = await runner.execute({ code: program(2), cache, globals }).result
     expect(r2.outcome).toBe('rejected')
     if (r2.outcome !== 'rejected')
       return
@@ -1624,7 +1613,7 @@ describe('replay divergence (recorded key, different call)', () => {
 
     const r1 = await runner.execute({ code, cache: {}, globals }).result
     expect(r1.outcome).toBe('suspended')
-    expect(r1.cache.nap).toEqual({ seq: 0, status: 'waiting', name: 'sleep', args: [{ ms: 5 }] })
+    expect(r1.cache.nap).toEqual({ seq: 0, status: 'waiting', name: 'sleep', args: [{ ms: 5 }], scope: '', order: 0 })
 
     ready = true
     const r2 = await runner.execute({ code, cache: r1.cache, globals }).result
@@ -1809,7 +1798,7 @@ describe('pinned edge cases', () => {
       export default await step('b', 'b', {})`
     const r2 = await runner.execute({ code, cache: {}, globals }).result
     expect(r2.outcome).toBe('rejected')
-    expect(r2.cache).toEqual({ a: { seq: 0, status: 'completed', name: 'a', args: [{}], value: 'a' } })
+    expect(r2.cache).toEqual({ a: { seq: 0, status: 'completed', name: 'a', args: [{}], scope: '', order: 0, value: 'a' } })
     const r3 = await runner.execute({ code, cache: r2.cache, globals: { ...globals, b: () => 'b' } }).result
     expect(r3.outcome).toBe('completed')
     expect(r3.cache.b).toMatchObject({ seq: 1 }) // the rejected dispatch consumed nothing
@@ -1856,21 +1845,26 @@ describe('pinned edge cases', () => {
     await tight.dispose()
   }, 20_000)
 
-  test('malformed or non-text payloads on either bridge are rejected (program calling the bridge directly)', async () => {
+  test('bridge payloads the shim never sends are protocol faults; nothing is recorded', async () => {
     const globals: PerExecuteGlobals = { e: () => 'ran' }
-    for (const [code, source, detail] of [
-      [`globalThis.__di_call('k', 'e', '[1'); export default 1`, 'args', 'malformed JSON text'],
-      [`globalThis.__di_commit('k', '{x'); export default 1`, 'commit', 'malformed JSON text'],
-      [`globalThis.__di_call('k', 'e', 5); export default 1`, 'args', 'not JSON text'],
+    for (const [code, expected] of [
+      [`globalThis.__di_call('k', 'e', '[1', undefined, 0, ''); export default 1`, { source: 'args', name: 'e', detail: 'malformed JSON text' }],
+      [`globalThis.__di_call('k', 'e', 5, undefined, 0, ''); export default 1`, { source: 'args', name: 'e', detail: 'not JSON text' }],
+      [`globalThis.__di_call('k', 'e', '{"a":1}', undefined, 0, ''); export default 1`, { source: 'args', name: 'e', detail: 'args are not a JSON array' }],
+      [`globalThis.__di_call('k', 'e', '[]'); export default 1`, { source: 'args', name: 'e', detail: 'missing issue position' }],
+      [`globalThis.__di_commit('k', '{x'); export default 1`, { source: 'commit', detail: 'malformed JSON text' }],
+      [`globalThis.__di_commit('k', 123); export default 1`, { source: 'commit', detail: 'not JSON text' }],
+      [`globalThis.__di_commit('k', '1', undefined, 'zero', ''); export default 1`, { source: 'commit', detail: 'malformed position' }],
     ] as const) {
       const r = await runner.execute({ code, cache: {}, globals }).result
       expect(r.outcome).toBe('rejected')
       if (r.outcome !== 'rejected')
         return
-      expect(r.rejection).toMatchObject({ reason: 'non-json', source, key: 'k', detail })
+      expect(r.rejection).toMatchObject({ reason: 'protocol', key: 'k', ...expected })
+      expect(r.rejection.message).toContain('never through its bridge globals directly')
       expect(r.cache).toEqual({})
     }
-  }, 20_000)
+  }, 30_000)
 
   test('sandbox-side serializer complaints: a plain throw is its text, an unreadable one a fixed text, a long one is cut', async () => {
     const run = (thrown: string) => runner.execute({
@@ -1919,14 +1913,14 @@ describe('pinned edge cases', () => {
     expect(noCall.cache).toEqual(checkpoint.cache)
   }, 30_000)
 
-  test('a record from an older kernel (name without args) is a no-call divergence', async () => {
+  test('a record from an older kernel (no order, no args) diverges on the position check', async () => {
     const globals: PerExecuteGlobals = { ok: () => 'new' }
     const old: BoundaryCache = { k: { seq: 0, status: 'completed', name: 'ok', value: 'old' } }
     const r = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'ok', {})`, cache: old, globals }).result
     expect(r.outcome).toBe('rejected')
     if (r.outcome !== 'rejected')
       return
-    expect(r.rejection).toMatchObject({ reason: 'divergence', mismatch: 'no-call', recorded: {} })
+    expect(r.rejection).toMatchObject({ reason: 'divergence', mismatch: 'order', recorded: { key: 'k' } })
   }, 15_000)
 
   test('the input cache is never mutated and `recorded` is a copy of the history', async () => {
@@ -2020,7 +2014,7 @@ describe('pinned edge cases', () => {
     const first = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 1)`, cache: {}, globals }).result
     const diverged = await runner.execute({ code: `import { step } from 'tools'; export default await step('k', 'a', 2)`, cache: first.cache, globals }).result
     expect(diverged.outcome === 'rejected' && diverged.rejection.message).toBe(
-      'durable-isolates: replay divergence: at a recorded boundary the program asked for the same operation with different arguments. Durable calls must be deterministic across runs: keep them in the same order (parallel calls must not depend on completion order) and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.',
+      'durable-isolates: replay divergence: at a recorded boundary the program asked for the same operation with different arguments. Durable calls must be deterministic across runs: keep them in the same order, give each parallel branch that makes more than one durable call its own boundary(), and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.',
     )
   }, 20_000)
 
@@ -2095,6 +2089,204 @@ describe('deep values (iso4 >= 0.6.3 has no host → sandbox nesting cap)', () =
     const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
     expect(r2.outcome === 'completed' && r2.result).toEqual([200, 'leaf', 'saved'])
     expect(seen).toEqual(['leaf']) // the global ran once; the deep args compared equal on replay
+  }, 15_000)
+})
+
+describe('issue order (position) divergence', () => {
+  const globals: PerExecuteGlobals = { a: () => 'A', b: () => 'B', n: () => 'N' }
+
+  test('every record carries the position at which the program issued it; a resume keeps them', async () => {
+    let approved = false
+    const g: PerExecuteGlobals = {
+      ...globals,
+      approve: () => {
+        if (!approved)
+          throw new SuspendIsolate({})
+        return 'ok'
+      },
+    }
+    const code = `import { call } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      const a = await call('a', {})
+      const t = await boundary('t', () => a + '!')
+      export default await call('approve', t)`
+
+    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r1.outcome).toBe('suspended')
+    expect(r1.cache['a#0']).toMatchObject({ order: 0 })
+    expect(r1.cache.t).toMatchObject({ order: 1 })
+    expect(r1.cache['approve#0']).toMatchObject({ order: 2, status: 'waiting' })
+
+    approved = true
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('ok')
+    expect(r2.cache['approve#0']).toMatchObject({ order: 2, status: 'completed' })
+  }, 15_000)
+
+  test('two calls swapped: the first key sits at another position → divergence, even though both keys match', async () => {
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('b', {})`, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('b', {}); export default await call('a', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toEqual({
+      reason: 'divergence',
+      mismatch: 'order',
+      key: 'b#0',
+      recorded: { key: 'b#0', scope: '', order: 1, name: 'b', args: [{}] },
+      attempted: { name: 'b', args: [{}], scope: '', order: 0 },
+      message: expect.stringContaining('issued a durable operation at a different position than recorded'),
+    })
+    expect(r2.cache).toEqual(r1.cache)
+  }, 15_000)
+
+  test('a flipped branch: a NEW key at a position another key holds → divergence instead of running', async () => {
+    let ns = 0
+    const g: PerExecuteGlobals = { ...globals, n: () => {
+      ns += 1
+      return 'N'
+    } }
+    const r1 = await runner.execute({ code: `import { step } from 'tools'; export default await step('x', 'a', 1)`, cache: {}, globals: g }).result
+    expect(r1.outcome).toBe('completed')
+
+    const r2 = await runner.execute({ code: `import { step } from 'tools'; export default await step('y', 'n', 1)`, cache: r1.cache, globals: g }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ mismatch: 'order', key: 'y', recorded: { key: 'x', order: 0, name: 'a', args: [1] }, attempted: { name: 'n', args: [1], order: 0 } })
+    expect(ns).toBe(0) // the other branch did NOT run
+  }, 15_000)
+
+  test('a call inserted before recorded ones diverges at the insertion', async () => {
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('n', {}); export default await call('a', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ mismatch: 'order', key: 'n#0', recorded: { key: 'a#0', order: 0 } })
+  }, 15_000)
+
+  test('a call appended after recorded ones just runs (its position is free)', async () => {
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'; await call('a', {}); export default await call('n', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('N')
+    expect(r2.cache['n#0']).toMatchObject({ order: 1 })
+  }, 15_000)
+
+  test('a checkpoint inserted before a recorded call diverges at the lookup (attempted has only the position)', async () => {
+    const r1 = await runner.execute({ code: `import { call } from 'tools'; export default await call('a', {})`, cache: {}, globals }).result
+    const r2 = await runner.execute({ code: `import { call } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      await boundary('s', () => 1); export default await call('a', {})`, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toEqual({
+      reason: 'divergence',
+      mismatch: 'order',
+      key: 's',
+      recorded: { key: 'a#0', scope: '', order: 0, name: 'a', args: [{}] },
+      attempted: { scope: '', order: 0 },
+      message: expect.stringContaining('different position'),
+    })
+    expect(r2.cache).toEqual(r1.cache)
+  }, 15_000)
+
+  test('parallel calls keep source-order positions whichever finishes first → no divergence on replay', async () => {
+    let delays: Record<string, number> = { first: 40, second: 5 }
+    const g: PerExecuteGlobals = {
+      echo: async (v) => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, delays[v as string])
+        })
+        return v
+      },
+    }
+    const code = `import { call } from 'tools'
+      export default await Promise.all([call('echo', 'first'), call('echo', 'second')])`
+
+    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['first', 'second'])
+    expect(r1.cache['echo#0']).toMatchObject({ order: 0, value: 'first' })
+    expect(r1.cache['echo#1']).toMatchObject({ order: 1, value: 'second' })
+
+    delays = { first: 5, second: 40 } // timing flips; positions do not
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['first', 'second'])
+  }, 15_000)
+
+  test('nested boundary: the inner ops count in their own scope; a hit on the outer skips them without shifting later positions', async () => {
+    let cs = 0
+    const g: PerExecuteGlobals = { ...globals, c: () => {
+      cs += 1
+      return 'C'
+    } }
+    const code = `import { boundary, durableCall, nextKey } from 'durable-isolates:internal'
+      const call = (n, ...a) => durableCall(nextKey(n), n, ...a) // scoped keys, like a real shim
+      const o = await boundary('o', async () => (await call('a', {})) + (await call('b', {})))
+      export default o + (await call('c', {}))`
+    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r1.outcome === 'completed' && r1.result).toBe('ABC')
+    expect(r1.cache.o).toMatchObject({ scope: '', order: 0, seq: 2 }) // committed after its body settled
+    expect(r1.cache['o/a#0']).toMatchObject({ scope: 'o', order: 0 })
+    expect(r1.cache['o/b#0']).toMatchObject({ scope: 'o', order: 1 })
+    expect(r1.cache['c#0']).toMatchObject({ scope: '', order: 1 }) // the body never touched the top-level count
+
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toBe('ABC') // the hit on 'o' skips a and b; c still sits at position 1
+    expect(cs).toBe(1)
+  }, 15_000)
+
+  test('parallel boundaries: each body numbers its own ops; interleaving cannot shift them', async () => {
+    const g: PerExecuteGlobals = {
+      slow: async (v) => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, v === 'x' ? 30 : 5)
+        })
+        return v
+      },
+    }
+    const code = `import { boundary, durableCall, nextKey } from 'durable-isolates:internal'
+      const call = (n, ...a) => durableCall(nextKey(n), n, ...a) // scoped keys, like a real shim
+      export default await Promise.all([
+        boundary('p', async () => (await call('slow', 'x')) + (await call('slow', 'y'))),
+        boundary('q', async () => (await call('slow', 'z'))),
+      ])`
+    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['xy', 'z'])
+    expect(r1.cache.p).toMatchObject({ scope: '', order: 0 })
+    expect(r1.cache.q).toMatchObject({ scope: '', order: 1 })
+    expect(r1.cache['p/slow#0']).toMatchObject({ scope: 'p', order: 0 })
+    expect(r1.cache['p/slow#1']).toMatchObject({ scope: 'p', order: 1 })
+    expect(r1.cache['q/slow#0']).toMatchObject({ scope: 'q', order: 0 })
+
+    // Evict q's commit only: its body re-runs on replay while p hits — positions still line up.
+    const pruned = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    delete pruned.q
+    const r2 = await runner.execute({ code, cache: pruned, globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual(['xy', 'z'])
+  }, 15_000)
+
+  test('raw durableLookup/durableCommit are outside the position check: a call after them replays fine', async () => {
+    let loads = 0
+    const g: PerExecuteGlobals = { load: () => {
+      loads += 1
+      return 'L'
+    } }
+    const code = `import { durableLookup, durableCommit } from 'durable-isolates:internal'
+      import { call } from 'tools'
+      const r = await durableLookup('k')
+      const v = r.hit ? r.value : await durableCommit('k', 5)
+      export default [v, await call('load', {})]`
+    const r1 = await runner.execute({ code, cache: {}, globals: g }).result
+    expect(r1.outcome === 'completed' && r1.result).toEqual([5, 'L'])
+    expect(r1.cache.k).toEqual({ seq: 0, status: 'completed', value: 5 }) // no position on a raw commit
+    expect(r1.cache['load#0']).toMatchObject({ scope: '', order: 0 }) // the raw pair consumed none
+    const r2 = await runner.execute({ code, cache: JSON.parse(JSON.stringify(r1.cache)), globals: g }).result
+    expect(r2.outcome === 'completed' && r2.result).toEqual([5, 'L'])
+    expect(loads).toBe(1)
   }, 15_000)
 })
 

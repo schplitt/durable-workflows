@@ -19,7 +19,12 @@ import { stableStringify } from './json'
  * The rule a divergence message ends with — what the author (or model) must
  * change for replays to line up.
  */
-const DETERMINISM_RULE = 'Durable calls must be deterministic across runs: keep them in the same order (parallel calls must not depend on completion order) and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.'
+const DETERMINISM_RULE = 'Durable calls must be deterministic across runs: keep them in the same order, give each parallel branch that makes more than one durable call its own boundary(), and wrap nondeterministic inputs such as time, random values or external state in boundary() so they are recorded once.'
+
+/**
+ * The rule a protocol-fault message ends with.
+ */
+const PROTOCOL_RULE = 'Reach the kernel through the durable-isolates:internal module, never through its bridge globals directly.'
 
 /**
  * The rule every rejection message ends with — written for whoever wrote the
@@ -114,15 +119,71 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   const inFlight = new Set<Promise<unknown>>()
   const controller = new AbortController()
 
+  // One pass over the history: the next `seq`, and which key holds each
+  // position (`scope` + `order`) for the position check. Both grow as this run
+  // records.
   let seqNext = 0
-  for (const r of Object.values(cache)) {
+  const keyAtPosition = new Map<string, string>()
+  const positionId = (scope: string, order: number): string => `${order}\u0000${scope}`
+  for (const k in cache) {
+    const r = cache[k]!
     if (r.seq >= seqNext)
       seqNext = r.seq + 1
+    if (r.order !== undefined && r.scope !== undefined)
+      keyAtPosition.set(positionId(r.scope, r.order), k)
   }
 
   // The first violation that rejected this run (later ones are dropped: the
   // isolate is already being aborted).
   let rejection: Rejection | undefined
+
+  // The position check. An operation is only answered for the position it was
+  // recorded at, and a position already held by another key cannot be taken by
+  // a new one (that is how a swapped order or a flipped branch shows up even
+  // when each key still matches). Returns the record that conflicts.
+  const positionConflict = (key: string, scope: string, order: number, existing: BoundaryRecord | undefined): { key: string, record: BoundaryRecord } | undefined => {
+    if (existing !== undefined)
+      return existing.scope === scope && existing.order === order ? undefined : { key, record: existing }
+    const other = keyAtPosition.get(positionId(scope, order))
+    return other === undefined ? undefined : { key: other, record: cache[other]! }
+  }
+
+  // Reject the run as a replay divergence: the program's durable operations no
+  // longer line up with the history, so no answer from the cache can be
+  // trusted. `recorded` is handed out as a copy so a caller editing the
+  // rejection (redacting it for a log, say) cannot touch the history it
+  // persists. The message carries no program-written text.
+  const diverge = (
+    mismatch: DivergenceRejection['mismatch'],
+    key: string,
+    attempted: DivergenceRejection['attempted'],
+    at: { key: string, record: BoundaryRecord },
+  ): Promise<never> => {
+    const what = mismatch === 'order'
+      ? 'the program issued a durable operation at a different position than recorded'
+      : mismatch === 'name'
+        ? 'at a recorded boundary the program asked for a different operation'
+        : mismatch === 'args'
+          ? 'at a recorded boundary the program asked for the same operation with different arguments'
+          : 'at a recorded boundary the program asked for a call where the record holds no call to compare (a checkpoint, or a record from an older kernel)'
+    const message = `durable-isolates: replay divergence: ${what}. ${DETERMINISM_RULE}`
+    const recorded: DivergenceRejection['recorded'] = {
+      key: at.key,
+      ...(at.record.order === undefined || at.record.scope === undefined ? {} : { scope: at.record.scope, order: at.record.order }),
+      ...(at.record.name === undefined || at.record.args === undefined ? {} : { name: at.record.name, args: structuredClone(at.record.args) }),
+    }
+    rejection ??= { reason: 'divergence', key, mismatch, recorded, attempted, message }
+    controller.abort()
+    return never()
+  }
+
+  // A bridge payload the shim never sends (a program calling a bridge global
+  // directly): refuse the run as a protocol fault.
+  const protocolFault = (detail: string, at: { source: 'commit', key: string } | { source: 'args', key: string, name: string }): Promise<never> => {
+    rejection ??= { reason: 'protocol', ...at, detail, message: `durable-isolates: a bridge payload was not what the kernel shim sends. ${PROTOCOL_RULE}` }
+    controller.abort()
+    return never()
+  }
 
   // Admit a value into the cache as JSON, or REJECT the run over it. A host
   // value (`{ value }`) is stringified here; a sandbox value (`{ text, invalid }`)
@@ -132,7 +193,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   const admit = (
     input: { value: unknown } | { text: unknown, invalid: unknown },
     at: { source: 'commit', key: string } | { source: NonJsonCallRejection['source'], key: string, name: string },
-  ): { ok: true, value: unknown } | { ok: false } => {
+  ): { ok: true, value: unknown } | { ok: false, protocol?: string } => {
     let text: string | undefined
     let detail: string | undefined
     if ('value' in input) {
@@ -152,13 +213,13 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     } else if (input.text === undefined || typeof input.text === 'string') {
       text = input.text
     } else {
-      detail = 'not JSON text' // only a program calling the bridge global directly gets here
+      return { ok: false, protocol: 'not JSON text' }
     }
     if (detail === undefined) {
       try {
         return { ok: true, value: text === undefined ? undefined : JSON.parse(text) }
       } catch {
-        detail = 'malformed JSON text' // likewise
+        return { ok: false, protocol: 'malformed JSON text' }
       }
     }
     // The message carries no program-written text (the key, the name and the
@@ -179,13 +240,14 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
   // history says WHAT was asked at each key, not only what came back. Always
   // SETTLES (suspension and rejection resolve the sentinel) so the drain can
   // await every dispatch.
-  const dispatch = async (key: string, name: string, args: unknown[], argsText: string, seq: number): Promise<CallEnvelope | typeof ABORTED> => {
+  const dispatch = async (key: string, name: string, args: unknown[], argsText: string, scope: string, order: number, seq: number): Promise<CallEnvelope | typeof ABORTED> => {
+    keyAtPosition.set(positionId(scope, order), key)
     const global = registry.get(name)
     if (global === undefined) {
       // Plain, persistable record (see the catch below); iso4 rebuilds it as an
       // Error in the sandbox when the bridge re-throws it.
       const error = { name: 'Error', message: `durable-isolates: no global for "${name}"` }
-      cache[key] = { seq, status: 'failed', name, args, error }
+      cache[key] = { seq, status: 'failed', name, args, scope, order, error }
       return { ok: false, error }
     }
     // The global gets its OWN copy: `args` is what the record stores and what
@@ -198,7 +260,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       returned = await global(...ownArgs)
     } catch (e) {
       if (e instanceof SuspendIsolate) {
-        cache[key] = { seq, status: 'waiting', name, args }
+        cache[key] = { seq, status: 'waiting', name, args, scope, order }
         pending.push({ id: key, name, payload: e.payload })
         return ABORTED
       }
@@ -227,37 +289,60 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       // A thrown symbol, function or `undefined` has no JSON reading at all;
       // give it a fixed shape rather than recording an absent error.
       const error = admitted.value === undefined ? { name: 'Error', message: 'non-JSON throw' } : admitted.value
-      cache[key] = { seq, status: 'failed', name, args, error }
+      cache[key] = { seq, status: 'failed', name, args, scope, order, error }
       return { ok: false, error }
     }
     const admitted = admit({ value: returned }, { source: 'result', key, name })
     if (!admitted.ok)
       return ABORTED
-    cache[key] = { seq, status: 'completed', name, args, value: admitted.value }
+    cache[key] = { seq, status: 'completed', name, args, scope, order, value: admitted.value }
     return { ok: true, value: admitted.value }
   }
 
-  // `__di_lookup` — non-memoized read of the live cache (the checkpoint check).
+  // `__di_lookup(key, order?, scope?)` — non-memoized read of the live cache
+  // (the checkpoint check). With a position (a `boundary()`), the position
+  // check applies; a raw `durableLookup` without one is a plain read.
   const lookupBridge = (...bridgeArgs: unknown[]): unknown => {
-    const record: BoundaryRecord | undefined = cache[String(bridgeArgs[0])]
+    const key = String(bridgeArgs[0])
+    const [order, scope] = [bridgeArgs[1], bridgeArgs[2]]
+    const record: BoundaryRecord | undefined = cache[key]
+    if (order !== undefined || scope !== undefined) {
+      if (typeof order !== 'number' || typeof scope !== 'string')
+        return protocolFault('malformed position', { source: 'commit', key })
+      const conflict = positionConflict(key, scope, order, record)
+      if (conflict !== undefined)
+        return diverge('order', key, { scope, order }, conflict)
+    }
     if (record !== undefined && record.status === 'completed')
       return { hit: true, value: record.value }
     return { hit: false }
   }
 
-  // `__di_commit(key, text, invalid)` — record a completed boundary from the
-  // sandbox. Only an ack goes back: the shim parses its own copy of the same
-  // text, so what the program sees is what the cache holds.
+  // `__di_commit(key, text, invalid, order, scope)` — record a completed
+  // boundary from the sandbox. Only an ack goes back: the shim parses its own
+  // copy of the same text, so what the program sees is what the cache holds.
   const commitBridge = (...bridgeArgs: unknown[]): unknown => {
     const key = String(bridgeArgs[0])
     const admitted = admit({ text: bridgeArgs[1], invalid: bridgeArgs[2] }, { source: 'commit', key })
     if (!admitted.ok)
-      return never()
-    cache[key] = { seq: seqNext++, status: 'completed', value: admitted.value }
+      return admitted.protocol === undefined ? never() : protocolFault(admitted.protocol, { source: 'commit', key })
+    const [order, scope] = [bridgeArgs[3], bridgeArgs[4]]
+    if (order === undefined && scope === undefined) {
+      // A raw `durableCommit`: outside the position check, like a raw lookup.
+      cache[key] = { seq: seqNext++, status: 'completed', value: admitted.value }
+      return { ok: true }
+    }
+    if (typeof order !== 'number' || typeof scope !== 'string')
+      return protocolFault('malformed position', { source: 'commit', key })
+    const conflict = positionConflict(key, scope, order, cache[key])
+    if (conflict !== undefined)
+      return diverge('order', key, { scope, order }, conflict)
+    cache[key] = { seq: seqNext++, status: 'completed', scope, order, value: admitted.value }
+    keyAtPosition.set(positionId(scope, order), key)
     return { ok: true }
   }
 
-  // `__di_call(key, name, argsText, invalid)` — answer the boundary at `key`
+  // `__di_call(key, name, argsText, invalid, order, scope)` — answer the boundary at `key`
   // from the cache or dispatch its global. Resolves with the boundary's value
   // on success (a JSON value, carried to the sandbox as is) and REJECTS with the
   // recorded error on failure: iso4 (>=0.2.2) delivers a rejecting bridge to the
@@ -271,36 +356,31 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     // violation even at a key the cache would have answered.
     const admitted = admit({ text: bridgeArgs[2], invalid: bridgeArgs[3] }, { source: 'args', key, name })
     if (!admitted.ok)
-      return never()
-    // The shim always sends an array; anything else is a program calling the
-    // bridge global directly, and is refused like non-text is.
-    if (!Array.isArray(admitted.value)) {
-      admit({ text: undefined, invalid: 'args are not a JSON array' }, { source: 'args', key, name })
-      return never()
-    }
+      return admitted.protocol === undefined ? never() : protocolFault(admitted.protocol, { source: 'args', key, name })
+    // The shim always sends an array and a position; anything else is a
+    // program calling the bridge global directly.
+    if (!Array.isArray(admitted.value))
+      return protocolFault('args are not a JSON array', { source: 'args', key, name })
     const args = admitted.value
+    const [order, scope] = [bridgeArgs[4], bridgeArgs[5]]
+    if (typeof order !== 'number' || typeof scope !== 'string')
+      return protocolFault('missing issue position', { source: 'args', key, name })
 
     const existing = cache[key]
+    // Position first: the call must sit where the history has it.
+    const conflict = positionConflict(key, scope, order, existing)
+    if (conflict !== undefined)
+      return diverge('order', key, { name, args, scope, order }, conflict)
     if (existing !== undefined) {
       // A recorded key is only answered (or re-thrown, or re-dispatched) for
-      // the SAME call it was recorded for. Anything else is a replay
-      // divergence: the program's durable calls no longer line up with its
-      // history, so no answer from the cache can be trusted — reject the run.
+      // the SAME call it was recorded for.
       const mismatch = existing.name === undefined || existing.args === undefined
         ? 'no-call'
-        : existing.name !== name ? 'name' : stableStringify(existing.args) !== stableStringify(args) ? 'args' : undefined
-      if (mismatch !== undefined) {
-        const what = mismatch === 'name'
-          ? 'a different operation'
-          : mismatch === 'args' ? 'the same operation with different arguments' : 'a call where the record holds no call to compare (a checkpoint, or a record from an older kernel)'
-        const message = `durable-isolates: replay divergence: at a recorded boundary the program asked for ${what}. ${DETERMINISM_RULE}`
-        // `recorded` is handed out as a copy so a caller editing the rejection
-        // (redacting it for a log, say) cannot touch the history it persists.
-        const recorded: DivergenceRejection['recorded'] = mismatch === 'no-call' ? {} : { name: existing.name as string, args: structuredClone(existing.args as unknown[]) }
-        rejection ??= { reason: 'divergence', key, mismatch, recorded, attempted: { name, args }, message }
-        controller.abort()
-        return never()
-      }
+        // Fast path: the sandbox's own text usually reproduces the recorded args
+        // byte for byte; the sorted-key compare only runs when it does not.
+        : existing.name !== name ? 'name' : JSON.stringify(existing.args) !== bridgeArgs[2] && stableStringify(existing.args) !== stableStringify(args) ? 'args' : undefined
+      if (mismatch !== undefined)
+        return diverge(mismatch, key, { name, args, scope, order }, { key, record: existing })
       if (existing.status === 'completed')
         return existing.value
       if (existing.status === 'failed')
@@ -308,7 +388,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       // waiting → fall through and re-dispatch (existing seq reused)
     }
 
-    const dispatched = dispatch(key, name, args, bridgeArgs[2] as string, existing?.seq ?? seqNext++)
+    const dispatched = dispatch(key, name, args, bridgeArgs[2] as string, scope, order, existing?.seq ?? seqNext++)
     inFlight.add(dispatched)
     const settled = await dispatched.finally(() => inFlight.delete(dispatched))
     if (settled === ABORTED) {
