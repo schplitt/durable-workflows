@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, PerExecuteGlobals } from '../src'
-import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
+import { durableIsolates, KERNEL_BRIDGE_GLOBALS, NonJsonValueError, SuspendIsolate, toJson } from '../src'
 
 // A mounted module whose shim forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -721,10 +721,10 @@ describe('error plane', () => {
     expect(r.result).toBe('NonRetryableError') // carried via the bridge, not flattened
   }, 15_000)
 
-  test('a host throw reaches the sandbox catch as a real Error with ALL own fields', async () => {
+  test('a host throw reaches the sandbox catch as a real Error with name + message only', async () => {
     const globals: PerExecuteGlobals = {
       boom: () => {
-        throw Object.assign(new Error('payment declined'), { name: 'PaymentError', status: 402 })
+        throw Object.assign(new Error('payment declined'), { name: 'PaymentError', status: 402, cause: new Response('x') })
       },
     }
     const code = `import { call } from 'tools'
@@ -738,14 +738,16 @@ describe('error plane', () => {
     expect(r.outcome).toBe('completed')
     if (r.outcome !== 'completed')
       return
-    // name/message + the custom `status` survive; rebuilt as a real Error in-sandbox.
-    expect(r.result).toEqual({ name: 'PaymentError', message: 'payment declined', status: 402, isError: true })
-    // Recorded as plain, persistable data with the host stack stripped.
-    const failed = Object.values(r.cache).find((rec) => rec.status === 'failed')
-    expect(failed?.status).toBe('failed')
-    if (failed?.status !== 'failed')
-      return
-    expect(failed.error).toEqual({ name: 'PaymentError', message: 'payment declined', status: 402 })
+    // name/message survive and it is rebuilt as a real Error in-sandbox; own
+    // fields (JSON or not) are dropped — the record is text a model reads back.
+    expect(r.result).toEqual({ name: 'PaymentError', message: 'payment declined', status: undefined, isError: true })
+    expect(r.cache['boom#0']).toEqual({
+      seq: 0,
+      status: 'failed',
+      name: 'boom',
+      args: [{}],
+      error: { name: 'PaymentError', message: 'payment declined' },
+    })
   }, 15_000)
 
   test('a non-Error host throw crosses without an assumed shape', async () => {
@@ -782,7 +784,7 @@ describe('error plane', () => {
     const err = r.error
     expect(err.name).toBe('PaymentError')
     expect(err.message).toBe('boom')
-    expect(err.fields?.status).toBe(402) // iso4 nests non-reserved props under `fields`
+    expect(err.fields?.status).toBeUndefined() // own fields are not recorded, so none reach the run-level error
   }, 15_000)
 
   test('a changed program just misses and runs — determinism is a contract, not a check', async () => {
@@ -862,6 +864,329 @@ describe('e2e: @iso4/fetch mounted durably', () => {
     expect(gets).toBe(1) // GET cached — NOT re-fetched on resume
     expect(deletes).toBe(2) // DELETE re-dispatched and ran once
   }, 20_000)
+})
+
+describe('e2e: @iso4/fetch byte bodies', () => {
+  // Shared fetch wiring: `decode` chooses whether the middleware hands the kernel
+  // raw bytes (what a real HTTP body is) or text.
+  const fetchGlobals = (decode: boolean): PerExecuteGlobals => ({
+    fetch: createSafeFetch({
+      pinDns: false,
+      rules: {
+        host: 'example.test',
+        httpsOnly: true,
+        routes: [{ path: '/**' }],
+        middleware: async () => {
+          const bytes = new TextEncoder().encode('hello')
+          return { status: 200, headers: { 'content-type': 'text/plain' }, body: decode ? new TextDecoder().decode(bytes) : bytes }
+        },
+      },
+    }).handler,
+  })
+  const code = `import { call } from 'tools'
+    export default await call('fetch', 'https://example.test/file').then((r) => r.body)`
+
+  test('a raw byte body is rejected — the kernel does not store binary', async () => {
+    const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(false) }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'result', name: 'fetch', path: '$.body', found: 'Uint8Array' })
+  }, 20_000)
+
+  test('converting the body to text in the middleware is the fix', async () => {
+    const r = await runner.execute({ code, cache: {}, globals: fetchGlobals(true) }).result
+    expect(r.outcome).toBe('completed')
+    if (r.outcome !== 'completed')
+      return
+    expect(r.result).toBe('hello')
+  }, 20_000)
+})
+
+describe('toJson (the JSON check + normalization)', () => {
+  test('accepts JSON and returns a normalized copy; undefined follows JSON rules', () => {
+    const value = { a: 1, b: 'two', c: [true, null, undefined], d: { e: undefined, f: -0.5 }, g: Object.create(null) }
+    expect(toJson(value)).toEqual({ a: 1, b: 'two', c: [true, null, null], d: { f: -0.5 }, g: {} })
+    expect(toJson(undefined)).toBeUndefined()
+    expect(toJson(null)).toBeNull()
+    expect(toJson('s')).toBe('s')
+  })
+
+  test('shared references are fine; cycles are not', () => {
+    const shared = { x: 1 }
+    expect(toJson({ a: shared, b: shared })).toEqual({ a: { x: 1 }, b: { x: 1 } })
+    const cyclic: Record<string, unknown> = { name: 'loop' }
+    cyclic.self = cyclic
+    expect(() => toJson(cyclic)).toThrow(new NonJsonValueError('$.self', 'circular reference'))
+  })
+
+  test.each([
+    ['a Date', { at: new Date(0) }, '$.at', 'Date'],
+    ['a Map', new Map(), '$', 'Map'],
+    ['a Set in an array', [new Set()], '$[0]', 'Set'],
+    ['a RegExp', { re: /x/ }, '$.re', 'RegExp'],
+    ['bytes', { body: new Uint8Array(2) }, '$.body', 'Uint8Array'],
+    ['a bigint', [1, 2n], '$[1]', 'bigint'],
+    ['NaN', { n: Number.NaN }, '$.n', 'NaN'],
+    ['Infinity', [Number.POSITIVE_INFINITY], '$[0]', 'Infinity'],
+    ['-Infinity', Number.NEGATIVE_INFINITY, '$', '-Infinity'],
+    ['a function', { fn: () => 1 }, '$.fn', 'function'],
+    ['a symbol', [Symbol('s')], '$[0]', 'symbol'],
+    ['an Error', new TypeError('x'), '$', 'TypeError'],
+    ['a class instance, deep', { items: [0, 1, { at: new (class Money {})() }] }, '$.items[2].at', 'Money'],
+    ['a non-identifier key', { 'odd key': new Date(0) }, '$["odd key"]', 'Date'],
+    ['a sparse array', { list: [1, , 3] }, '$.list', 'sparse array'], // eslint-disable-line no-sparse-arrays -- the point of the case
+    ['a huge sparse array (never iterated)', Object.assign([], { length: 2 ** 32 - 1 }), '$', 'sparse array'],
+    ['an object with toJSON', { toJSON: () => 1 }, '$.toJSON', 'function'],
+  ])('rejects %s with the path and what was found', (_label, value, path, found) => {
+    expect(() => toJson(value)).toThrow(new NonJsonValueError(path, found))
+  })
+
+  test('-0 becomes 0, as JSON does', () => {
+    expect(Object.is(toJson(-0), 0)).toBe(true)
+    expect(Object.is((toJson([-0]) as number[])[0], 0)).toBe(true)
+  })
+
+  test('an own __proto__ key stays an own key and never re-points the copy', () => {
+    const out = toJson(JSON.parse('{"__proto__":{"isAdmin":true},"a":1}')) as Record<string, unknown>
+    expect(Object.keys(out)).toEqual(['__proto__', 'a'])
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype)
+    expect((out as { isAdmin?: unknown }).isAdmin).toBeUndefined()
+    expect(JSON.stringify(out)).toBe('{"__proto__":{"isAdmin":true},"a":1}')
+  })
+
+  test('a throwing getter and a value too deep to walk are reported, not thrown through', () => {
+    const trap = { items: [{ get at() {
+      throw new Error('getter boom')
+    } }] }
+    expect(() => toJson(trap)).toThrow(new NonJsonValueError('$.items[0].at', 'unreadable value'))
+
+    let deep: unknown = 'leaf'
+    for (let i = 0; i < 100_000; i++)
+      deep = { d: deep }
+    let caught: unknown
+    try {
+      toJson(deep)
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(NonJsonValueError)
+    expect((caught as NonJsonValueError).found).toBe('nesting too deep to walk')
+    expect((caught as NonJsonValueError).path.startsWith('$.d.d.d')).toBe(true)
+  })
+})
+
+describe('JSON-only boundaries (rejected outcome)', () => {
+  test('a global returning a non-JSON value rejects the run; nothing is recorded at the key', async () => {
+    const globals: PerExecuteGlobals = { now: () => ({ items: [0, 1, { at: new Date(0) }] }) }
+    const code = `import { call } from 'tools'; export default await call('now', {})`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toEqual({
+      reason: 'non-json',
+      source: 'result',
+      key: 'now#0',
+      name: 'now',
+      path: '$.items[2].at',
+      found: 'Date',
+      message: expect.stringContaining('non-JSON value in what a global returned: Date at $.items[2].at'),
+    })
+    expect(r.rejection.message).toContain('Only JSON values')
+    expect(r.cache).toEqual({}) // not recorded — fix the global and run the same cache again
+    expect(r.run.status).toBe('aborted')
+  }, 15_000)
+
+  test('a non-JSON argument from the sandbox rejects the run before any lookup', async () => {
+    let calls = 0
+    const globals: PerExecuteGlobals = {
+      save: () => {
+        calls += 1
+        return 'ok'
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('save', { when: new Date(0) })`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'args', key: 'save#0', name: 'save', path: '$[0].when', found: 'Date' })
+    expect(r.rejection.message).toContain('non-JSON value in an argument of a durable call: Date at $[0].when')
+    expect(r.rejection.message).not.toContain('save') // no program-written text in the message
+    expect(calls).toBe(0) // the global never ran
+    expect(r.cache).toEqual({})
+  }, 15_000)
+
+  test('a global throwing a non-Error, non-JSON value rejects the run', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw new Map([['code', 'DENY']])
+      },
+    }
+    const code = `import { call } from 'tools'; export default await call('boom', {})`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ reason: 'non-json', source: 'error', key: 'boom#0', name: 'boom', path: '$', found: 'Map' })
+    expect(r.rejection.message).toContain('non-JSON value in what a global threw: Map at $')
+  }, 15_000)
+
+  test('a boundary() body returning a non-JSON value rejects the run at the commit', async () => {
+    const code = `import { boundary } from 'durable-isolates:internal'
+      export default await boundary('total', async () => ({ amount: 10n }))`
+
+    const r = await runner.execute({ code, cache: {}, globals: {} }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toEqual({
+      reason: 'non-json',
+      source: 'commit',
+      key: 'total',
+      path: '$.amount',
+      found: 'bigint',
+      message: expect.stringContaining('non-JSON value in a committed value: bigint at $.amount'),
+    })
+    expect(r.cache).toEqual({})
+  }, 15_000)
+
+  test('values are JSON-normalized on the FIRST run: undefined → dropped / null, same as replay', async () => {
+    const globals: PerExecuteGlobals = { load: () => [1, undefined, { a: undefined, b: 2 }] }
+    const code = `import { call } from 'tools'
+      import { boundary } from 'durable-isolates:internal'
+      const fromGlobal = await call('load', {})
+      const fromBody = await boundary('body', () => ({ list: [undefined, 'x'], gone: undefined }))
+      export default { fromGlobal, fromBody, nothing: await boundary('nothing', () => undefined) }`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+    if (r1.outcome !== 'completed')
+      return
+    const expected = { fromGlobal: [1, null, { b: 2 }], fromBody: { list: [null, 'x'] }, nothing: undefined }
+    expect(r1.result).toEqual(expected) // first run already sees the JSON shape
+    expect(r1.cache['load#0']).toMatchObject({ value: [1, null, { b: 2 }] })
+    expect(r1.cache.body).toMatchObject({ value: { list: [null, 'x'] } })
+    expect(r1.cache.nothing).toEqual({ seq: 2, status: 'completed' }) // a bare undefined is an absent value
+
+    // A store round trip changes nothing: the replay reads back the same values.
+    const roundTripped = JSON.parse(JSON.stringify(r1.cache)) as typeof r1.cache
+    const r2 = await runner.execute({ code, cache: roundTripped, globals }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual(expected)
+  }, 15_000)
+
+  test('a sandbox try/catch around the violating call cannot swallow the rejection', async () => {
+    const globals: PerExecuteGlobals = { now: () => new Date(0) }
+    const code = `import { call } from 'tools'
+      let out = 'not reached'
+      try { await call('now', {}) } catch (e) { out = 'caught: ' + e.message }
+      export default out`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'result', key: 'now#0', found: 'Date' })
+  }, 15_000)
+
+  test('a parallel branch in flight at rejection is drained and kept; the first violation wins', async () => {
+    let slowRuns = 0
+    const globals: PerExecuteGlobals = {
+      slow: async () => {
+        slowRuns += 1
+        await new Promise((resolve) => {
+          setTimeout(resolve, 100)
+        })
+        return 'io-result'
+      },
+      bad: () => new Map(),
+      alsoBad: () => new Set(),
+    }
+    const code = `import { call } from 'tools'
+      export default await Promise.all([call('slow', {}), call('bad', {}), call('alsoBad', {})])`
+
+    const r1 = await runner.execute({ code, cache: {}, globals }).result
+    expect(r1.outcome).toBe('rejected')
+    if (r1.outcome !== 'rejected')
+      return
+    expect(r1.rejection).toMatchObject({ key: 'bad#0', found: 'Map' })
+    expect(r1.cache['slow#0']).toMatchObject({ status: 'completed', value: 'io-result' }) // drained write kept
+    expect(r1.cache['bad#0']).toBeUndefined()
+    expect(r1.cache['alsoBad#0']).toBeUndefined()
+
+    // Fix the globals, run the same cache: the drained IO is not redone.
+    const fixed: PerExecuteGlobals = { ...globals, bad: () => 'b', alsoBad: () => 'c' }
+    const r2 = await runner.execute({ code, cache: r1.cache, globals: fixed }).result
+    expect(r2.outcome).toBe('completed')
+    if (r2.outcome !== 'completed')
+      return
+    expect(r2.result).toEqual(['io-result', 'b', 'c'])
+    expect(slowRuns).toBe(1)
+  }, 15_000)
+
+  test('args are checked even at a key the cache would have answered', async () => {
+    const globals: PerExecuteGlobals = { p: () => 'cached' }
+    const first = `import { step } from 'tools'; export default await step('k', 'p', 'fine')`
+    const r1 = await runner.execute({ code: first, cache: {}, globals }).result
+    expect(r1.outcome).toBe('completed')
+
+    const changed = `import { step } from 'tools'; export default await step('k', 'p', new Date(0))`
+    const r2 = await runner.execute({ code: changed, cache: r1.cache, globals }).result
+    expect(r2.outcome).toBe('rejected')
+    if (r2.outcome !== 'rejected')
+      return
+    expect(r2.rejection).toMatchObject({ source: 'args', key: 'k', path: '$[0]', found: 'Date' })
+  }, 15_000)
+
+  test('a program that never awaits the violating call is still rejected', async () => {
+    const globals: PerExecuteGlobals = { bad: () => new Map() }
+    const code = `import { call } from 'tools'
+      call('bad', {}) // fire and forget
+      export default 'done'`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'result', key: 'bad#0', found: 'Map' })
+  }, 15_000)
+
+  test('a sparse array from the sandbox is rejected without being iterated', async () => {
+    const globals: PerExecuteGlobals = { echo: (v) => v }
+    const code = `import { call } from 'tools'
+      const a = []; a.length = 2 ** 32 - 1
+      export default await call('echo', a)`
+
+    const started = Date.now()
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('rejected')
+    if (r.outcome !== 'rejected')
+      return
+    expect(r.rejection).toMatchObject({ source: 'args', path: '$[0]', found: 'sparse array' })
+    expect(Date.now() - started).toBeLessThan(2_000)
+  }, 15_000)
+
+  test('an Error with a non-string message is recorded as text', async () => {
+    const globals: PerExecuteGlobals = {
+      boom: () => {
+        throw Object.assign(new Error('x'), { message: { d: new Date(0) } })
+      },
+    }
+    const code = `import { call } from 'tools'
+      try { await call('boom', {}) } catch {}
+      export default 'survived'`
+
+    const r = await runner.execute({ code, cache: {}, globals }).result
+    expect(r.outcome).toBe('completed')
+    expect(r.cache['boom#0']).toMatchObject({ status: 'failed', error: { name: 'Error', message: '[object Object]' } })
+  }, 15_000)
 })
 
 describe('mount guards', () => {

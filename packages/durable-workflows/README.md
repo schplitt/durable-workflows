@@ -73,6 +73,7 @@ How the pieces divide:
 - **Definitions are read-only to the engine.** Uploading, versioning and rollback belong to your app — you write code rows into the same backend the store reads. Instances pin the version they started on and always replay exactly that code, so rollbacks never disturb running instances. The one rule: never mutate or delete a version that instances still reference.
 - **Resuming is re-running.** `continueWorkflow(id)` replays the workflow over its saved history; a step that was waiting asks its plugin global again, and the global checks your systems (the approval row, the clock, the job status) to answer, keep waiting, or fail. There are no callbacks to register and nothing to inject.
 - **Scheduling is yours.** The engine never wakes anything up — your cron/webhooks/queues decide when to call `continueWorkflow`.
+- **Step values must be JSON.** What a `step.do` body returns, what a plugin global returns or throws, and the arguments of an operation are saved as JSON and read back on replay. A `Date`, `Map`, bytes or a class instance there ends the run and fails the instance with `error.name === 'NonJsonValueError'`; `error.data` names the step, the path inside the value and what was found. Convert such values inside the step before returning them.
 - **Remediation:** `evict(id, stepId)` deletes a step (and everything after it) from history and replays; `restart(id)` replays from scratch; `terminate(id)` ends an instance.
 
 ## License

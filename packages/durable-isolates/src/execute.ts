@@ -5,11 +5,20 @@ import type {
   ExecuteHandle,
   ExecuteResult,
   HostGlobal,
+  NonJsonCallRejection,
   PendingOperation,
   PerExecuteGlobals,
+  Rejection,
 } from './types'
 import { SuspendIsolate } from './suspend-isolate'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL } from './shim'
+import { NonJsonValueError, toJson } from './json'
+
+/**
+ * The rule every rejection message ends with — written for whoever wrote the
+ * program (an author or a model), so the fix is stated, not just the fault.
+ */
+const JSON_RULE = 'Only JSON values (null, booleans, finite numbers, strings, arrays, plain objects) can cross a durable boundary; convert the value before it reaches one.'
 
 /**
  * Kernel default limits merged UNDER the caller's. Only `maxBridgeCalls` is
@@ -27,10 +36,11 @@ function never(): Promise<never> {
 }
 
 /**
- * Sentinel resolved (never thrown) by a dispatch whose global suspended, so
- * the in-flight dispatch promise always settles and the drain can await it.
+ * Sentinel resolved (never thrown) by a dispatch that ended the run — its
+ * global suspended, or produced a value the run was rejected over — so the
+ * in-flight dispatch promise always settles and the drain can await it.
  */
-const SUSPENDED = Symbol('durable-isolates.suspended')
+const ABORTED = Symbol('durable-isolates.aborted')
 
 /**
  * The bridge envelope for a settled durable call.
@@ -61,6 +71,13 @@ export interface ExecuteRunParams {
  * - `__di_lookup(key)` — non-memoized read of the live cache (checkpoint check).
  * - `__di_commit(key, value)` — record a completed boundary from the sandbox.
  *
+ * Every value entering the cache — call args, a global's return or throw, a
+ * committed value — is admitted through `toJson`: JSON-normalized so the first
+ * run sees what a replay sees, and REJECTING the run on a value JSON cannot
+ * carry. A rejection aborts the isolate like a suspension does (the violating
+ * bridge call never settles, so sandbox `try/catch` cannot swallow it), keeps
+ * the first violation, and records nothing at the violating key.
+ *
  * Every in-flight global dispatch is tracked and DRAINED before the result is
  * built (on every outcome): a dispatch racing an abort or the run's completion
  * still lands in the cache, while its resolution into a dead isolate is a
@@ -88,12 +105,40 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       seqNext = r.seq + 1
   }
 
+  // The first violation that rejected this run (later ones are dropped: the
+  // isolate is already being aborted).
+  let rejection: Rejection | undefined
+
+  // Admit a value into the cache: JSON-normalize it, or REJECT the run over it.
+  // `at` says where the value came from, for the rejection record and message.
+  const admit = (
+    value: unknown,
+    at: { source: 'commit', key: string } | { source: NonJsonCallRejection['source'], key: string, name: string },
+  ): { ok: true, value: unknown } | { ok: false } => {
+    try {
+      return { ok: true, value: toJson(value) }
+    } catch (e) {
+      if (!(e instanceof NonJsonValueError))
+        throw e
+      // The message carries no sandbox-written text (no key, no name — those
+      // are in the structured fields): `path` keys are identifier-only or
+      // JSON-quoted and `found` is a V8 or host class name.
+      const where = at.source === 'args'
+        ? 'in an argument of a durable call'
+        : at.source === 'result' ? 'in what a global returned' : at.source === 'error' ? 'in what a global threw' : 'in a committed value'
+      const message = `durable-isolates: non-JSON value ${where}: ${e.found} at ${e.path}. ${JSON_RULE}`
+      rejection ??= { reason: 'non-json', ...at, path: e.path, found: e.found, message }
+      controller.abort()
+      return { ok: false }
+    }
+  }
+
   // Run one global and record the boundary. Every record a dispatch writes
   // carries the call's `name` and `args` (what the shim forwarded), so the
   // history says WHAT was asked at each key, not only what came back. Always
-  // SETTLES (suspension resolves the sentinel) so the drain can await every
-  // dispatch.
-  const dispatch = async (key: string, name: string, args: unknown[], seq: number): Promise<CallEnvelope | typeof SUSPENDED> => {
+  // SETTLES (suspension and rejection resolve the sentinel) so the drain can
+  // await every dispatch.
+  const dispatch = async (key: string, name: string, args: unknown[], seq: number): Promise<CallEnvelope | typeof ABORTED> => {
     const global = registry.get(name)
     if (global === undefined) {
       // Plain, persistable record (see the catch below); iso4 rebuilds it as an
@@ -102,26 +147,32 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       cache[key] = { seq, status: 'failed', name, args, error }
       return { ok: false, error }
     }
+    let returned: unknown
     try {
-      const value = await global(...args)
-      cache[key] = { seq, status: 'completed', name, args, value }
-      return { ok: true, value }
+      returned = await global(...args)
     } catch (e) {
       if (e instanceof SuspendIsolate) {
         cache[key] = { seq, status: 'waiting', name, args }
         pending.push({ id: key, name, payload: e.payload })
-        return SUSPENDED
+        return ABORTED
       }
-      // Record the failure as plain, persistable data (the cache is JSON-shaped).
-      // An Error's name/message are non-enumerable, so lift them explicitly; the
-      // spread carries any own enumerable fields (e.g. `status`). `stack` is
-      // dropped — a host stack is noise replayed in the sandbox, where iso4
-      // synthesizes a fresh one. The bridge re-throws this, and iso4 (>=0.2.2)
-      // rebuilds a real Error from it in the sandbox — no reconstruction shim.
-      const error = e instanceof Error ? { ...e, name: e.name, message: e.message } : e
-      cache[key] = { seq, status: 'failed', name, args, error }
-      return { ok: false, error }
+      // Record the failure as JSON. An Error is reduced to name + message (its
+      // own fields and the host stack are dropped: the cache is text a model
+      // reads back, and iso4 synthesizes a fresh stack in the sandbox). The
+      // bridge re-throws this and iso4 (>=0.2.2) rebuilds a real Error from it
+      // in the sandbox — no reconstruction shim. A non-Error throw is admitted
+      // like any other value.
+      const admitted = e instanceof Error ? { ok: true as const, value: { name: String(e.name), message: String(e.message) } } : admit(e, { source: 'error', key, name })
+      if (!admitted.ok)
+        return ABORTED
+      cache[key] = { seq, status: 'failed', name, args, error: admitted.value }
+      return { ok: false, error: admitted.value }
     }
+    const admitted = admit(returned, { source: 'result', key, name })
+    if (!admitted.ok)
+      return ABORTED
+    cache[key] = { seq, status: 'completed', name, args, value: admitted.value }
+    return { ok: true, value: admitted.value }
   }
 
   // `__di_lookup` — non-memoized read of the live cache (the checkpoint check).
@@ -132,21 +183,34 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     return { hit: false }
   }
 
-  // `__di_commit` — record a completed boundary from the sandbox.
+  // `__di_commit` — record a completed boundary from the sandbox. Only an ack
+  // goes back: the shim JSON-normalizes its own copy (the same rules as
+  // `toJson`, on a value this admission has just proven JSON-clean), which is
+  // far cheaper than echoing a large value across the bridge again.
   const commitBridge = (...bridgeArgs: unknown[]): unknown => {
-    cache[String(bridgeArgs[0])] = { seq: seqNext++, status: 'completed', value: bridgeArgs[1] }
+    const key = String(bridgeArgs[0])
+    const admitted = admit(bridgeArgs[1], { source: 'commit', key })
+    if (!admitted.ok)
+      return never()
+    cache[key] = { seq: seqNext++, status: 'completed', value: admitted.value }
     return { ok: true }
   }
 
   // `__di_call` — answer the boundary at `key` from the cache or dispatch its
   // global. Resolves with the boundary's value on success and REJECTS with the
   // recorded error on failure: iso4 (>=0.2.2) delivers a rejecting bridge to the
-  // sandbox `catch` faithfully (rebuilt as a real Error with name/message/fields),
+  // sandbox `catch` faithfully (rebuilt as a real Error with name/message),
   // so no envelope unwrapping or error reconstruction is needed sandbox-side.
   const callBridge = async (...bridgeArgs: unknown[]): Promise<unknown> => {
     const key = String(bridgeArgs[0])
     const name = String(bridgeArgs[1])
-    const args: unknown[] = Array.isArray(bridgeArgs[2]) ? bridgeArgs[2] : []
+
+    // Args are admitted BEFORE the lookup: a non-JSON argument is a violation
+    // even at a key the cache would have answered.
+    const admitted = admit(Array.isArray(bridgeArgs[2]) ? bridgeArgs[2] : [], { source: 'args', key, name })
+    if (!admitted.ok)
+      return never()
+    const args = admitted.value as unknown[]
 
     const existing = cache[key]
     if (existing !== undefined) {
@@ -160,7 +224,7 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     const dispatched = dispatch(key, name, args, existing?.seq ?? seqNext++)
     inFlight.add(dispatched)
     const settled = await dispatched.finally(() => inFlight.delete(dispatched))
-    if (settled === SUSPENDED) {
+    if (settled === ABORTED) {
       controller.abort()
       return never()
     }
@@ -187,6 +251,11 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
     // the result is built — the IO is kept even though the isolate is gone.
     await Promise.allSettled([...inFlight])
 
+    // A rejection wins over everything else this turn: the run is dead however
+    // the isolate ended (normally aborted by us; completed only if the program
+    // never awaited the violating call).
+    if (rejection !== undefined)
+      return { outcome: 'rejected', rejection, cache, run: result }
     // Suspension is detected by the ABORT — never by catching an in-sandbox
     // throw — so sandbox `try/catch` around a suspending call cannot swallow it.
     if (result.status === 'aborted')

@@ -17,6 +17,12 @@
  * sandbox-side and carried over the wire — the kernel is a memoize-by-key
  * router. Determinism is a documented contract (deterministic keys, no
  * time/randomness in branches), not an enforced one: a key miss simply runs.
+ *
+ * Everything that enters the cache must be plain JSON (see `toJson`): the
+ * kernel normalizes every boundary value the way a JSON round trip would, so
+ * the first run sees exactly what a replay sees, and REJECTS the run (a
+ * terminal `rejected` outcome, uncatchable in-sandbox) on a value JSON cannot
+ * carry.
  */
 import type { ResourceLimits, RunError, RunFailure, RunResult, RunSuccess, Sandbox, SandboxOptions } from '@iso4/sandbox'
 
@@ -113,12 +119,17 @@ export interface ModuleDefinition {
  * never see replay of a settled boundary. A `waiting` boundary IS re-dispatched
  * (that is the resume path): the global consults host/app state and either
  * proceeds this time, suspends again, or throws. It receives ALL the args the
- * shim's `durableCall` forwarded (V8-serialized across the bridge).
+ * shim's `durableCall` forwarded, JSON-normalized (see `toJson`).
  *
  * It does one of:
- * - returns a value → completed boundary; the sandbox `await` resolves;
+ * - returns a JSON value → completed boundary; the sandbox `await` resolves
+ *   with the normalized value;
  * - throws `SuspendIsolate` → the run suspends (waiting boundary + abort);
- * - throws anything else → failed boundary, re-thrown deterministically on replay.
+ * - throws anything else → failed boundary, re-thrown deterministically on
+ *   replay. An `Error` is recorded as its `name` + `message` only; a non-Error
+ *   throw is recorded as JSON;
+ * - returns or throws a non-JSON value → the run is REJECTED (terminal
+ *   `rejected` outcome, nothing recorded at this key).
  */
 export type HostGlobal = (...args: unknown[]) => unknown
 
@@ -223,6 +234,7 @@ export type ExecuteResult
   = | CompletedResult
     | SuspendedResult
     | FailedResult
+    | RejectedResult
 
 interface ExecuteResultBase {
   /**
@@ -290,6 +302,79 @@ export interface FailedResult extends ExecuteResultBase {
   error: RunError
   run: RunFailure
 }
+
+/**
+ * The kernel REFUSED to continue the run: the program violated the durable
+ * contract at a boundary, so no replay could be trusted to see the same thing
+ * twice. Terminal for this turn and uncatchable in-sandbox (the isolate is
+ * aborted and the violating bridge call never settles); every in-flight
+ * dispatch is still drained into `cache`, but nothing is recorded at the
+ * violating key — fix the program or the global and run the same cache again.
+ * `rejection` says what was refused and why, discriminated on `reason`; its
+ * `message` is written for the author (or the model) that wrote the program.
+ */
+export interface RejectedResult extends ExecuteResultBase {
+  outcome: 'rejected'
+  rejection: Rejection
+  /**
+   * Normally iso4's aborted arm (the kernel rejects a run by aborting it). Only
+   * a program that never awaited the violating call can finish first, in
+   * which case iso4's own arm is passed through.
+   */
+  run: RunResult
+}
+
+/**
+ * Why a run was rejected — discriminated on `reason`. `key` is the boundary
+ * the violation happened at (nothing is recorded there).
+ */
+export type Rejection = NonJsonRejection
+
+interface RejectionBase {
+  key: string
+  /**
+   * Author-facing explanation: what was refused, where, and the rule to
+   * follow.
+   */
+  message: string
+}
+
+interface NonJsonRejectionBase extends RejectionBase {
+  reason: 'non-json'
+  /**
+   * Where inside the value the offender sits: `$` for the value itself,
+   * `$.items[2].at`, `$[0]` for the first argument, ….
+   */
+  path: string
+  /**
+   * What was there: `Date`, `Map`, `Uint8Array`, `bigint`, `NaN`,
+   * `function`, `circular reference`, a class name, ….
+   */
+  found: string
+}
+
+/**
+ * A non-JSON value on a durable call: in the args the sandbox passed
+ * (`args`), in what the global `name` returned (`result`) or in what it threw
+ * (`error`).
+ */
+export interface NonJsonCallRejection extends NonJsonRejectionBase {
+  source: 'args' | 'result' | 'error'
+  /**
+   * The global the call routed to.
+   */
+  name: string
+}
+
+/**
+ * A non-JSON value committed from the sandbox (`durableCommit`, or returned
+ * from a `boundary()` body).
+ */
+export interface NonJsonCommitRejection extends NonJsonRejectionBase {
+  source: 'commit'
+}
+
+export type NonJsonRejection = NonJsonCallRejection | NonJsonCommitRejection
 
 /**
  * A dispatched-but-unanswered operation, handed outward on suspension. `id` is
@@ -368,9 +453,10 @@ export interface FailedBoundary extends BoundaryRecordBase {
    */
   args?: unknown[]
   /**
-   * The value the global threw, recorded verbatim. Re-thrown into the sandbox
-   * on replay via the durable envelope; iso4's bridge serialization carries it
-   * faithfully (name/message/stack + own fields).
+   * What the global threw, as JSON. An `Error` is reduced to `{ name, message }`
+   * (own fields and the host stack are dropped — the sandbox gets a real Error
+   * rebuilt from the two); a non-Error throw is recorded JSON-normalized.
+   * Re-thrown into the sandbox deterministically on replay.
    */
   error: unknown
 }

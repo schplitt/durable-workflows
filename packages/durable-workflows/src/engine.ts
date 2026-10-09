@@ -211,6 +211,15 @@ export function durableWorkflows(options: DurableWorkflowsOptions): DurableWorkf
         status: 'waiting',
         pending: result.pending.map((p) => ({ stepId: p.id, operation: p.name, payload: p.payload })),
       }
+    } else if (result.outcome === 'rejected') {
+      // The kernel refused the run over a durable-contract violation (a
+      // non-JSON value at a boundary). Terminal for the instance: the program
+      // or a plugin global must change before a replay can be trusted. The
+      // structured rejection rides along as `data` for tooling.
+      const { message, ...data } = result.rejection
+      const error: SerializedError = { name: 'NonJsonValueError', message, data }
+      next = { ...base, status: 'failed', error }
+      outcome = { instanceId, run, status: 'failed', error }
     } else {
       const error = toSerializedError(result.error)
       next = { ...base, status: 'failed', error }

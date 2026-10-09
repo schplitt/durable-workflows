@@ -5,5 +5,6 @@
  */
 export type * from './types'
 export { durableIsolates } from './durable-isolates'
+export { NonJsonValueError, toJson } from './json'
 export { KERNEL_BRIDGE_GLOBALS } from './shim'
 export { SuspendIsolate } from './suspend-isolate'
