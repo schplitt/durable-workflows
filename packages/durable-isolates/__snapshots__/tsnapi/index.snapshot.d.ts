@@ -152,6 +152,7 @@ export declare class SuspendIsolate extends Error {
 // #region Variables
 export declare const durableIsolates: CreateDurableIsolates;
 export declare const KERNEL_BRIDGE_GLOBALS: readonly [typeof DURABLE_CALL_GLOBAL, typeof DURABLE_LOOKUP_GLOBAL, typeof DURABLE_COMMIT_GLOBAL];
+export declare const RESERVED_GLOBALS: ReadonlySet<string>;
 // #endregion
 
 // #region Referenced (internal)

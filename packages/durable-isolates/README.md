@@ -147,6 +147,8 @@ const runner = await di.prepare({
 
 If a plain call returns something you need to survive a replay, wrap it in `boundary()`.
 
+A plain global cannot take a name in `RESERVED_GLOBALS`: every name the sandbox already defines (`Date`, `Response`, `waitUntil`, …) plus the kernel's own bridges. `prepare` and `run` throw on one. Check generated names against the set before mounting them.
+
 ## One run, one isolate
 
 `prepare` builds a prefix that iso4 keeps warm. Runs on it are fast (about 0.1 ms of overhead) but share an instance, so one run can leave state on `globalThis` for the next. That is fine for the turns of one workflow. It is not fine for code from different tenants, or code a model wrote.

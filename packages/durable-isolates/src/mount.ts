@@ -1,4 +1,5 @@
 import type { HostExportFunction, HostGlobals, Imports, ImportValue } from '@iso4/sandbox'
+import { SANDBOX_GLOBALS } from '@iso4/sandbox'
 import type { DurableGlobal, DurableModule, ExecuteOptions, PrepareOptions } from './types'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER, KERNEL_BRIDGE_GLOBALS } from './shim'
 
@@ -14,7 +15,9 @@ function unbound(): never {
  * the first rule it breaks:
  * - the specifier `durable-isolates:internal` is the kernel shim, compiled into
  *   every prefix, and cannot be mounted;
- * - the three bridge global names (`KERNEL_BRIDGE_GLOBALS`) are the kernel's;
+ * - a plain global must not take a name in `RESERVED_GLOBALS`: the three
+ *   kernel bridges, or a name the sandbox already defines (V8 built-ins and
+ *   iso4's runtime globals — iso4 itself would silently replace a built-in);
  * - a name cannot be both a plain global and a durable global: the two never
  *   collide at runtime (one is `globalThis.name`, the other is reached only
  *   through `durableCall`), but one name meaning two things is a trap for
@@ -28,9 +31,15 @@ function unbound(): never {
  * The builders below assume these hold.
  * @param options the caller's prepare options
  */
-const RESERVED_GLOBALS: ReadonlySet<string> = new Set(KERNEL_BRIDGE_GLOBALS)
 const IDENTIFIER = /^[A-Z_$][\w$]*$/i
 // Everything `export const <name>` cannot bind in a strict-mode module.
+/**
+ * Every global name a plain `globals` entry cannot take: iso4's
+ * `SANDBOX_GLOBALS` (V8 built-ins and the runtime's own globals) plus the
+ * kernel's bridge globals (`KERNEL_BRIDGE_GLOBALS`). `prepare` and `run`
+ * throw on them; exported so a host generating global names can avoid them.
+ */
+export const RESERVED_GLOBALS: ReadonlySet<string> = new Set([...SANDBOX_GLOBALS, ...KERNEL_BRIDGE_GLOBALS])
 const RESERVED_WORDS: ReadonlySet<string> = new Set(['default', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false', 'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof', 'let', 'new', 'null', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while', 'with', 'yield', 'implements', 'interface', 'package', 'private', 'protected', 'public', 'eval', 'arguments'])
 
 export function assertPrepareOptions(options: PrepareOptions): void {
@@ -42,7 +51,7 @@ export function assertPrepareOptions(options: PrepareOptions): void {
   }
   for (const name of Object.keys(options.globals ?? {})) {
     if (RESERVED_GLOBALS.has(name))
-      throw new Error(`durable-isolates: "${name}" is a reserved global (a kernel bridge) and cannot be mounted`)
+      throw new Error(`durable-isolates: "${name}" is a reserved global (${SANDBOX_GLOBALS.has(name) ? 'the sandbox already defines it' : 'a kernel bridge'}) and cannot be mounted`)
     if (Object.hasOwn(options.durableGlobals ?? {}, name))
       throw new Error(`durable-isolates: "${name}" is both a plain global and a durable global; give the two different names`)
   }

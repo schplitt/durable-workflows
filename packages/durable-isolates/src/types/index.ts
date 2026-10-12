@@ -111,9 +111,10 @@ export interface PrepareOptions {
   /**
    * iso4's `globals`, passed through as they are: plain host functions (or
    * strings / data constants) installed on `globalThis` in the sandbox. Not
-   * durable — same as a host-module function above. The three kernel bridge
-   * names (`KERNEL_BRIDGE_GLOBALS`) are reserved, and a name cannot also be a
-   * durable global.
+   * durable — same as a host-module function above. Names in
+   * `RESERVED_GLOBALS` (everything the sandbox already defines, plus the
+   * three kernel bridges) are refused, and a name cannot also be a durable
+   * global.
    */
   globals?: HostGlobals
   /**

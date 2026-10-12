@@ -2,7 +2,7 @@ import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, DurableGlobal, DurableGlobals } from '../src'
-import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
+import { durableIsolates, KERNEL_BRIDGE_GLOBALS, RESERVED_GLOBALS, SuspendIsolate } from '../src'
 
 // A shim (a string import) that forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -2579,8 +2579,11 @@ describe('plain globals and imports (iso4 semantics, not durable)', () => {
     await di.dispose()
   }, 20_000)
 
-  test('a kernel bridge name cannot be mounted as a plain global; a name cannot be both plain and durable', async () => {
-    await expect(host.prepare({ globals: { __di_call: () => 1 } })).rejects.toThrow(/reserved global/)
+  test('a reserved name (kernel bridge or sandbox global) cannot be mounted as a plain global; a name cannot be both plain and durable', async () => {
+    await expect(host.prepare({ globals: { __di_call: () => 1 } })).rejects.toThrow(/"__di_call" is a reserved global \(a kernel bridge\)/)
+    await expect(host.prepare({ globals: { Date: () => 1 } })).rejects.toThrow(/"Date" is a reserved global \(the sandbox already defines it\)/) // a V8 built-in
+    await expect(host.prepare({ globals: { waitUntil: () => 1 } })).rejects.toThrow(/"waitUntil" is a reserved global/) // an iso4 runtime global
+    expect(KERNEL_BRIDGE_GLOBALS.every((n) => RESERVED_GLOBALS.has(n)) && RESERVED_GLOBALS.has('Response')).toBe(true)
     await expect(host.prepare({ globals: { load: () => 1 }, durableGlobals: { load: () => 2 } })).rejects.toThrow(/both a plain global and a durable global/)
   })
 })
@@ -2795,6 +2798,7 @@ describe('one-off runs (di.run, a fresh isolate per call)', () => {
     const swapped = await di.run({ code: `import { step } from 'tools'; export default await step('g', 'approve', { changed: true })`, cache: r2.cache, imports: { tools: SHIM }, durableGlobals }).result
     expect(swapped.outcome === 'rejected' && swapped.rejection).toMatchObject({ reason: 'divergence', mismatch: 'args' })
     expect(() => di.run({ code, cache: {}, globals: { __di_call: () => 1 } })).toThrow(/reserved global/)
+    expect(() => di.run({ code, cache: {}, globals: { Math: () => 1 } })).toThrow(/reserved global/)
     expect(() => di.run({ code, cache: {}, durableGlobals: { approve: 'nope' as unknown as DurableGlobal } })).toThrow(/durableGlobals\["approve"\] is not a function/)
     await di.dispose()
   }, 20_000)
