@@ -8,7 +8,12 @@ export class SuspendIsolate extends Error {
 }
 // #endregion
 
+// #region Functions
+export function isValidGlobalName(_) {}
+// #endregion
+
 // #region Variables
 export var durableIsolates /* const */
 export var KERNEL_BRIDGE_GLOBALS /* const */
+export var RESERVED_GLOBALS /* const */
 // #endregion

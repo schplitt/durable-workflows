@@ -96,7 +96,7 @@ const runner = await di.prepare({
 // await load('r-1'); await users.find('a@b.c')
 ```
 
-Each function gets a key the sandbox counts per call: `acme.load#0`, `acme.load#1`, `acme.users.find#0`. Functions only, and export names must be valid identifiers.
+Each function gets a key the sandbox counts per call: `acme.load#0`, `acme.load#1`, `acme.users.find#0`. Functions only. Top-level names are the module's exports: any name iso4 accepts as one (`isValidExportName`, Unicode such as `café` included), except `default` and names starting with `__di`. Nested names can be any string.
 
 Per run, you can swap a function, for a credential bound to this request for example:
 
@@ -146,6 +146,10 @@ const runner = await di.prepare({
 ```
 
 If a plain call returns something you need to survive a replay, wrap it in `boundary()`.
+
+A plain global cannot take a name in `RESERVED_GLOBALS`: every name the sandbox already defines (`Date`, `Response`, `waitUntil`, …) plus the kernel's own bridges. `prepare` and `run` throw on one, and on a name iso4 refuses (e.g. `__proto__`). `isValidGlobalName(name)` applies exactly that rule: check generated names with it before mounting them. A name that is not an identifier, such as `my-tool`, is fine: code reaches it as `globalThis['my-tool']`.
+
+A run iso4 refuses before it starts is not an outcome: a per-run override naming something not declared at `prepare` or of the wrong kind, or `execute` on a disposed runner. `result` (and `suspend()`) rejects with iso4's setup error, and its `code` says which (`ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`). Awaiting the handle later is safe: the rejection is never unhandled.
 
 ## One run, one isolate
 
@@ -262,10 +266,10 @@ Everything `prepare` takes plus `code` and `cache`. No per-run overrides, since 
 
 ### `Handle`
 
-| Member      | Description                                                                                            |
-| ----------- | ------------------------------------------------------------------------------------------------------ |
-| `result`    | `Promise<ExecuteResult>`                                                                               |
-| `suspend()` | stop the run from outside (server shutdown), keep what durable calls finished, resolve with the result |
+| Member      | Description                                                                                                                                    |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `result`    | `Promise<ExecuteResult>`; rejects with iso4's setup error when nothing ran                                                                     |
+| `suspend()` | stop the run from outside (server shutdown), keep what durable calls finished, resolve with the result; rejects like `result` when nothing ran |
 
 ### `ExecuteResult`
 
@@ -286,6 +290,14 @@ The module a sandbox shim imports.
 ### `SuspendIsolate`
 
 `throw new SuspendIsolate(payload)` from a durable function pauses the run. `payload` is handed back on `pending`.
+
+### Names
+
+| Export                  | Description                                                                               |
+| ----------------------- | ----------------------------------------------------------------------------------------- |
+| `isValidGlobalName(n)`  | whether `n` can be a plain `globals` entry: the rule `prepare` and `run` apply            |
+| `RESERVED_GLOBALS`      | names a plain global cannot take: everything the sandbox defines, plus the kernel bridges |
+| `KERNEL_BRIDGE_GLOBALS` | the kernel's own bridge names, as they appear in `run.bridgeCalls`                        |
 
 ## License
 

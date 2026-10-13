@@ -5,5 +5,6 @@
  */
 export type * from './types'
 export { durableIsolates } from './durable-isolates'
+export { isValidGlobalName, RESERVED_GLOBALS } from './mount'
 export { KERNEL_BRIDGE_GLOBALS } from './shim'
 export { SuspendIsolate } from './suspend-isolate'

@@ -51,8 +51,8 @@ export const durableIsolates: CreateDurableIsolates = (options = {}) => {
           assertExecuteOptions(executeOptions) // shape rules, before the run starts
           return executeRun({
             // The plain side is iso4's: its per-run overrides go through as
-            // given (a wrong one fails the run with iso4's own error), and the
-            // kernel rebinds only its three bridges.
+            // given (a wrong one rejects `result` with iso4's own setup
+            // error), and the kernel rebinds only its three bridges.
             start: (bridges, limits, signal) => prefix.execute({
               code: executeOptions.code,
               globals: { ...executeOptions.globals, ...bridges } as RebindGlobals<HostGlobals>,

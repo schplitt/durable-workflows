@@ -1,8 +1,9 @@
+import process from 'node:process'
 import { runInNewContext } from 'node:vm'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSafeFetch } from '@iso4/fetch'
 import type { BoundaryCache, DurableIsolates, DurableIsolatesRunner, ExecuteResult, DurableGlobal, DurableGlobals } from '../src'
-import { durableIsolates, KERNEL_BRIDGE_GLOBALS, SuspendIsolate } from '../src'
+import { durableIsolates, isValidGlobalName, KERNEL_BRIDGE_GLOBALS, RESERVED_GLOBALS, SuspendIsolate } from '../src'
 
 // A shim (a string import) that forms the key IN THE SANDBOX two ways:
 //  - `call(name, …)` auto-keys with an in-sandbox per-name counter (mc8yp style)
@@ -2004,11 +2005,28 @@ describe('pinned edge cases', () => {
   test('a disposed runner refuses to execute', async () => {
     const disposable = await host.prepare({ imports: { tools: SHIM } })
     await disposable.dispose()
-    const r = await disposable.execute({ code: `export default 1`, cache: {} }).result
-    expect(r.outcome).toBe('failed')
-    if (r.outcome !== 'failed')
-      return
-    expect(r.error.code).toBe('ERR_PREFIX_DISPOSED')
+    await expect(disposable.execute({ code: `export default 1`, cache: {} }).result).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+  }, 20_000)
+
+  test('a setup error awaited late is not an unhandled rejection', async () => {
+    const disposable = await host.prepare({ imports: { tools: SHIM } })
+    await disposable.dispose()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const handle = disposable.execute({ code: `export default 1`, cache: {} })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50) // the rejection lands before anyone awaits it
+      })
+      expect(unhandled).toEqual([])
+      await expect(handle.result).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+      await expect(handle.suspend()).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
   }, 20_000)
 })
 
@@ -2554,7 +2572,7 @@ describe('plain globals and imports (iso4 semantics, not durable)', () => {
     await di.dispose()
   }, 20_000)
 
-  test('object-form bridge globals pass through, and a bad override fails with iso4\'s own error', async () => {
+  test('object-form bridge globals pass through, and a bad override rejects the result with iso4\'s own setup error', async () => {
     const di = durableIsolates()
     const r = await di.prepare({
       globals: { gate: { kind: 'bridge', enumerable: false, handler: () => 'declared' } },
@@ -2573,14 +2591,19 @@ describe('plain globals and imports (iso4 semantics, not durable)', () => {
       [{ imports: { acme: { label: () => 1 } } }, 'ERR_FROZEN_BINDING'],
       [{ imports: { nope: { f: () => 1 } } }, 'ERR_UNDECLARED_BINDING'],
     ] as const) {
-      const rb = await r.execute({ code, cache: {}, ...bad }).result
-      expect(rb.outcome === 'failed' && rb.error.code).toBe(code)
+      await expect(r.execute({ code, cache: {}, ...bad }).result).rejects.toMatchObject({ code }) // iso4 >= 0.8.1 throws setup errors
     }
     await di.dispose()
   }, 20_000)
 
-  test('a kernel bridge name cannot be mounted as a plain global; a name cannot be both plain and durable', async () => {
-    await expect(host.prepare({ globals: { __di_call: () => 1 } })).rejects.toThrow(/reserved global/)
+  test('a reserved name (kernel bridge or sandbox global) cannot be mounted as a plain global; a name cannot be both plain and durable', async () => {
+    await expect(host.prepare({ globals: { __di_call: () => 1 } })).rejects.toThrow(/"__di_call" is a reserved global \(a kernel bridge\)/)
+    await expect(host.prepare({ globals: { Date: () => 1 } })).rejects.toThrow(/"Date" is a reserved global \(the sandbox already defines it\)/) // a V8 built-in
+    await expect(host.prepare({ globals: { waitUntil: () => 1 } })).rejects.toThrow(/"waitUntil" is a reserved global/) // an iso4 runtime global
+    expect(KERNEL_BRIDGE_GLOBALS.every((n) => RESERVED_GLOBALS.has(n)) && RESERVED_GLOBALS.has('Response')).toBe(true)
+    await expect(host.prepare({ globals: { ['__proto__']: () => 1 } })).rejects.toThrow(/"__proto__" is not a usable global name/) // runtime-owned, not in SANDBOX_GLOBALS
+    expect(['my-tool', 'café', 'load'].map(isValidGlobalName)).toEqual([true, true, true])
+    expect(['__proto__', 'console', 'Date', '__di_call'].map(isValidGlobalName)).toEqual([false, false, false, false]) // iso4's rule, then RESERVED_GLOBALS
     await expect(host.prepare({ globals: { load: () => 1 }, durableGlobals: { load: () => 2 } })).rejects.toThrow(/both a plain global and a durable global/)
   })
 })
@@ -2644,6 +2667,7 @@ describe('durableImports (generated durable modules)', () => {
     await expect(host.prepare({ durableImports: { acme: { default: () => 1 } } })).rejects.toThrow(/"acme\.default" cannot be exported/)
     await expect(host.prepare({ durableImports: { acme: { public: () => 1 } } })).rejects.toThrow(/"acme\.public" cannot be exported/) // strict-mode reserved
     await expect(host.prepare({ durableImports: { acme: { __di_op: () => 1 } } })).rejects.toThrow(/"acme\.__di_op" cannot be exported/)
+    await expect(host.prepare({ durableImports: { acme: { eval: () => 1 } } })).rejects.toThrow(/"acme\.eval" cannot be exported/) // strict mode cannot bind it
     await expect(host.prepare({ durableImports: { 'a.b': { c: () => 1 }, 'a': { b: { c: () => 2 } } } })).rejects.toThrow(/"a\.b\.c" is produced by two durable imports/)
     await expect(host.prepare({ imports: { acme: 'export const x = 1' }, durableImports: { acme: { f: () => 1 } } })).rejects.toThrow(/both a plain import and a durable import/)
     await expect(host.prepare({ durableGlobals: { 'acme.f': () => 1 }, durableImports: { acme: { f: () => 2 } } })).rejects.toThrow(/both a durable import and a durable global/)
@@ -2654,12 +2678,13 @@ describe('durableImports (generated durable modules)', () => {
     const di = durableIsolates()
     const typed = (id: string): string => `T:${id}` // an ordinary typed function fits DurableModule
     const r = await di.prepare({
-      durableImports: { acme: { op: () => 'op!', nextKey: () => 'nk!', typed, util: { 'bad-name': () => 'odd', ['__proto__']: () => 'proto' } } }, // computed key: an OWN leaf named __proto__
+      globals: { 'my-tool': () => 'tool!' }, // not an identifier: reachable as globalThis['my-tool']
+      durableImports: { acme: { op: () => 'op!', nextKey: () => 'nk!', typed, café: () => 'café!', util: { 'bad-name': () => 'odd', ['__proto__']: () => 'proto' } } }, // computed key: an OWN leaf named __proto__
     })
-    const code = `import { op, nextKey, typed, util } from 'acme'
-      export default [await op(), await nextKey(), await typed('x'), await util['bad-name'](), await util.__proto__(), Object.keys(util)]`
+    const code = `import { op, nextKey, typed, café, util } from 'acme'
+      export default [await op(), await nextKey(), await typed('x'), await util['bad-name'](), await util.__proto__(), Object.keys(util), await café(), await globalThis['my-tool']()]`
     const r1 = await r.execute({ code, cache: {} }).result
-    expect(r1.outcome === 'completed' && r1.result).toEqual(['op!', 'nk!', 'T:x', 'odd', 'proto', ['bad-name', '__proto__']]) // __proto__ is an OWN property
+    expect(r1.outcome === 'completed' && r1.result).toEqual(['op!', 'nk!', 'T:x', 'odd', 'proto', ['bad-name', '__proto__'], 'café!', 'tool!']) // __proto__ is an OWN property
     await di.dispose()
   }, 20_000)
 
@@ -2795,6 +2820,7 @@ describe('one-off runs (di.run, a fresh isolate per call)', () => {
     const swapped = await di.run({ code: `import { step } from 'tools'; export default await step('g', 'approve', { changed: true })`, cache: r2.cache, imports: { tools: SHIM }, durableGlobals }).result
     expect(swapped.outcome === 'rejected' && swapped.rejection).toMatchObject({ reason: 'divergence', mismatch: 'args' })
     expect(() => di.run({ code, cache: {}, globals: { __di_call: () => 1 } })).toThrow(/reserved global/)
+    expect(() => di.run({ code, cache: {}, globals: { Math: () => 1 } })).toThrow(/reserved global/)
     expect(() => di.run({ code, cache: {}, durableGlobals: { approve: 'nope' as unknown as DurableGlobal } })).toThrow(/durableGlobals\["approve"\] is not a function/)
     await di.dispose()
   }, 20_000)
