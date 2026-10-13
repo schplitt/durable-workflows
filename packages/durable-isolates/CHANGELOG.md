@@ -1,5 +1,16 @@
 # durable-isolates
 
+## 0.4.0
+
+### Minor Changes
+
+- 7539acc: feat(durable-isolates)!: export `RESERVED_GLOBALS` (iso4's `SANDBOX_GLOBALS` plus the kernel bridges) and `isValidGlobalName`; `prepare` and `run` throw on a plain global that fails it instead of letting it overwrite a built-in. `durableImports` export names follow iso4's `isValidExportName`, so Unicode names like `café` work.
+- 7539acc: feat(durable-isolates)!: a run iso4 refuses before it starts (a wrong per-run override, `execute` on a disposed runner) now rejects `result` and `suspend()` with iso4's setup error (`ERR_UNDECLARED_BINDING`, `ERR_PREFIX_DISPOSED`, …) instead of resolving as `outcome: 'failed'`. The rejection is never unhandled, so awaiting the handle later is safe.
+
+### Patch Changes
+
+- 7539acc: chore(durable-isolates): bump `@iso4/sandbox` to 0.8.1. A clean `dispose()` no longer prints a connection error per socket.
+
 ## 0.3.0
 
 ### Minor Changes
