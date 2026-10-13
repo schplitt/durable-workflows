@@ -62,8 +62,9 @@ export interface DurableIsolates {
    * warm resident instances — many prefixes share the one sandbox and its run
    * slots, and a prefix is the trust boundary (runs on one prefix share
    * `globalThis` carryover). Per-run overrides for the plain side are
-   * handed to iso4 as given, so a wrong one fails the run with iso4's own
-   * `ERR_UNDECLARED_BINDING` / `ERR_FROZEN_BINDING`.
+   * handed to iso4 as given, so a wrong one rejects the handle's `result`
+   * with iso4's own setup error (`ERR_UNDECLARED_BINDING`,
+   * `ERR_FROZEN_BINDING`, …) — nothing ran, so it is not an outcome.
    */
   prepare: (options: PrepareOptions) => Promise<DurableIsolatesRunner>
   /**
@@ -111,10 +112,13 @@ export interface PrepareOptions {
   /**
    * iso4's `globals`, passed through as they are: plain host functions (or
    * strings / data constants) installed on `globalThis` in the sandbox. Not
-   * durable — same as a host-module function above. Names in
-   * `RESERVED_GLOBALS` (everything the sandbox already defines, plus the
-   * three kernel bridges) are refused, and a name cannot also be a durable
+   * durable — same as a host-module function above. A name
+   * `isValidGlobalName` rejects is refused: one in `RESERVED_GLOBALS`
+   * (everything the sandbox already defines, plus the three kernel bridges)
+   * or one iso4 refuses (e.g. `__proto__`). A name cannot also be a durable
    * global.
+   * A name that is not an identifier (`my-tool`) is fine: code reaches it as
+   * `globalThis['my-tool']`.
    */
   globals?: HostGlobals
   /**
@@ -133,12 +137,12 @@ export interface PrepareOptions {
    * `durableCall(nextKey('acme.load'), 'acme.load', ...args)` — recorded as
    * `acme.load#0` (scope-prefixed inside a `boundary()`), positioned, replayed
    * from the cache, able to suspend. Nested objects become nested exports.
-   * Functions only (a data value has nothing to record), export names must be
-   * identifiers, a specifier cannot also be in `imports`, and the dotted
-   * operation name cannot collide with a `durableGlobals` name; `prepare`
-   * and `run` refuse each with the offending path. Top-level names are the module's
-   * exports and must be identifiers; nested names may be any string (reached
-   * as `obj[name]`).
+   * Functions only (a data value has nothing to record), a specifier cannot
+   * also be in `imports`, and the dotted operation name cannot collide with a
+   * `durableGlobals` name; `prepare` and `run` refuse each with the offending
+   * path. Top-level names are the module's exports and follow iso4's
+   * `isValidExportName`, minus `default` and the `__di` prefix; nested names
+   * may be any string (reached as `obj[name]`).
    */
   durableImports?: Readonly<Record<string, DurableModule>>
   /**
@@ -200,8 +204,9 @@ export interface DurableModule {
 /**
  * Per-run overrides for plain iso4 globals declared at prepare: the function
  * (or bridge handler) under that name for THIS run — iso4's `globals` rebind,
- * handed through as given. An unknown name fails the run with iso4's own
- * `ERR_UNDECLARED_BINDING`.
+ * handed through as given. An unknown name, or one of the wrong kind, rejects
+ * the handle's `result` with iso4's own setup error (`ERR_UNDECLARED_BINDING`,
+ * …).
  */
 export type PlainGlobalOverrides = Readonly<Record<string, HostExportFunction>>
 
@@ -209,8 +214,8 @@ export type PlainGlobalOverrides = Readonly<Record<string, HostExportFunction>>
  * Per-run overrides for the function leaves of host-module imports declared
  * at prepare, by specifier, mirroring the declared shape (nested objects
  * allowed) — iso4's `imports` rebind, handed through as given. An unknown
- * specifier or path, a string module or a data leaf fails the run with iso4's
- * own `ERR_UNDECLARED_BINDING` / `ERR_FROZEN_BINDING`.
+ * specifier or path, a string module or a data leaf rejects the handle's
+ * `result` with iso4's own `ERR_UNDECLARED_BINDING` / `ERR_FROZEN_BINDING`.
  */
 export type PlainImportOverrides = Readonly<Record<string, HostModuleObject>>
 
@@ -312,7 +317,12 @@ export interface RunOptions extends Omit<PrepareOptions, 'limits'> {
  */
 export interface ExecuteHandle {
   /**
-   * The run's outcome — resolves when the turn completes, suspends, or fails.
+   * The run's outcome — resolves when the turn completes, suspends, fails or
+   * is rejected. Rejects (and so does `suspend()`) only when nothing ran:
+   * iso4's setup error (`code` is a `SetupErrorCode`, e.g.
+   * `ERR_UNDECLARED_BINDING`, `ERR_PREFIX_DISPOSED`), or for `run` the
+   * sandbox failing to start. Never an unhandled
+   * rejection, so awaiting it later is safe.
    */
   result: Promise<ExecuteResult>
   /**

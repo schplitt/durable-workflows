@@ -1,5 +1,5 @@
 import type { HostExportFunction, HostGlobals, Imports, ImportValue } from '@iso4/sandbox'
-import { SANDBOX_GLOBALS } from '@iso4/sandbox'
+import { isValidExportName, isValidGlobalName as isIso4GlobalName, SANDBOX_GLOBALS } from '@iso4/sandbox/utils'
 import type { DurableGlobal, DurableModule, ExecuteOptions, PrepareOptions } from './types'
 import { DURABLE_CALL_GLOBAL, DURABLE_COMMIT_GLOBAL, DURABLE_LOOKUP_GLOBAL, internalShim, INTERNAL_SPECIFIER, KERNEL_BRIDGE_GLOBALS } from './shim'
 
@@ -11,36 +11,48 @@ function unbound(): never {
 }
 
 /**
- * Check a `prepare` call as a whole, before anything is built, and throw on
- * the first rule it breaks:
- * - the specifier `durable-isolates:internal` is the kernel shim, compiled into
- *   every prefix, and cannot be mounted;
- * - a plain global must not take a name in `RESERVED_GLOBALS`: the three
- *   kernel bridges, or a name the sandbox already defines (V8 built-ins and
- *   iso4's runtime globals — iso4 itself would silently replace a built-in);
- * - a name cannot be both a plain global and a durable global: the two never
- *   collide at runtime (one is `globalThis.name`, the other is reached only
- *   through `durableCall`), but one name meaning two things is a trap for
- *   whoever reads the shim or writes a per-run override;
- * - a `durableImports` module: its specifier is not reserved and not also in
- *   `imports` (one specifier, one module), every export name is an identifier
- *   the generated module can `export`, every leaf is a function (a data value
- *   has nothing to record), and its dotted operation names do not collide
- *   with `durableGlobals`;
- * - every `durableGlobals` value is a function.
- * The builders below assume these hold.
- * @param options the caller's prepare options
- */
-const IDENTIFIER = /^[A-Z_$][\w$]*$/i
-// Everything `export const <name>` cannot bind in a strict-mode module.
-/**
  * Every global name a plain `globals` entry cannot take: iso4's
  * `SANDBOX_GLOBALS` (V8 built-ins and the runtime's own globals) plus the
  * kernel's bridge globals (`KERNEL_BRIDGE_GLOBALS`). `prepare` and `run`
  * throw on them; exported so a host generating global names can avoid them.
  */
 export const RESERVED_GLOBALS: ReadonlySet<string> = new Set([...SANDBOX_GLOBALS, ...KERNEL_BRIDGE_GLOBALS])
-const RESERVED_WORDS: ReadonlySet<string> = new Set(['default', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false', 'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof', 'let', 'new', 'null', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'var', 'void', 'while', 'with', 'yield', 'implements', 'interface', 'package', 'private', 'protected', 'public', 'eval', 'arguments'])
+
+/**
+ * Whether `name` can be a plain `globals` entry: iso4 accepts it (a
+ * well-formed string that is not runtime-owned, e.g. not `__proto__`) and it
+ * is not in {@link RESERVED_GLOBALS}. Exactly the rule `prepare` and `run`
+ * apply — check generated names with it before mounting them.
+ * @param name a global name
+ */
+export function isValidGlobalName(name: string): boolean {
+  return isIso4GlobalName(name) && !RESERVED_GLOBALS.has(name)
+}
+
+/**
+ * Check a `prepare` call as a whole, before anything is built, and throw on
+ * the first rule it breaks:
+ * - the specifier `durable-isolates:internal` is the kernel shim, compiled into
+ *   every prefix, and cannot be mounted;
+ * - a plain global must pass `isValidGlobalName`: iso4 accepts it (a
+ *   well-formed string that is not runtime-owned, so not `__proto__`) and not
+ *   in `RESERVED_GLOBALS`: the three kernel bridges, or a name the sandbox
+ *   already defines (V8 built-ins and iso4's runtime globals — iso4 itself
+ *   would silently replace a built-in);
+ * - a name cannot be both a plain global and a durable global: the two never
+ *   collide at runtime (one is `globalThis.name`, the other is reached only
+ *   through `durableCall`), but one name meaning two things is a trap for
+ *   whoever reads the shim or writes a per-run override;
+ * - a `durableImports` module: its specifier is not reserved and not also in
+ *   `imports` (one specifier, one module), every export name passes iso4's
+ *   `isValidExportName` and is not `default` or `__di…` (the generated
+ *   module writes `export const <name>`), every leaf is a function (a data value
+ *   has nothing to record), and its dotted operation names do not collide
+ *   with `durableGlobals`;
+ * - every `durableGlobals` value is a function.
+ * The builders below assume these hold.
+ * @param options the caller's prepare options
+ */
 
 export function assertPrepareOptions(options: PrepareOptions): void {
   if (Object.hasOwn(options.imports ?? {}, INTERNAL_SPECIFIER) || Object.hasOwn(options.durableImports ?? {}, INTERNAL_SPECIFIER)) {
@@ -50,8 +62,11 @@ export function assertPrepareOptions(options: PrepareOptions): void {
     )
   }
   for (const name of Object.keys(options.globals ?? {})) {
-    if (RESERVED_GLOBALS.has(name))
-      throw new Error(`durable-isolates: "${name}" is a reserved global (${SANDBOX_GLOBALS.has(name) ? 'the sandbox already defines it' : 'a kernel bridge'}) and cannot be mounted`)
+    if (!isValidGlobalName(name)) {
+      throw new Error(RESERVED_GLOBALS.has(name)
+        ? `durable-isolates: "${name}" is a reserved global (${SANDBOX_GLOBALS.has(name) ? 'the sandbox already defines it' : 'a kernel bridge'}) and cannot be mounted`
+        : `durable-isolates: "${name}" is not a usable global name`)
+    }
     if (Object.hasOwn(options.durableGlobals ?? {}, name))
       throw new Error(`durable-isolates: "${name}" is both a plain global and a durable global; give the two different names`)
   }
@@ -68,9 +83,11 @@ export function assertPrepareOptions(options: PrepareOptions): void {
     const walk = (shape: DurableModule, path: string, exported: boolean): void => {
       for (const [name, value] of Object.entries(shape)) {
         const at = `${path}.${name}`
-        // Top-level names become `export const <name>`; nested ones are computed
-        // keys in an object literal, so any string works there.
-        if (exported && (!IDENTIFIER.test(name) || RESERVED_WORDS.has(name) || name.startsWith('__di')))
+        // Top-level names become `export const <name>`: iso4's export-name rule,
+        // minus `default` (iso4 emits that as `export default`, we cannot) and
+        // the shim's `__di` helpers. Nested ones are computed keys in an object
+        // literal, so any string works there.
+        if (exported && (!isValidExportName(name) || name === 'default' || name.startsWith('__di')))
           throw new Error(`durable-isolates: "${at}" cannot be exported from a durable module ("${name}" is not a usable export name)`)
         if (typeof value === 'function') {
           if (Object.hasOwn(options.durableGlobals ?? {}, at))

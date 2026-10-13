@@ -514,6 +514,13 @@ export function executeRun(params: ExecuteRunParams): ExecuteHandle {
       return { outcome: 'completed', result: result.exports.default, cache: grown, run: result }
     return { outcome: 'failed', error: result.error, cache: grown, run: result }
   })()
+  // `result` rejects only when nothing ran (iso4's setup error, or for `run`
+  // the sandbox failing to start). That happens within microtasks, before a
+  // caller who awaits the handle later has attached anything; marking it
+  // handled keeps it from being an unhandled rejection (a process exit under
+  // Node's default), while every `await` of `result` or `suspend()` still
+  // sees the error.
+  result.catch(() => {})
 
   const suspend = (): Promise<ExecuteResult> => {
     controller.abort()
