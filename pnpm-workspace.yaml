@@ -16,16 +16,16 @@ packages:
   - 'packages/*'
 
 catalog:
-  '@changesets/cli': ^3.0.2
-  '@iso4/fetch': ^0.0.2
-  '@iso4/sandbox': ^0.8.1
+  '@changesets/cli': ^3.0.3
+  '@iso4/fetch': ^0.1.1
+  '@iso4/sandbox': ^0.9.0
   '@schplitt/eslint-config': ^1.5.4
-  '@types/node': ^26.5.1
-  eslint: ^10.10.0
-  tsdown: ^0.23.0
-  tsnapi: ^1.4.2
+  '@types/node': ^26.6.6
+  eslint: ^10.14.0
+  tsdown: ^0.23.5
+  tsnapi: ^1.6.1
   typescript: ^6.0.3
-  vitest: ^5.0.0
+  vitest: ^5.1.0
 
 onlyBuiltDependencies:
   - esbuild
