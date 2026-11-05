@@ -1,5 +1,11 @@
 # durable-isolates
 
+## 0.4.1
+
+### Patch Changes
+
+- 6cd13e3: chore(deps): update `@iso4/sandbox` to 0.9.0.
+
 ## 0.4.0
 
 ### Minor Changes
