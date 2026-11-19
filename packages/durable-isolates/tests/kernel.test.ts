@@ -2803,6 +2803,65 @@ describe('one-off runs (di.run, a fresh isolate per call)', () => {
     await di.dispose()
   }, 20_000)
 
+  // 3 durable calls + 2 boundaries of 2 durable calls each: 9 records.
+  const COUNTED = `import { boundary } from 'durable-isolates:internal'
+    import { call } from 'tools'
+    await call('ping', 1)
+    await call('ping', 2)
+    await call('ping', 3)
+    await boundary('a', async () => [await call('ping', 4), await call('ping', 5)])
+    await boundary('b', async () => [await call('ping', 6), await call('ping', 7)])
+    export default 'ok'`
+
+  test('a replay costs one bridge call per recorded call it reaches and one per finished boundary; records inside a finished boundary cost nothing', async () => {
+    const di = durableIsolates()
+    const durableGlobals: DurableGlobals = { ping: (i: number) => i }
+    const r1 = await di.run({ code: COUNTED, cache: {}, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r1.outcome).toBe('completed')
+    expect(Object.keys(r1.cache)).toHaveLength(9)
+    expect(r1.run.bridgeCalls).toHaveLength(11) // 7 calls + a lookup and a commit per new boundary
+    const r2 = await di.run({ code: COUNTED, cache: r1.cache, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r2.outcome).toBe('completed')
+    expect(r2.run.bridgeCalls).toHaveLength(5) // 3 calls + a lookup per recorded boundary, bodies skipped
+    await di.dispose()
+  }, 20_000)
+
+  test('a boundary that suspended in its body has no record yet; its replay costs the lookup plus each call', async () => {
+    const di = durableIsolates()
+    const durableGlobals: DurableGlobals = {
+      ping: (i: number) => i,
+      wait: () => {
+        throw new SuspendIsolate({})
+      },
+    }
+    const code = `import { boundary } from 'durable-isolates:internal'
+      import { call } from 'tools'
+      export default await boundary('a', async () => [await call('ping', 1), await call('wait')])`
+    const r1 = await di.run({ code, cache: {}, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r1.outcome).toBe('suspended')
+    expect(Object.keys(r1.cache)).toHaveLength(2) // ping and the waiting call; the boundary has no record
+    const r2 = await di.run({ code, cache: r1.cache, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r2.outcome).toBe('suspended')
+    expect(r2.run.bridgeCalls).toHaveLength(3) // the boundary lookup + 2 calls
+    await di.dispose()
+  }, 20_000)
+
+  test('a replay that hits maxBridgeCalls fails with the limit code; the returned cache completes with a higher limit', async () => {
+    const di = durableIsolates()
+    const durableGlobals: DurableGlobals = { ping: (i: number) => i }
+    const r1 = await di.run({ code: COUNTED, cache: {}, imports: { tools: SHIM }, durableGlobals }).result
+    expect(r1.outcome).toBe('completed')
+    const r2 = await di.run({ code: COUNTED, cache: r1.cache, imports: { tools: SHIM }, durableGlobals, limits: { maxBridgeCalls: 4 } }).result
+    expect(r2.outcome).toBe('failed')
+    if (r2.outcome !== 'failed')
+      return
+    expect(r2.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    expect(r2.cache).toEqual(r1.cache)
+    const r3 = await di.run({ code: COUNTED, cache: r2.cache, imports: { tools: SHIM }, durableGlobals, limits: { maxBridgeCalls: 4 + Object.keys(r2.cache).length } }).result
+    expect(r3.outcome === 'completed' && r3.result).toBe('ok')
+    await di.dispose()
+  }, 20_000)
+
   test('suspension, divergence and the prepare rules all apply to a one-off', async () => {
     const di = durableIsolates()
     let approved = false

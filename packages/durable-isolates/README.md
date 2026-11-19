@@ -75,6 +75,18 @@ if (r.outcome === 'suspended')
 
 To continue, run the same code with `r.cache` again. The program replays up to the waiting call, which asks `ask` again. Nothing is injected from outside: the function looks at your systems and either answers or pauses again.
 
+When a durable call suspended, `pending` holds one or more entries, in no fixed order. After `handle.suspend()` it can be empty. One round does not promise every parallel wait: the run stops at the first suspension, and calls that had not reached the host yet show up in a later round. Nothing is lost. Loop until the outcome is no longer `suspended`:
+
+<!-- eslint-skip -->
+
+```ts
+let r = await runner.execute({ code, cache }).result
+while (r.outcome === 'suspended') {
+  await answer(r.pending) // may be one entry per round, also for parallel waits
+  r = await runner.execute({ code, cache: r.cache }).result
+}
+```
+
 ## Durable modules
 
 `durableImports` is the simple way in. Give it host functions under a module name, and the sandbox can import them. Every call is durable.
@@ -199,12 +211,12 @@ What JSON cannot write at all (a `bigint`, a cycle, a `toJSON` that throws) stop
 
 A run can end four ways:
 
-| `outcome`   | What Happened                                                  |
-| ----------- | -------------------------------------------------------------- |
-| `completed` | the program finished, `result` is its default export           |
-| `suspended` | a durable call paused, `pending` lists it                      |
-| `failed`    | the program threw or hit a limit, `error` is iso4's            |
-| `rejected`  | the program broke a rule of the kernel, `rejection` says which |
+| `outcome`   | What Happened                                                                            |
+| ----------- | ---------------------------------------------------------------------------------------- |
+| `completed` | the program finished, `result` is its default export                                     |
+| `suspended` | a durable call paused (`pending` lists what is waiting) or `handle.suspend()` was called |
+| `failed`    | the program threw or hit a limit, `error` is iso4's                                      |
+| `rejected`  | the program broke a rule of the kernel, `rejection` says which                           |
 
 A rejection is not catchable in the sandbox. Nothing is written at the offending key, so you can fix the cause and run the same cache again.
 
@@ -246,6 +258,20 @@ Creates the host. `options.sandbox` is passed to iso4's `createSandbox`. The san
 | `imports`        | iso4 `Imports`                  | plain sandbox modules (source) or host modules             |
 | `globals`        | iso4 `HostGlobals`              | plain globals                                              |
 | `limits`         | `Partial<ResourceLimits>`       | defaults for every run (`maxBridgeCalls` defaults to 1000) |
+
+#### `maxBridgeCalls` and replays
+
+`maxBridgeCalls` counts replayed and new calls alike. A replay costs one bridge call per recorded durable call it reaches and one per `boundary()` it enters. A finished `boundary()` skips its body, so the records inside it cost nothing. A `boundary()` that had started but not finished has no record yet, and still costs its lookup. A new `boundary()` costs two plus its body. Each raw `durableLookup` costs one.
+
+The record count is a safe upper bound for the recorded part. Add it to `budget`, the bridge calls you allow for work that is not recorded yet: new calls, two per new `boundary()`, one lookup for each `boundary()` that had started but not finished, and one per raw `durableLookup`:
+
+<!-- eslint-skip -->
+
+```ts
+const limits = { maxBridgeCalls: budget + Object.keys(cache).length }
+```
+
+A run over the limit ends with `outcome: 'failed'` and `error.code === 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'`. The cache comes back with it, so you can run it again with a higher limit.
 
 ### `runner.execute(options)`
 
