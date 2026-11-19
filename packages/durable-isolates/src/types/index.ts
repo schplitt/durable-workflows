@@ -150,6 +150,20 @@ export interface PrepareOptions {
    * `ExecuteOptions.limits` overrides per run. Replay is bridge-call heavy (a
    * completed boundary still round-trips through the cache lookup), so
    * `maxBridgeCalls` defaults to 1000 (iso4's own default of 10 is far too low).
+   *
+   * `maxBridgeCalls` counts replayed and new calls alike. A replay costs one
+   * bridge call per recorded durable call it reaches and one per `boundary()`
+   * it enters. A finished `boundary()` skips its body, so the records inside
+   * it cost nothing. A `boundary()` that had started but not finished has no
+   * record yet, and still costs its lookup. A new `boundary()` costs two plus
+   * its body. Each raw `durableLookup` costs one. The record count is a safe
+   * upper bound for the recorded part, so size the limit as
+   * `budget + Object.keys(cache).length`, where `budget` is the bridge calls
+   * you allow for work that is not recorded yet: new calls, two per new
+   * `boundary()`, one lookup for each `boundary()` that had started but not
+   * finished, and one per raw `durableLookup`. A run over the limit ends with
+   * `outcome: 'failed'` and `error.code === 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'`;
+   * its cache comes back, so it can run again with a higher limit.
    */
   limits?: Partial<ResourceLimits>
 }
@@ -397,6 +411,11 @@ export interface SuspendedResult extends ExecuteResultBase {
    * The caller reacts (elicit, notify, wait) and resumes by re-executing with
    * the grown cache: the waiting boundary re-dispatches and its global,
    * consulting host state, proceeds, suspends again, or throws.
+   *
+   * When a durable call suspended: one or more entries, in no fixed order. One
+   * round does not promise every parallel wait: the run stops at the first
+   * suspension, and calls that had not reached the host yet show up in a later
+   * round. Nothing is lost. Loop until the outcome is no longer `suspended`.
    */
   pending: PendingOperation[]
   /**
